@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>苍米独家混淆</title>
+    <link rel="stylesheet" href="https://pyscript.net/releases/2024.1.1/core.css">
+    <script type="module" src="https://pyscript.net/releases/2024.1.1/core.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: #0a0e1a;
+            color: #e0e0e0;
+            font-family: -apple-system, "Microsoft YaHei", sans-serif;
+            font-size: 14px;
+            padding: 10px;
+            padding-bottom: env(safe-area-inset-bottom);
+        }
+        h1 {
+            color: #00e5ff;
+            font-size: 20px;
+            text-align: center;
+            margin-bottom: 2px;
+        }
+        .subtitle {
+            color: #888;
+            font-size: 12px;
+            text-align: center;
+            margin-bottom: 12px;
+        }
+        textarea {
+            width: 100%;
+            background: #141927;
+            color: #e0e0e0;
+            border: 1px solid #2a3142;
+            border-radius: 8px;
+            padding: 10px;
+            font-family: "Courier New", monospace;
+            font-size: 13px;
+            resize: vertical;
+            min-height: 120px;
+            outline: none;
+        }
+        textarea:focus { border-color: #00e5ff; }
+        label {
+            color: #8073ff;
+            font-size: 13px;
+            font-weight: bold;
+            display: block;
+            margin: 10px 0 4px;
+        }
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            margin: 10px 0;
+        }
+        button {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .btn-run {
+            background: #00e5ff;
+            color: #000;
+        }
+        .btn-run:disabled {
+            background: #333;
+            color: #666;
+        }
+        .btn-clear {
+            background: #2a3142;
+            color: #aaa;
+            flex: 0 0 80px;
+        }
+        .btn-copy {
+            background: #4caf50;
+            color: #000;
+        }
+        .status {
+            font-size: 12px;
+            color: #888;
+            text-align: center;
+            margin: 8px 0;
+            min-height: 16px;
+        }
+        .loading {
+            color: #ff9800;
+        }
+        .success {
+            color: #4caf50;
+        }
+        .error {
+            color: #f44336;
+        }
+        #pwd-screen {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: #0a0e1a;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 999;
+        }
+        #pwd-screen input {
+            width: 200px;
+            padding: 10px;
+            border: 1px solid #2a3142;
+            border-radius: 8px;
+            background: #141927;
+            color: #e0e0e0;
+            text-align: center;
+            font-size: 16px;
+            outline: none;
+            margin-bottom: 10px;
+        }
+        #pwd-screen input:focus { border-color: #00e5ff; }
+        #pwd-screen button {
+            width: 120px;
+            padding: 10px;
+            background: #00e5ff;
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: bold;
+        }
+        #pwd-error {
+            color: #f44336;
+            font-size: 13px;
+            margin-top: 8px;
+            display: none;
+        }
+        #app { display: none; }
+    </style>
+</head>
+<body>
+
+<div id="pwd-screen">
+    <h1>苍米独家混淆</h1>
+    <p style="color:#888;font-size:12px;margin-bottom:20px;">请输入访问密码</p>
+    <input type="password" id="pwd-input" placeholder="密码" autofocus>
+    <button onclick="checkPwd()">进入</button>
+    <div id="pwd-error">密码错误</div>
+</div>
+
+<div id="app">
+    <h1>苍米独家混淆</h1>
+    <div class="subtitle">12层混淆保护 · 浏览器本地运行</div>
+
+    <label>输入 Luau 脚本</label>
+    <textarea id="input-code" placeholder="在此粘贴要混淆的代码..."></textarea>
+
+    <div class="btn-row">
+        <button class="btn-clear" onclick="document.getElementById('input-code').value=''">清空</button>
+        <button class="btn-run" id="btn-run" onclick="doObfuscate()">开始混淆</button>
+    </div>
+
+    <div class="status" id="status"></div>
+
+    <label>输出结果</label>
+    <textarea id="output-code" placeholder="混淆后的代码将显示在这里..." readonly></textarea>
+
+    <div class="btn-row">
+        <button class="btn-copy" onclick="copyResult()">复制结果</button>
+    </div>
+</div>
+
+<py-config>
+  [[fetch]]
+  files = ["obfuscator_all.py"]
+</py-config>
+
+<py-script>
+from obfuscator_all import obfuscate_code
+from pyodide.ffi import create_proxy
+
+def _do_obfuscate(code):
+    try:
+        result = obfuscate_code(code)
+        return result
+    except Exception as e:
+        import traceback
+        return "ERROR: " + str(e) + "\n" + traceback.format_exc()
+
+do_obfuscate_py = create_proxy(_do_obfuscate)
+</py-script>
+
+<script>
+// 访问密码 - 改成你自己的密码
+const ACCESS_PASSWORD = "cangmi2024";
+
+function checkPwd() {
+    const input = document.getElementById('pwd-input').value;
+    if (input === ACCESS_PASSWORD) {
+        sessionStorage.setItem('authed', '1');
+        document.getElementById('pwd-screen').style.display = 'none';
+        document.getElementById('app').style.display = 'block';
+    } else {
+        document.getElementById('pwd-error').style.display = 'block';
+    }
+}
+
+// 自动登录
+if (sessionStorage.getItem('authed') === '1') {
+    document.getElementById('pwd-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+}
+
+// 回车提交密码
+document.getElementById('pwd-input').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') checkPwd();
+});
+
+async function doObfuscate() {
+    const code = document.getElementById('input-code').value.trim();
+    if (!code) {
+        document.getElementById('status').textContent = '请先输入代码';
+        document.getElementById('status').className = 'status error';
+        return;
+    }
+
+    const btn = document.getElementById('btn-run');
+    const status = document.getElementById('status');
+    btn.disabled = true;
+    btn.textContent = '混淆中...';
+    status.textContent = '正在处理，请稍候...';
+    status.className = 'status loading';
+
+    try {
+        const result = do_obfuscate_py(code);
+        document.getElementById('output-code').value = result;
+        status.textContent = '混淆完成';
+        status.className = 'status success';
+    } catch (e) {
+        status.textContent = '错误: ' + e.message;
+        status.className = 'status error';
+        console.error(e);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '开始混淆';
+    }
+}
+
+function copyResult() {
+    const output = document.getElementById('output-code');
+    output.select();
+    document.execCommand('copy');
+    const status = document.getElementById('status');
+    status.textContent = '已复制到剪贴板';
+    status.className = 'status success';
+    setTimeout(() => {
+        status.textContent = '';
+        status.className = 'status';
+    }, 2000);
+}
+</script>
+
+</body>
+</html>
