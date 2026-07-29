@@ -28,6 +28,13 @@ os.makedirs(extract_dir, exist_ok=True)
 with tarfile.open(priv_tar_path, 'r') as tf:
     tf.extractall(extract_dir, filter='data')
 
+# 先复制新.py文件，再判断哪些.pyc需要备份
+shutil.copy2(MAIN_PY, os.path.join(extract_dir, 'main.py'))
+for f in os.listdir(SRC_DIR):
+    if f.endswith('.py'):
+        shutil.copy2(os.path.join(SRC_DIR, f), os.path.join(extract_dir, 'src', f))
+
+# 备份没有对应.py的.pyc（如sitecustomize.pyc）
 backup_dir = os.path.join(work_dir, 'backup')
 os.makedirs(backup_dir, exist_ok=True)
 backup_pyc = {}
@@ -43,11 +50,7 @@ for root, dirs, files in os.walk(extract_dir):
                 shutil.copy2(full, dest)
                 backup_pyc[rel] = dest
 
-shutil.copy2(MAIN_PY, os.path.join(extract_dir, 'main.py'))
-for f in os.listdir(SRC_DIR):
-    if f.endswith('.py'):
-        shutil.copy2(os.path.join(SRC_DIR, f), os.path.join(extract_dir, 'src', f))
-
+# 删除所有.pyc（新编译会重新生成）
 for root, dirs, files in os.walk(extract_dir):
     for f in files:
         if f.endswith('.pyc'):
