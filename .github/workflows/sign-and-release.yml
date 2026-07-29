@@ -1,0 +1,68 @@
+name: Sign and Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_apk_url:
+        description: '原始未签名 APK 下载链接（如 GitHub Release asset URL）'
+        required: true
+      version:
+        description: 'Release 版本号，例如 v2.0.4'
+        required: true
+
+jobs:
+  sign-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install cryptography
+
+      - name: Prepare debug keystore
+        run: |
+          mkdir -p /root/.android
+          # 生成一个自签名 debug keystore（与本地使用的等价）
+          keytool -genkey -v \
+            -keystore /root/.android/debug.keystore \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Android Debug, O=Android, C=US"
+          # 导出 PEM 供脚本使用
+          keytool -importkeystore \
+            -srckeystore /root/.android/debug.keystore -srcstorepass android \
+            -srcalias androiddebugkey \
+            -destkeystore /tmp/debug.p12 -deststorepass android -destkeypass android \
+            -deststoretype PKCS12 -noprompt
+          openssl pkcs12 -in /tmp/debug.p12 -out /tmp/debug_key.pem -nodes -password pass:android
+
+      - name: Download original APK
+        run: |
+          APK_DIR=".buildozer/android/platform/build-arm64-v8a/dists/cangmiobfuscator/build/outputs/apk/debug"
+          mkdir -p "$APK_DIR"
+          curl -L -o "$APK_DIR/cangmiobfuscator-debug.apk" "${{ github.event.inputs.original_apk_url }}"
+
+      - name: Build unsigned + aligned APK
+        run: python build_unsigned_apk.py
+
+      - name: Sign v1
+        run: python sign_apk_v1.py
+
+      - name: Sign v2
+        run: python sign_apk_v2.py
+
+      - name: Release APK
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: 苍米独家混淆 ${{ github.event.inputs.version }}
+          files: bin/cangmiobfuscator-debug-2.0.1.apk
