@@ -1,0 +1,12 @@
+.buildozer/
+*.pyc
+__pycache__/
+
+# APK outputs and intermediates
+bin/*.apk
+bin/unsigned.apk
+bin/test_copy.apk
+bin/apk_update/
+
+# Temporary keys / assets
+/tmp/debug_key.pem
