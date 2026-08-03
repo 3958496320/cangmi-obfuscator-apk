@@ -3317,6 +3317,12 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
             while true do error("watermark broken") end
         end
 
+    时机保证（v3 修复）：
+    本块由 inject_runtime_protection 插入到 body 中 wm_var 赋值「之后」，
+    保证执行时 dec_name 解密函数与 wm_var 水印变量均已就绪。
+    合法脚本下 __got == __exp 恒成立，验证通过，不自毁；
+    仅当攻击者删除/篡改水印串时才触发自毁。
+
     防篡改机理：
     1. 删除头部注释 → 内嵌水印仍在，__got 仍等于 __exp，正常运行（不误伤）。
     2. 删除/篡改内嵌水印串 → __got 为 nil 或不等于 __exp → 自毁。
@@ -3333,7 +3339,7 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
     payload_node.attrs["_verbatim"] = True
 
     exp_var = gen.fresh()
-    got_var = gen.fresh()   # 仅作别名，便于阅读；直接引用 wm_var 亦可
+    got_var = gen.fresh()
     ok_var = gen.fresh()
 
     # __exp = <dec_name>(payload, k, o, m)
@@ -3382,7 +3388,6 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
 
     # 删除自身文件分支
     selfdel_body = []
-    # if src:sub(1,1) == "@" then
     selfdel_cond = N("BinOp", op="==",
         left=call_node(
             N("Index", obj=name_node(src_var), key=string_node("sub")),
@@ -3395,7 +3400,6 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
             [number_node(2)])
     ])
     del_calls = []
-    # if os and os.remove then pcall(os.remove, p) end
     del_calls.append(N("If",
         cond=N("BinOp", op="and",
                left=name_node("os"),
@@ -3404,13 +3408,11 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
                 [N("Index", obj=name_node("os"), key=string_node("remove")),
                  name_node(p_var)]))],
         elifs=[], else_body=None))
-    # if delfile then pcall(delfile, p) end
     del_calls.append(N("If",
         cond=name_node("delfile"),
         body=[N("CallStatement", expr=call_node(name_node("pcall"),
                 [name_node("delfile"), name_node(p_var)]))],
         elifs=[], else_body=None))
-    # if writefile then pcall(writefile, p, "") end
     del_calls.append(N("If",
         cond=name_node("writefile"),
         body=[N("CallStatement", expr=call_node(name_node("pcall"),
@@ -3631,9 +3633,23 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
             ]),
         ]))
 
-    # 把 prelude 插到最前
+    # 把 prelude 插入 body
+    # 关键：水印验证块依赖 dec_name（L1 注入）和 wm_var（L0 注入），
+    # 二者都在 body 中但不在 prelude 里。若 prelude 插到 body 最前，
+    # 执行时 dec_name/wm_var 尚未定义/赋值，水印验证必然失败 → 误触发自毁。
+    # 修复：找到 wm_var 的 LocalAssign 节点，把 prelude 整体插到它之后。
+    # 此时 dec_name（在 wm_var 之前）和 wm_var 均已就绪，验证能正常通过。
+    wm_idx = -1
+    if wm_var is not None:
+        for i, stmt in enumerate(body):
+            if isinstance(stmt, Node) and stmt.type == "LocalAssign":
+                names = stmt.attrs.get("names") or []
+                if wm_var in names:
+                    wm_idx = i
+                    break
+    insert_pos = wm_idx + 1 if wm_idx >= 0 else 0
     for i, stmt in enumerate(prelude):
-        body.insert(i, stmt)
+        body.insert(insert_pos + i, stmt)
     return stats
 
 
@@ -4648,19 +4664,23 @@ def obfuscate(src: str,
     stats["lines"] = profile.get("lines")
 
     # 苍米独家混淆 - 内嵌水印：local <rand> = "苍米独家混淆"
-    # 字符串交由 L1 三重加密，变量名交由 L2 重命名，语句可能被 L3/L10 打散
-    # 删除头部注释后，加密水印串仍埋伏在代码内部，反编译可见版权归属
+    # 字符串交由 L1 三重加密，变量名交由 L2 重命名。
+    # 时机：在 L7 之后注入，避免被 L7 的字符串拆分/API重定向转换成
+    # _G[key](...) 形式（否则运行时值可能不再是"苍米独家混淆"，
+    # 导致 L8 水印验证误判失败→自毁→脚本启动无反应）。
     _wm_var = NameGenerator(rng).fresh()
+
+    # 7. 反自动化（pre-encryption）：字符串拆分 / API 重定向 / AST 扰动
+    #    须在字符串加密之前，产生的新串会被 L1 加密
+    stats["L7_pre_encryption"] = apply_pre_encryption(chunk, rng)
+
+    # L0 水印注入（L7 后，避免被 L7 转换）
     chunk.attrs["body"].insert(0, Node(
         "LocalAssign",
         names=[_wm_var],
         exprs=[Node("String", value=_WATERMARK_STRING)],
     ))
     stats["L0_watermark"] = {"var": _wm_var, "embedded": True}
-
-    # 7. 反自动化（pre-encryption）：字符串拆分 / API 重定向 / AST 扰动
-    #    须在字符串加密之前，产生的新串会被 L1 加密
-    stats["L7_pre_encryption"] = apply_pre_encryption(chunk, rng)
 
     # 9. 动态指令替换（须在 L1 前，_G["<key>"] 字符串交由 L1 加密）
     if profile["dyninst_points"] > 0:
