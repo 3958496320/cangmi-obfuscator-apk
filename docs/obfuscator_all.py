@@ -2012,18 +2012,23 @@ def _group_states(stmts, rng: random.Random,
 
 
 def flatten_function_body(func: Node, rng: random.Random,
-                          gen: NameGenerator) -> bool:
+                          gen: NameGenerator,
+                          max_states: int = 50) -> bool:
     """对一个 Function 节点的函数体执行控制流平坦化。
 
+    参数：
+        max_states: CFF 状态数上限（兼容性红线 ≤50，超出会被内部钳制）。
     返回是否实际进行了平坦化。
     """
+    # 兼容性红线：CFF 状态变量不得超过 50（忍者注入器安全上限）
+    max_states = max(2, min(max_states, 50))
     stmts = _body_stmts(func)
     if not _is_flattenable(stmts):
         return False
 
     top_locals = _collect_top_locals(stmts)
     converted = _convert_top_locals(stmts)
-    groups = _group_states(converted, rng, max_states=50)
+    groups = _group_states(converted, rng, max_states=max_states)
     if len(groups) < 2:
         return False
 
@@ -2344,9 +2349,13 @@ def vm_compile_function(func: Node, rng: random.Random,
 # ---------------------------------------------------------------------------
 
 def apply_control_flow(chunk: Node, rng: random.Random,
-                       enable_vm: bool = True) -> dict:
+                       enable_vm: bool = True,
+                       max_states: int = 50) -> dict:
     """遍历 AST，对函数体应用 CFF（及可选 VM）。
 
+    参数：
+        enable_vm:  是否启用 VM 编译（更激进，但开销更大）。
+        max_states: CFF 状态数上限（兼容性红线 ≤50，内部钳制）。
     返回统计信息 {cff_count, vm_count}。
     """
     gen = NameGenerator(rng)
@@ -2371,7 +2380,7 @@ def apply_control_flow(chunk: Node, rng: random.Random,
                     stats["vm_count"] += 1
                     handled = True
             if not handled:
-                if flatten_function_body(node, rng, gen):
+                if flatten_function_body(node, rng, gen, max_states=max_states):
                     stats["cff_count"] += 1
         # 递归子节点（含刚被改写的函数体，以处理其中的嵌套函数）
         for key, val in list(node.attrs.items()):
@@ -4364,34 +4373,36 @@ adaptive_engine.py
 #   loadstring_enable:     第 8 层是否启用 loadstring（全工具 ≤1 次）
 _PROFILE_SMALL = {
     "name": "small",
-    "dyninst_points": 35,
-    "chunk_split_max_order": 30,
+    # 最强安全档：小脚本行数少，可承受最高强度
+    "dyninst_points": 50,            # 第9层：50个运算点替换为_G调用（注册块在顶部，函数体免VM/CFF保速度）
+    "chunk_split_max_order": 30,     # 第10层：跳转表上限（单函数分组上限3-8，30已足）
     "anti_heuristic": True,
-    "garbage_ratio": 1.2,
-    "cff_max_states": 80,
+    "garbage_ratio": 1.6,            # 第4层：1.6倍垃圾代码（受max_blocks=200硬上限保护，不会失控）
+    "cff_max_states": 50,            # 第3层：CFF状态数=红线最大值50（忍者注入器安全上限）
     "vm_enable": True,
     "loadstring_enable": True,
 }
 
 _PROFILE_MEDIUM = {
     "name": "medium",
-    "dyninst_points": 25,
+    "dyninst_points": 40,
     "chunk_split_max_order": 25,
     "anti_heuristic": True,
-    "garbage_ratio": 0.9,
-    "cff_max_states": 60,
+    "garbage_ratio": 1.3,
+    "cff_max_states": 50,            # 红线最大值
     "vm_enable": True,
     "loadstring_enable": True,
 }
 
 _PROFILE_LARGE = {
     "name": "large",
-    "dyninst_points": 15,          # 大脚本也开启第9层
+    # 大脚本(>500行)：适度控制强度避免输出过大导致注入器加载失败
+    "dyninst_points": 30,
     "chunk_split_max_order": 20,
     "anti_heuristic": True,
-    "garbage_ratio": 0.7,
-    "cff_max_states": 50,
-    "vm_enable": True,             # 大脚本也开启VM
+    "garbage_ratio": 1.0,
+    "cff_max_states": 50,            # 红线最大值
+    "vm_enable": True,
     "loadstring_enable": True,
 }
 
@@ -4624,7 +4635,8 @@ def obfuscate(src: str,
 
     # 3. 控制流平坦化 + VM（处理未被 L10 接管的的函数）
     stats["L3_control_flow"] = apply_control_flow(
-        chunk, rng, enable_vm=profile["vm_enable"])
+        chunk, rng, enable_vm=profile["vm_enable"],
+        max_states=profile.get("cff_max_states", 50))
 
     # 4. 垃圾代码注入
     stats["L4_garbage"] = inject_garbage(
