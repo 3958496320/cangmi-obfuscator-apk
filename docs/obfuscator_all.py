@@ -4364,34 +4364,34 @@ adaptive_engine.py
 #   loadstring_enable:     第 8 层是否启用 loadstring（全工具 ≤1 次）
 _PROFILE_SMALL = {
     "name": "small",
-    "dyninst_points": 20,
-    "chunk_split_max_order": 20,
+    "dyninst_points": 35,
+    "chunk_split_max_order": 30,
     "anti_heuristic": True,
-    "garbage_ratio": 0.75,
-    "cff_max_states": 50,
+    "garbage_ratio": 1.2,
+    "cff_max_states": 80,
     "vm_enable": True,
     "loadstring_enable": True,
 }
 
 _PROFILE_MEDIUM = {
     "name": "medium",
-    "dyninst_points": 10,
-    "chunk_split_max_order": 10,
+    "dyninst_points": 25,
+    "chunk_split_max_order": 25,
     "anti_heuristic": True,
-    "garbage_ratio": 0.5,
-    "cff_max_states": 40,
+    "garbage_ratio": 0.9,
+    "cff_max_states": 60,
     "vm_enable": True,
     "loadstring_enable": True,
 }
 
 _PROFILE_LARGE = {
     "name": "large",
-    "dyninst_points": 0,         # 关闭第 9 层
-    "chunk_split_max_order": 8,
+    "dyninst_points": 15,          # 大脚本也开启第9层
+    "chunk_split_max_order": 20,
     "anti_heuristic": True,
-    "garbage_ratio": 0.35,
-    "cff_max_states": 30,
-    "vm_enable": False,          # 大脚本关闭 VM，避免性能损耗
+    "garbage_ratio": 0.7,
+    "cff_max_states": 50,
+    "vm_enable": True,             # 大脚本也开启VM
     "loadstring_enable": True,
 }
 
