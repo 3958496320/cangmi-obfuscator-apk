@@ -79,12 +79,19 @@
             background: #4caf50;
             color: #000;
         }
+        .btn-retry {
+            background: #ff9800;
+            color: #000;
+            margin-top: 8px;
+            flex: 0 0 120px;
+        }
         .status {
             font-size: 12px;
             color: #888;
             text-align: center;
             margin: 8px 0;
             min-height: 16px;
+            word-break: break-all;
         }
         .loading { color: #ff9800; }
         .success { color: #4caf50; }
@@ -154,6 +161,9 @@
     </div>
 
     <div class="status" id="status">正在加载Python环境，请稍候...</div>
+    <div id="retry-area" style="display:none;text-align:center;">
+        <button class="btn-retry" onclick="initPyodide()">重试加载</button>
+    </div>
 
     <label>输出结果</label>
     <textarea id="output-code" placeholder="混淆后的代码将显示在这里..." readonly></textarea>
@@ -163,14 +173,22 @@
     </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
 <script>
-// 访问密码
+// ===== 配置 =====
 const ACCESS_PASSWORD = "cangmi2024";
+const PYODIDE_VERSION = "0.26.2";
+
+// 多个 CDN 源，按优先级尝试
+const PYODIDE_CDNS = [
+    `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`,
+    `https://unpkg.com/pyodide@${PYODIDE_VERSION}/full/`,
+    `https://fastly.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`,
+];
 
 // Python 环境
 let pyodide = null;
 let do_obfuscate_py = null;
+let pyodideLoading = false;
 
 function checkPwd() {
     const input = document.getElementById('pwd-input').value;
@@ -178,8 +196,7 @@ function checkPwd() {
         sessionStorage.setItem('authed', '1');
         document.getElementById('pwd-screen').style.display = 'none';
         document.getElementById('app').style.display = 'block';
-        // 首次进入时初始化 Pyodide
-        if (!pyodide) {
+        if (!pyodide && !pyodideLoading) {
             initPyodide();
         }
     } else {
@@ -191,7 +208,7 @@ function checkPwd() {
 if (sessionStorage.getItem('authed') === '1') {
     document.getElementById('pwd-screen').style.display = 'none';
     document.getElementById('app').style.display = 'block';
-    if (!pyodide) {
+    if (!pyodide && !pyodideLoading) {
         initPyodide();
     }
 }
@@ -201,30 +218,62 @@ document.getElementById('pwd-input').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') checkPwd();
 });
 
+// 动态加载脚本
+function loadScript(url) {
+    return new Promise((resolve, reject) => {
+        const existing = document.querySelector(`script[src="${url}"]`);
+        if (existing) {
+            resolve();
+            return;
+        }
+        const script = document.createElement('script');
+        script.src = url;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error('无法加载脚本: ' + url));
+        document.head.appendChild(script);
+    });
+}
+
 async function initPyodide() {
+    if (pyodideLoading) return;
+    pyodideLoading = true;
+
     const btn = document.getElementById('btn-run');
     const status = document.getElementById('status');
+    const retryArea = document.getElementById('retry-area');
 
-    try {
-        status.textContent = '正在下载Python运行环境(约10MB)...';
-        status.className = 'status loading';
+    btn.disabled = true;
+    retryArea.style.display = 'none';
 
-        pyodide = await loadPyodide();
+    // 依次尝试不同 CDN
+    for (let i = 0; i < PYODIDE_CDNS.length; i++) {
+        const cdn = PYODIDE_CDNS[i];
+        try {
+            status.textContent = `[${i+1}/${PYODIDE_CDNS.length}] 正在下载Python运行环境(约10MB)...`;
+            status.className = 'status loading';
 
-        status.textContent = '正在加载混淆引擎...';
+            // 加载 pyodide.js
+            await loadScript(cdn + 'pyodide.js');
 
-        // 获取 Python 文件
-        const response = await fetch('obfuscator_all.py');
-        if (!response.ok) {
-            throw new Error('无法下载混淆引擎文件: ' + response.status);
-        }
-        const pyCode = await response.text();
+            status.textContent = `[${i+1}/${PYODIDE_CDNS.length}] 正在初始化Python引擎...`;
 
-        // 运行 Python 代码（定义 obfuscate_code 函数）
-        pyodide.runPython(pyCode);
+            // 初始化 Pyodide，指定 indexURL
+            pyodide = await loadPyodide({ indexURL: cdn });
 
-        // 创建代理函数供 JS 调用
-        do_obfuscate_py = pyodide.runPython(`
+            status.textContent = '正在加载混淆引擎...';
+
+            // 获取 Python 文件
+            const response = await fetch('obfuscator_all.py');
+            if (!response.ok) {
+                throw new Error('混淆引擎文件下载失败: HTTP ' + response.status);
+            }
+            const pyCode = await response.text();
+
+            // 运行 Python 代码
+            pyodide.runPython(pyCode);
+
+            // 创建代理函数
+            do_obfuscate_py = pyodide.runPython(`
 from pyodide.ffi import create_proxy
 
 def _do_obfuscate(code):
@@ -238,20 +287,39 @@ def _do_obfuscate(code):
 create_proxy(_do_obfuscate)
 `);
 
-        // 加载完成，启用按钮
-        btn.disabled = false;
-        status.textContent = '引擎就绪，可以开始混淆';
-        status.className = 'status success';
-        setTimeout(() => {
-            status.textContent = '';
-            status.className = 'status';
-        }, 3000);
+            // 成功
+            btn.disabled = false;
+            status.textContent = '引擎就绪，可以开始混淆';
+            status.className = 'status success';
+            setTimeout(() => {
+                status.textContent = '';
+                status.className = 'status';
+            }, 3000);
 
-    } catch (err) {
-        status.textContent = '加载失败: ' + err.message;
-        status.className = 'status error';
-        console.error('Pyodide init error:', err);
+            pyodideLoading = false;
+            return;
+
+        } catch (err) {
+            console.error(`CDN ${i+1} 失败:`, err);
+            status.textContent = `[${i+1}/${PYODIDE_CDNS.length}] 失败: ${err.message}`;
+            status.className = 'status error';
+
+            // 清理可能残留的 script 标签
+            if (typeof loadPyodide !== 'undefined') {
+                // 已经加载了 pyodide.js 但初始化失败，不需要再试其他 CDN
+                if (err.message.includes('混淆引擎') || err.message.includes('初始化')) {
+                    // Pyodide 加载成功但后续步骤失败，可以重试
+                    break;
+                }
+            }
+        }
     }
+
+    // 所有 CDN 都失败
+    status.textContent = '加载失败，请检查网络后点击重试。如果反复失败，请使用科学上网或换一个网络环境。';
+    status.className = 'status error';
+    retryArea.style.display = 'block';
+    pyodideLoading = false;
 }
 
 async function doObfuscate() {
@@ -276,9 +344,7 @@ async function doObfuscate() {
     status.className = 'status loading';
 
     try {
-        // 让 UI 先刷新再执行（Python 是同步阻塞的）
         await new Promise(r => setTimeout(r, 50));
-
         const result = do_obfuscate_py(code);
         document.getElementById('output-code').value = result;
 
