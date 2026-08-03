@@ -269,6 +269,114 @@
             background: rgba(76,175,80,0.1);
             border-radius: 8px;
         }
+        /* 文件管理器切换 */
+        .upload-row {
+            display: flex;
+            gap: 6px;
+            align-items: stretch;
+            margin-bottom: 6px;
+        }
+        .upload-row .upload-btn-big {
+            flex: 1;
+            margin-bottom: 0;
+        }
+        .upload-help-btn {
+            width: 38px;
+            border: none;
+            border-radius: 16px;
+            background: rgba(42,49,66,0.8);
+            color: #00e5ff;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+            flex-shrink: 0;
+            transition: background 0.2s;
+        }
+        .upload-help-btn:hover { background: rgba(0,229,255,0.15); }
+        .fm-switcher {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+        .fm-chip {
+            padding: 6px 10px;
+            border: 1px solid rgba(0,229,255,0.2);
+            border-radius: 20px;
+            background: rgba(10,14,26,0.6);
+            color: #aaa;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        .fm-chip:hover {
+            border-color: rgba(0,229,255,0.5);
+            color: #e0e0e0;
+        }
+        .fm-chip.active {
+            background: linear-gradient(135deg, #00e5ff, #8073ff);
+            color: #000;
+            border-color: transparent;
+            font-weight: bold;
+        }
+        /* 帮助弹窗 */
+        .fm-popup-mask {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(8px);
+            z-index: 998;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+        }
+        .fm-popup {
+            background: rgba(20,25,39,0.95);
+            border: 1px solid rgba(0,229,255,0.25);
+            border-radius: 16px;
+            padding: 20px;
+            max-width: 380px;
+            width: 100%;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 0 40px rgba(0,229,255,0.15);
+        }
+        .fm-popup h3 {
+            color: #00e5ff;
+            font-size: 16px;
+            margin-bottom: 12px;
+            text-align: center;
+        }
+        .fm-popup p, .fm-popup li {
+            color: #ccc;
+            font-size: 13px;
+            line-height: 1.7;
+        }
+        .fm-popup ul {
+            padding-left: 18px;
+            margin: 8px 0;
+        }
+        .fm-popup .step {
+            background: rgba(0,229,255,0.06);
+            border-left: 3px solid #00e5ff;
+            padding: 8px 12px;
+            margin: 8px 0;
+            border-radius: 6px;
+        }
+        .fm-popup .step b { color: #00e5ff; }
+        .fm-popup-close {
+            width: 100%;
+            margin-top: 14px;
+            padding: 10px;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #00e5ff, #8073ff);
+            color: #000;
+            font-weight: bold;
+            cursor: pointer;
+        }
 
         textarea {
             width: 100%;
@@ -474,14 +582,53 @@ for (let i = 0; i < 15; i++) {
             <span>输入 Luau / Lua 脚本</span>
         </div>
 
-        <!-- 大上传按钮 -->
-        <button class="upload-btn-big" id="upload-btn" onclick="document.getElementById('file-input').click()">
-            <div class="upload-icon-big">📂</div>
-            <div>点击上传脚本文件</div>
-            <div class="upload-sub">支持 .lua .luau .txt · 可选择 MT管理器/文件管理器</div>
-        </button>
-        <input type="file" id="file-input" class="hidden" accept="*/*">
+        <!-- 大上传按钮 + 文件管理器切换 -->
+        <div class="upload-row">
+            <button class="upload-btn-big" id="upload-btn" onclick="document.getElementById('file-input').click()">
+                <div class="upload-icon-big">📂</div>
+                <div>点击上传脚本文件</div>
+                <div class="upload-sub" id="upload-sub">支持 .lua .luau .txt · 当前: 限定类型</div>
+            </button>
+            <button class="upload-help-btn" onclick="showFileManagerHelp()" title="如何选择文件管理器？">?</button>
+        </div>
+        <input type="file" id="file-input" class="hidden" accept=".lua,.luau,.txt,.text,.lc">
+        <div class="fm-switcher" id="fm-switcher">
+            <div class="fm-chip active" data-accept=".lua,.luau,.txt,.text,.lc" onclick="switchFileManager(this)">限定类型</div>
+            <div class="fm-chip" data-accept="*/*" onclick="switchFileManager(this)">通用模式</div>
+            <div class="fm-chip" data-accept="text/plain" onclick="switchFileManager(this)">文本模式</div>
+            <div class="fm-chip" data-accept="" onclick="switchFileManager(this)">不限类型</div>
+        </div>
         <div class="file-info hidden" id="file-info"></div>
+
+        <!-- 文件管理器帮助弹窗 -->
+        <div class="fm-popup-mask hidden" id="fm-help-popup" onclick="if(event.target===this) closeFmHelp()">
+            <div class="fm-popup">
+                <h3>如何选择文件管理器？</h3>
+                <p>如果你的手机装了多个文件管理器（如 MT管理器、ES文件浏览器、手机自带管理器），点击上传按钮时 Android 会弹出选择菜单。</p>
+                <div class="step">
+                    <b>方法 1：切换上传模式</b><br>
+                    下方有 4 个小按钮（限定类型 / 通用模式 / 文本模式 / 不限类型），不同模式会触发不同的选择器。如果当前模式没出现选择菜单，换一个模式再点上传按钮试试。
+                </div>
+                <div class="step">
+                    <b>方法 2：清除默认管理器</b><br>
+                    如果点击上传按钮总是直接打开某一个管理器（没有选择菜单），说明你之前选过"始终"。<br><br>
+                    <b>操作步骤：</b>
+                    <ul>
+                        <li>打开手机「设置」→「应用管理」</li>
+                        <li>找到当前默认的文件管理器（如 MT管理器）</li>
+                        <li>点「默认打开」/「打开方式」</li>
+                        <li>点「清除默认设置」</li>
+                    </ul>
+                    清除后再点上传按钮，就会重新弹出选择菜单。
+                </div>
+                <div class="step">
+                    <b>方法 3：MT管理器直接打开</b><br>
+                    打开 MT管理器 → 找到 .lua/.txt 文件 → 长按 → 「打开方式」→ 选「文本」→ 复制内容 → 回到本页粘贴。
+                </div>
+                <p style="color:#666;font-size:11px;margin-top:10px;">提示：浏览器无法直接调用某个特定 App，必须通过系统的文件选择器。Android 系统决定显示哪些管理器。</p>
+                <button class="fm-popup-close" onclick="closeFmHelp()">我明白了</button>
+            </div>
+        </div>
 
         <textarea id="input-code" placeholder="或在此直接粘贴代码..." style="margin-top:8px;"></textarea>
 
@@ -587,6 +734,32 @@ document.getElementById('pwd-input').addEventListener('keydown', e => {
 const fileInput = document.getElementById('file-input');
 const uploadBtn = document.getElementById('upload-btn');
 const fileInfo = document.getElementById('file-info');
+const uploadSub = document.getElementById('upload-sub');
+
+// 文件管理器模式切换：不同 accept 会触发不同选择器
+function switchFileManager(chip) {
+    document.querySelectorAll('.fm-chip').forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    const accept = chip.getAttribute('data-accept');
+    if (accept) {
+        fileInput.setAttribute('accept', accept);
+    } else {
+        fileInput.removeAttribute('accept');
+    }
+    const modeName = chip.textContent.trim();
+    uploadSub.textContent = `支持 .lua .luau .txt · 当前: ${modeName}`;
+    // 重置 input 以便下次点击触发选择器
+    fileInput.value = '';
+    setStatus(`已切换至「${modeName}」，点击上方按钮选择文件`, 'idle');
+}
+
+// 帮助弹窗
+function showFileManagerHelp() {
+    document.getElementById('fm-help-popup').classList.remove('hidden');
+}
+function closeFmHelp() {
+    document.getElementById('fm-help-popup').classList.add('hidden');
+}
 
 fileInput.addEventListener('change', e => {
     if (e.target.files[0]) handleFile(e.target.files[0]);
