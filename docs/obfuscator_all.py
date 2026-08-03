@@ -56,7 +56,11 @@ KEYWORDS = {
     "and", "break", "do", "else", "elseif", "end", "false", "for",
     "function", "goto", "if", "in", "local", "nil", "not", "or",
     "repeat", "return", "then", "true", "until", "while", "continue",
-    "export", "type",  # Luau 类型相关关键字（按普通标识符处理也安全）
+    # 注意：type / export 是 Luau 上下文关键字，此处不列入 KEYWORDS。
+    # 它们作为普通 name 词法处理后，由 parse_type_decl 在语句开头位置
+    # 通过 t.type=="name" and t.value in ("type","export") 判定类型声明。
+    # 若列入 KEYWORDS，词法器会把 type(x) 中的 type 转为 keyword token，
+    # 导致解析器在期望 name 的位置报"意外的 Token keyword 'type'"。
 }
 
 
@@ -84,9 +88,10 @@ class Token:
 _MULTI_SYMBOLS = [
     "...", "..", "::", "==", "~=", "<=", ">=", "<<", ">>", "//",
     "+=", "-=", "*=", "/=", "%=", "^=", "..=",
-    "->",  # Luau
+    "->",  # Luau 函数类型箭头
     "{", "}", "(", ")", "[", "]", ";", ":", ",", ".", "+", "-",
     "*", "/", "%", "^", "#", "<", ">", "=", "&", "|", "~",
+    "?",  # Luau optional type (如 string?)
 ]
 
 
@@ -468,10 +473,14 @@ class Parser:
                 self.next()
                 label = self.expect("name").value
                 return N("Goto", label=label)
-        # Luau 类型声明 type T = ... / export type T = ... -> 跳过到 end/换行
-        if t.type == "name" and t.value in ("type", "export") and \
-                self.peek(1).type == "name" and self.peek(1).value == "type" if t.value == "export" else \
-                (t.value == "type" and self.peek(1).type == "name"):
+        # Luau 类型声明 type T = ... / export type T = ... -> 跳过到行尾
+        # type/export 是上下文关键字，仅在语句开头且后跟 name 时才是类型声明
+        if t.type == "name" and t.value == "type" and \
+                self.peek(1).type == "name":
+            return self.parse_type_decl()
+        if t.type == "name" and t.value == "export" and \
+                self.peek(1).type == "name" and self.peek(1).value == "type" and \
+                self.peek(2).type == "name":
             return self.parse_type_decl()
         if t.type == "symbol" and t.value == "::":
             # 标签 ::label::
@@ -483,24 +492,35 @@ class Parser:
         return self.parse_expr_statement()
 
     def parse_type_decl(self) -> Node:
-        """跳过 Luau 类型声明（type/export type），不参与混淆。"""
+        """跳过 Luau 类型声明（type/export type），不参与混淆。
+
+        Luau 类型声明形式：``type Name = TypeExpr`` 或 ``export type Name = TypeExpr``。
+        通常单行；仅当 TypeExpr 含跨行的括号/大括号时才可能多行。
+        本函数采用「换行 + depth<=0」作为停止条件，避免吞掉下一语句。
+        特殊处理：``->`` 后必有返回类型，更新基准行继续吞。
+        """
         start_line = self.cur().line
-        # 吞掉到行尾或遇到等号后的内容结束（简化处理：吞到行尾）
-        # 这里采用：吞到下一个语句边界（即遇到顶层的新语句起始或块结束）
-        # 简化：吞掉该行剩余 token（类型声明通常单行）
         depth = 0
         while not self.is_block_end():
             t = self.cur()
             if t.type == "eof":
                 break
-            if t.type == "symbol" and t.value == "{":
-                depth += 1
-            elif t.type == "symbol" and t.value == "}":
-                depth -= 1
-            self.next()
-            # 简单地：当 depth<=0 且遇到换行后的关键字起始时停止
-            if depth <= 0 and t.type in ("keyword",) and t.value not in ("type",):
+            # 遇到 -> 更新基准行（-> 后必有返回类型，需继续吞）
+            if t.type == "symbol" and t.value == "->" and depth <= 0:
+                start_line = t.line
+                self.next()
+                continue
+            # 换行后且不在括号内则停止
+            if t.line != start_line and depth <= 0:
                 break
+            if t.type == "symbol" and t.value in ("(", "{", "[", "<"):
+                depth += 1
+            elif t.type == "symbol" and t.value in (")", "}", "]", ">"):
+                depth -= 1
+                # 遇到未配对的 >（如函数类型 (a) -> b 的箭头），不当作闭合括号
+                if depth < 0:
+                    depth = 0
+            self.next()
         return N("NoOp")
 
     def parse_if(self) -> Node:
@@ -623,7 +643,11 @@ class Parser:
         return N("LocalAssign", names=names, exprs=exprs)
 
     def skip_type_annotation(self):
-        """跳过 Luau 类型注解（如 : string, : number?, : {string}, : (a)->b）。"""
+        """跳过 Luau 类型注解（如 : string, : number?, : {string}, : (a)->b）。
+
+        类型注解里不会出现 Lua 关键字（类型名都是普通标识符），
+        因此 depth<=0 时遇到任何 keyword 即视为注解结束。
+        """
         depth = 0
         while True:
             t = self.cur()
@@ -638,7 +662,8 @@ class Parser:
                 depth -= 1
                 if depth < 0:
                     return
-            elif t.type == "keyword" and t.value in ("do", "then", "in"):
+            elif t.type == "keyword" and depth <= 0:
+                # 类型注解结束后遇到语句起始关键字（return/local/if 等）即停止
                 return
             elif t.type == "symbol" and t.value == ";":
                 return
@@ -828,7 +853,10 @@ class Parser:
         return N("Table", fields=fields)
 
     def parse_funcbody(self) -> Node:
-        """解析函数体 (params) ... body end。"""
+        """解析函数体 [generics] (params) [: rettype] body end。"""
+        # Luau 泛型参数 <T, U> 或 <T, U...>（可选）
+        if self.check("symbol", "<"):
+            self._skip_generics()
         self.expect("symbol", "(")
         params = []
         is_vararg = False
@@ -857,6 +885,21 @@ class Parser:
         body = self.parse_block()
         self.expect("keyword", "end")
         return N("Function", params=params, is_vararg=is_vararg, body=body)
+
+    def _skip_generics(self):
+        """跳过 Luau 泛型参数列表 <T, U, V...>（不参与混淆）。"""
+        # 当前 cur() 是 "<"
+        self.next()  # 吞掉 "<"
+        depth = 1
+        while depth > 0:
+            t = self.cur()
+            if t.type == "eof":
+                return
+            if t.type == "symbol" and t.value == "<":
+                depth += 1
+            elif t.type == "symbol" and t.value == ">":
+                depth -= 1
+            self.next()
 
 
 def parse_source(src: str) -> Node:
