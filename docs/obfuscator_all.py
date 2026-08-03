@@ -3512,6 +3512,22 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     prelude.append(env_block)
     stats["checks"] += 3
 
+    # 2.5) 扩展环境完整性检查（#8 增强建议）
+    #      检测 Lua 标准库关键全局是否被篡改/替换。
+    #      这些全局在忍者注入器及任何合规 Roblox 环境下必然存在且类型固定，
+    #      若被 Hook/替换为非预期类型，说明环境被篡改 → 设 flag（不阻断）。
+    #      纯增量，不改原有 env_check 逻辑，不影响兼容性。
+    ext_env_block = N("Do", body=[
+        env_check("type", "function"),
+        env_check("tostring", "function"),
+        env_check("pairs", "function"),
+        env_check("ipairs", "function"),
+        env_check("string", "table"),
+        env_check("table", "table"),
+    ])
+    prelude.append(ext_env_block)
+    stats["checks"] += 6
+
     # 3) 自修改计数器：注入若干检查点（自增 + 末尾校验）
     checkpoints = ["c1", "c2", "c3", "c4"]
     cp_names = [gen.fresh() for _ in checkpoints]
@@ -3614,6 +3630,28 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     if wm_var is not None:
         prelude.append(_build_watermark_selfdestruct(gen, rng, dec_name, wm_var))
         stats["watermark"] = True
+
+    # 8.6) 计数器完整性校验（#15 增强建议）
+    #      校验 #3 注入的 c1-c4 计数器值是否均为 1（每个自增一次）。
+    #      若被调试器断点跳过自增代码，或计数器被外部重置，则值不为 1 → 设 flag。
+    #      纯增量校验，不阻断执行，不影响兼容性。
+    #      预期值：c1=c2=c3=c4=1（每个检查点自增一次）
+    cp_verify_conds = []
+    for cp in cp_names:
+        # counter[cp] ~= 1
+        cp_verify_conds.append(N("BinOp", op="~=",
+            left=N("Index", obj=name_node(counter), key=string_node(cp)),
+            right=number_node(1)))
+    # 用 or 连接所有条件：任一计数器不为 1 则 flag=true
+    cp_cond = cp_verify_conds[0]
+    for c in cp_verify_conds[1:]:
+        cp_cond = N("BinOp", op="or", left=cp_cond, right=c)
+    prelude.append(N("Do", body=[
+        N("If", cond=cp_cond,
+          body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]))
+    stats["checks"] += 1
 
     # 9) 调试模式：隐蔽错误日志（pcall 包裹 print，绝不抛错）
     #    注意：须用 pcall(print, dbg_var) 形式（把 print 作为函数值传入），
