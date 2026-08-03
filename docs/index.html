@@ -7,229 +7,645 @@
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            background: #0a0e1a;
+            background: linear-gradient(135deg, #0a0e1a 0%, #131830 50%, #0a0e1a 100%);
             color: #e0e0e0;
             font-family: -apple-system, "Microsoft YaHei", sans-serif;
             font-size: 14px;
-            padding: 10px;
-            padding-bottom: env(safe-area-inset-bottom);
+            min-height: 100vh;
+            overflow-x: hidden;
         }
-        h1 {
-            color: #00e5ff;
-            font-size: 20px;
-            text-align: center;
-            margin-bottom: 2px;
+        /* 背景装饰 */
+        body::before {
+            content: '';
+            position: fixed;
+            top: -50%; left: -50%;
+            width: 200%; height: 200%;
+            background: radial-gradient(circle at 20% 80%, rgba(0,229,255,0.08) 0%, transparent 50%),
+                        radial-gradient(circle at 80% 20%, rgba(128,115,255,0.08) 0%, transparent 50%),
+                        radial-gradient(circle at 50% 50%, rgba(255,0,128,0.04) 0%, transparent 50%);
+            z-index: -1;
+            animation: bgShift 20s ease-in-out infinite alternate;
         }
-        .subtitle {
-            color: #888;
-            font-size: 12px;
-            text-align: center;
-            margin-bottom: 12px;
+        @keyframes bgShift {
+            from { transform: translate(0, 0); }
+            to { transform: translate(-30px, -30px); }
         }
-        textarea {
-            width: 100%;
-            background: #141927;
-            color: #e0e0e0;
-            border: 1px solid #2a3142;
-            border-radius: 8px;
-            padding: 10px;
-            font-family: "Courier New", monospace;
-            font-size: 13px;
-            resize: vertical;
-            min-height: 120px;
-            outline: none;
+        /* 浮动粒子 */
+        .particle {
+            position: fixed;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 0;
+            animation: floatUp linear infinite;
         }
-        textarea:focus { border-color: #00e5ff; }
-        label {
-            color: #8073ff;
-            font-size: 13px;
-            font-weight: bold;
-            display: block;
-            margin: 10px 0 4px;
+        @keyframes floatUp {
+            from { transform: translateY(100vh) scale(0); opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            to { transform: translateY(-10vh) scale(1); opacity: 0; }
         }
-        .btn-row {
-            display: flex;
-            gap: 8px;
-            margin: 10px 0;
-        }
-        button {
-            flex: 1;
-            padding: 12px;
-            border: none;
-            border-radius: 8px;
-            font-size: 15px;
-            font-weight: bold;
-            cursor: pointer;
-        }
-        .btn-run {
-            background: #00e5ff;
-            color: #000;
-        }
-        .btn-run:disabled {
-            background: #333;
-            color: #666;
-            cursor: not-allowed;
-        }
-        .btn-clear {
-            background: #2a3142;
-            color: #aaa;
-            flex: 0 0 80px;
-        }
-        .btn-copy {
-            background: #4caf50;
-            color: #000;
-        }
-        .btn-retry {
-            background: #ff9800;
-            color: #000;
-            margin-top: 8px;
-            flex: 0 0 120px;
-        }
-        .status {
-            font-size: 12px;
-            color: #888;
-            text-align: center;
-            margin: 8px 0;
-            min-height: 16px;
-            word-break: break-all;
-        }
-        .loading { color: #ff9800; }
-        .success { color: #4caf50; }
-        .error { color: #f44336; }
+
+        /* ===== 密码界面 ===== */
         #pwd-screen {
             position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: #0a0e1a;
+            inset: 0;
+            background: rgba(10,14,26,0.95);
+            backdrop-filter: blur(20px);
             display: flex;
             flex-direction: column;
             justify-content: center;
             align-items: center;
             z-index: 999;
         }
-        #pwd-screen input {
-            width: 200px;
-            padding: 10px;
+        .pwd-card {
+            background: rgba(20,25,39,0.8);
+            border: 1px solid rgba(0,229,255,0.2);
+            border-radius: 20px;
+            padding: 40px 30px;
+            text-align: center;
+            box-shadow: 0 0 60px rgba(0,229,255,0.1);
+            max-width: 320px;
+            width: 90%;
+        }
+        .pwd-card h1 {
+            font-size: 22px;
+            margin-bottom: 4px;
+        }
+        .pwd-card p {
+            color: #666;
+            font-size: 12px;
+            margin-bottom: 20px;
+        }
+        .pwd-card input {
+            width: 100%;
+            padding: 12px 16px;
             border: 1px solid #2a3142;
-            border-radius: 8px;
-            background: #141927;
+            border-radius: 12px;
+            background: rgba(10,14,26,0.8);
             color: #e0e0e0;
             text-align: center;
             font-size: 16px;
             outline: none;
-            margin-bottom: 10px;
+            margin-bottom: 12px;
+            transition: border-color 0.3s;
         }
-        #pwd-screen input:focus { border-color: #00e5ff; }
-        #pwd-screen button {
-            width: 120px;
-            padding: 10px;
-            background: #00e5ff;
+        .pwd-card input:focus {
+            border-color: #00e5ff;
+            box-shadow: 0 0 20px rgba(0,229,255,0.15);
+        }
+        .pwd-card button {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #00e5ff, #8073ff);
             color: #000;
             border: none;
-            border-radius: 8px;
+            border-radius: 12px;
             font-size: 15px;
             font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
         }
+        .pwd-card button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,229,255,0.3);
+        }
+        .pwd-card button:active { transform: translateY(0); }
         #pwd-error {
             color: #f44336;
             font-size: 13px;
-            margin-top: 8px;
+            margin-top: 10px;
             display: none;
         }
-        #app { display: none; }
+
+        /* ===== 主界面 ===== */
+        #app {
+            display: none;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 12px;
+            position: relative;
+            z-index: 1;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 16px;
+            position: relative;
+        }
+        .header h1 {
+            font-size: 24px;
+            background: linear-gradient(135deg, #00e5ff, #8073ff, #ff0080);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 2px;
+        }
+        .header .subtitle {
+            color: #666;
+            font-size: 12px;
+        }
+        /* 动漫人物装饰 */
+        .anime-deco {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            width: 120px;
+            height: 160px;
+            border-radius: 12px;
+            object-fit: cover;
+            opacity: 0.15;
+            pointer-events: none;
+            z-index: 0;
+            display: none;
+        }
+        @media (min-width: 768px) {
+            .anime-deco { display: block; }
+        }
+        .anime-deco-left {
+            position: fixed;
+            bottom: 10px;
+            left: 10px;
+            width: 120px;
+            height: 160px;
+            border-radius: 12px;
+            object-fit: cover;
+            opacity: 0.15;
+            pointer-events: none;
+            z-index: 0;
+            display: none;
+        }
+        @media (min-width: 768px) {
+            .anime-deco-left { display: block; }
+        }
+
+        /* 卡片 */
+        .card {
+            background: rgba(20,25,39,0.6);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.06);
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 12px;
+            transition: border-color 0.3s;
+        }
+        .card:hover {
+            border-color: rgba(0,229,255,0.15);
+        }
+        .card-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #00e5ff;
+            font-size: 13px;
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+        .card-label .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #00e5ff;
+            box-shadow: 0 0 8px #00e5ff;
+        }
+        .card-label.output .dot {
+            background: #4caf50;
+            box-shadow: 0 0 8px #4caf50;
+        }
+        .card-label.output { color: #4caf50; }
+
+        /* 文件上传区 */
+        .upload-zone {
+            border: 2px dashed #2a3142;
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 8px;
+            position: relative;
+        }
+        .upload-zone:hover, .upload-zone.dragover {
+            border-color: #00e5ff;
+            background: rgba(0,229,255,0.05);
+        }
+        .upload-zone .upload-icon {
+            font-size: 32px;
+            margin-bottom: 6px;
+        }
+        .upload-zone .upload-text {
+            color: #888;
+            font-size: 13px;
+        }
+        .upload-zone .upload-text span {
+            color: #00e5ff;
+            font-weight: bold;
+        }
+        .upload-zone .file-info {
+            color: #4caf50;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+
+        textarea {
+            width: 100%;
+            background: rgba(10,14,26,0.8);
+            color: #e0e0e0;
+            border: 1px solid #2a3142;
+            border-radius: 12px;
+            padding: 12px;
+            font-family: "Courier New", monospace;
+            font-size: 13px;
+            resize: vertical;
+            min-height: 100px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        textarea:focus {
+            border-color: #00e5ff;
+            box-shadow: 0 0 15px rgba(0,229,255,0.1);
+        }
+        textarea::placeholder { color: #444; }
+
+        /* 按钮组 */
+        .btn-group {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s, opacity 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+        .btn:hover { transform: translateY(-2px); }
+        .btn:active { transform: translateY(0); }
+        .btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #00e5ff, #00b8d4);
+            color: #000;
+            flex: 1;
+        }
+        .btn-primary:hover:not(:disabled) {
+            box-shadow: 0 6px 20px rgba(0,229,255,0.3);
+        }
+        .btn-secondary {
+            background: rgba(42,49,66,0.8);
+            color: #aaa;
+        }
+        .btn-success {
+            background: linear-gradient(135deg, #4caf50, #2e7d32);
+            color: #fff;
+            flex: 1;
+        }
+        .btn-success:hover:not(:disabled) {
+            box-shadow: 0 6px 20px rgba(76,175,80,0.3);
+        }
+        .btn-warning {
+            background: linear-gradient(135deg, #ff9800, #e65100);
+            color: #000;
+        }
+        .btn-full { width: 100%; }
+
+        /* 状态栏 */
+        .status-bar {
+            font-size: 12px;
+            text-align: center;
+            padding: 8px 12px;
+            border-radius: 8px;
+            margin: 8px 0;
+            min-height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+        .status-bar.idle {
+            color: #444;
+            background: transparent;
+        }
+        .status-bar.loading {
+            color: #ff9800;
+            background: rgba(255,152,0,0.08);
+        }
+        .status-bar.success {
+            color: #4caf50;
+            background: rgba(76,175,80,0.08);
+        }
+        .status-bar.error {
+            color: #f44336;
+            background: rgba(244,67,54,0.08);
+            word-break: break-all;
+        }
+        .spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid currentColor;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 6px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* 加载进度条 */
+        .progress-bar {
+            width: 100%;
+            height: 3px;
+            background: #1a1e2e;
+            border-radius: 2px;
+            overflow: hidden;
+            margin: 4px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00e5ff, #8073ff);
+            border-radius: 2px;
+            transition: width 0.3s;
+            width: 0%;
+        }
+
+        /* 统计信息 */
+        .stats {
+            display: flex;
+            gap: 8px;
+            margin-top: 6px;
+        }
+        .stat-item {
+            flex: 1;
+            background: rgba(10,14,26,0.5);
+            border-radius: 8px;
+            padding: 6px 8px;
+            text-align: center;
+        }
+        .stat-item .stat-label {
+            font-size: 10px;
+            color: #555;
+        }
+        .stat-item .stat-value {
+            font-size: 14px;
+            color: #00e5ff;
+            font-weight: bold;
+        }
+
+        .hidden { display: none !important; }
     </style>
 </head>
 <body>
 
+<!-- 浮动粒子 -->
+<script>
+for (let i = 0; i < 15; i++) {
+    const p = document.createElement('div');
+    p.className = 'particle';
+    const size = Math.random() * 4 + 2;
+    p.style.width = size + 'px';
+    p.style.height = size + 'px';
+    p.style.left = Math.random() * 100 + '%';
+    p.style.background = ['#00e5ff', '#8073ff', '#ff0080'][Math.floor(Math.random()*3)];
+    p.style.opacity = '0.3';
+    p.style.animationDuration = (Math.random() * 10 + 10) + 's';
+    p.style.animationDelay = (Math.random() * 10) + 's';
+    document.body.appendChild(p);
+}
+</script>
+
+<!-- 动漫人物装饰 -->
+<img class="anime-deco-left" src="anime-ninja.jpg" alt="">
+<img class="anime-deco" src="anime-hacker.jpg" alt="">
+
+<!-- 密码界面 -->
 <div id="pwd-screen">
-    <h1>苍米独家混淆</h1>
-    <p style="color:#888;font-size:12px;margin-bottom:20px;">请输入访问密码</p>
-    <input type="password" id="pwd-input" placeholder="密码" autofocus>
-    <button onclick="checkPwd()">进入</button>
-    <div id="pwd-error">密码错误</div>
+    <div class="pwd-card">
+        <h1>苍米独家混淆</h1>
+        <p>请输入访问密码</p>
+        <input type="password" id="pwd-input" placeholder="输入密码" autofocus>
+        <button onclick="checkPwd()">进 入</button>
+        <div id="pwd-error">密码错误，请重试</div>
+    </div>
 </div>
 
+<!-- 主界面 -->
 <div id="app">
-    <h1>苍米独家混淆</h1>
-    <div class="subtitle">12层混淆保护 · 浏览器本地运行</div>
-
-    <label>输入 Luau 脚本</label>
-    <textarea id="input-code" placeholder="在此粘贴要混淆的代码..."></textarea>
-
-    <div class="btn-row">
-        <button class="btn-clear" onclick="document.getElementById('input-code').value=''">清空</button>
-        <button class="btn-run" id="btn-run" onclick="doObfuscate()" disabled>开始混淆</button>
+    <div class="header">
+        <h1>苍米独家混淆</h1>
+        <div class="subtitle">12层混淆保护 · 浏览器本地运行 · 代码不上传</div>
     </div>
 
-    <div class="status" id="status">正在加载Python环境，请稍候...</div>
-    <div id="retry-area" style="display:none;text-align:center;">
-        <button class="btn-retry" onclick="initPyodide()">重试加载</button>
+    <!-- 输入区 -->
+    <div class="card">
+        <div class="card-label">
+            <span class="dot"></span>
+            <span>输入 Luau / Lua 脚本</span>
+        </div>
+
+        <!-- 文件上传 -->
+        <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()">
+            <div class="upload-icon">📁</div>
+            <div class="upload-text">
+                <span>点击选择文件</span> 或拖拽文件到此
+            </div>
+            <div class="upload-text" style="font-size:11px;color:#555;margin-top:4px;">
+                支持 .lua .luau .txt 文件
+            </div>
+            <div class="file-info hidden" id="file-info"></div>
+        </div>
+        <input type="file" id="file-input" class="hidden" accept=".lua,.luau,.txt,.text">
+
+        <textarea id="input-code" placeholder="或在此直接粘贴代码..." style="margin-top:8px;"></textarea>
+
+        <div class="stats">
+            <div class="stat-item">
+                <div class="stat-label">行数</div>
+                <div class="stat-value" id="stat-lines">0</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">字符数</div>
+                <div class="stat-value" id="stat-chars">0</div>
+            </div>
+        </div>
     </div>
 
-    <label>输出结果</label>
-    <textarea id="output-code" placeholder="混淆后的代码将显示在这里..." readonly></textarea>
+    <!-- 操作按钮 -->
+    <div class="card">
+        <div class="btn-group">
+            <button class="btn btn-primary" id="btn-run" onclick="doObfuscate()" disabled>
+                <span>开始混淆</span>
+            </button>
+            <button class="btn btn-secondary" onclick="clearInput()">清空</button>
+        </div>
 
-    <div class="btn-row">
-        <button class="btn-copy" onclick="copyResult()">复制结果</button>
+        <div class="status-bar idle" id="status">
+            正在加载Python环境，请稍候...
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="progress"></div></div>
+        <div id="retry-area" class="hidden" style="text-align:center;margin-top:8px;">
+            <button class="btn btn-warning" onclick="initPyodide()">重试加载</button>
+        </div>
+    </div>
+
+    <!-- 输出区 -->
+    <div class="card">
+        <div class="card-label output">
+            <span class="dot"></span>
+            <span>混淆结果</span>
+        </div>
+        <textarea id="output-code" placeholder="混淆后的代码将显示在这里..." readonly></textarea>
+
+        <div class="stats">
+            <div class="stat-item">
+                <div class="stat-label">行数</div>
+                <div class="stat-value" id="stat-out-lines">0</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-label">字符数</div>
+                <div class="stat-value" id="stat-out-chars">0</div>
+            </div>
+        </div>
+
+        <div class="btn-group" style="margin-top:8px;">
+            <button class="btn btn-success" onclick="copyResult()" id="btn-copy">📋 复制结果</button>
+            <button class="btn btn-secondary" onclick="downloadResult()" id="btn-download">💾 下载文件</button>
+        </div>
     </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"
+        onerror="this.remove(); var s=document.createElement('script'); s.src='https://unpkg.com/pyodide@0.26.2/full/pyodide.js'; document.head.appendChild(s);"></script>
 <script>
 // ===== 配置 =====
 const ACCESS_PASSWORD = "cangmi2024";
 const PYODIDE_VERSION = "0.26.2";
-
-// 多个 CDN 源，按优先级尝试
 const PYODIDE_CDNS = [
     `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`,
     `https://unpkg.com/pyodide@${PYODIDE_VERSION}/full/`,
     `https://fastly.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`,
 ];
 
-// Python 环境
 let pyodide = null;
 let do_obfuscate_py = null;
 let pyodideLoading = false;
+let loadedFileName = '';
 
+// ===== 密码 =====
 function checkPwd() {
     const input = document.getElementById('pwd-input').value;
     if (input === ACCESS_PASSWORD) {
         sessionStorage.setItem('authed', '1');
         document.getElementById('pwd-screen').style.display = 'none';
         document.getElementById('app').style.display = 'block';
-        if (!pyodide && !pyodideLoading) {
-            initPyodide();
-        }
+        if (!pyodide && !pyodideLoading) initPyodide();
     } else {
         document.getElementById('pwd-error').style.display = 'block';
+        document.getElementById('pwd-input').value = '';
+        document.getElementById('pwd-input').focus();
     }
 }
 
-// 自动登录
 if (sessionStorage.getItem('authed') === '1') {
     document.getElementById('pwd-screen').style.display = 'none';
     document.getElementById('app').style.display = 'block';
-    if (!pyodide && !pyodideLoading) {
-        initPyodide();
-    }
+    if (!pyodide && !pyodideLoading) initPyodide();
 }
 
-// 回车提交密码
-document.getElementById('pwd-input').addEventListener('keydown', function(e) {
+document.getElementById('pwd-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') checkPwd();
 });
 
-// 动态加载脚本
+// ===== 文件上传 =====
+const fileInput = document.getElementById('file-input');
+const uploadZone = document.getElementById('upload-zone');
+const fileInfo = document.getElementById('file-info');
+
+fileInput.addEventListener('change', e => {
+    if (e.target.files[0]) handleFile(e.target.files[0]);
+});
+
+uploadZone.addEventListener('dragover', e => {
+    e.preventDefault();
+    uploadZone.classList.add('dragover');
+});
+uploadZone.addEventListener('dragleave', () => {
+    uploadZone.classList.remove('dragover');
+});
+uploadZone.addEventListener('drop', e => {
+    e.preventDefault();
+    uploadZone.classList.remove('dragover');
+    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+
+function handleFile(file) {
+    const reader = new FileReader();
+    reader.onload = e => {
+        document.getElementById('input-code').value = e.target.result;
+        loadedFileName = file.name;
+        fileInfo.textContent = `已加载: ${file.name} (${(file.size/1024).toFixed(1)} KB)`;
+        fileInfo.classList.remove('hidden');
+        updateStats();
+    };
+    reader.readAsText(file);
+}
+
+// ===== 统计信息 =====
+document.getElementById('input-code').addEventListener('input', updateStats);
+
+function updateStats() {
+    const code = document.getElementById('input-code').value;
+    document.getElementById('stat-lines').textContent = code ? code.split('\n').length : 0;
+    document.getElementById('stat-chars').textContent = code.length;
+}
+
+function updateOutputStats() {
+    const code = document.getElementById('output-code').value;
+    document.getElementById('stat-out-lines').textContent = code ? code.split('\n').length : 0;
+    document.getElementById('stat-out-chars').textContent = code.length;
+}
+
+function clearInput() {
+    document.getElementById('input-code').value = '';
+    document.getElementById('output-code').value = '';
+    fileInfo.classList.add('hidden');
+    loadedFileName = '';
+    fileInput.value = '';
+    updateStats();
+    updateOutputStats();
+    setStatus('已清空', 'idle');
+}
+
+// ===== 状态栏 =====
+function setStatus(text, type) {
+    const bar = document.getElementById('status');
+    bar.className = 'status-bar ' + type;
+    if (type === 'loading') {
+        bar.innerHTML = '<div class="spinner"></div>' + text;
+    } else {
+        bar.textContent = text;
+    }
+}
+
+function setProgress(pct) {
+    document.getElementById('progress').style.width = pct + '%';
+}
+
+// ===== Pyodide 初始化 =====
 function loadScript(url) {
     return new Promise((resolve, reject) => {
         const existing = document.querySelector(`script[src="${url}"]`);
-        if (existing) {
-            resolve();
-            return;
-        }
+        if (existing) { resolve(); return; }
         const script = document.createElement('script');
         script.src = url;
         script.onload = () => resolve();
-        script.onerror = () => reject(new Error('无法加载脚本: ' + url));
+        script.onerror = () => reject(new Error('CDN 脚本加载失败'));
         document.head.appendChild(script);
     });
 }
@@ -239,40 +655,34 @@ async function initPyodide() {
     pyodideLoading = true;
 
     const btn = document.getElementById('btn-run');
-    const status = document.getElementById('status');
-    const retryArea = document.getElementById('retry-area');
+    document.getElementById('retry-area').classList.add('hidden');
 
     btn.disabled = true;
-    retryArea.style.display = 'none';
+    setProgress(5);
+    setStatus('正在下载 Python 运行环境 (约10MB)...', 'loading');
 
-    // 依次尝试不同 CDN
     for (let i = 0; i < PYODIDE_CDNS.length; i++) {
         const cdn = PYODIDE_CDNS[i];
         try {
-            status.textContent = `[${i+1}/${PYODIDE_CDNS.length}] 正在下载Python运行环境(约10MB)...`;
-            status.className = 'status loading';
+            setStatus(`[${i+1}/${PYODIDE_CDNS.length}] 下载 Python 引擎中...`, 'loading');
+            setProgress(10 + i * 10);
 
-            // 加载 pyodide.js
             await loadScript(cdn + 'pyodide.js');
+            setProgress(40);
 
-            status.textContent = `[${i+1}/${PYODIDE_CDNS.length}] 正在初始化Python引擎...`;
-
-            // 初始化 Pyodide，指定 indexURL
+            setStatus(`[${i+1}/${PYODIDE_CDNS.length}] 初始化 Python 引擎...`, 'loading');
             pyodide = await loadPyodide({ indexURL: cdn });
+            setProgress(60);
 
-            status.textContent = '正在加载混淆引擎...';
-
-            // 获取 Python 文件
+            setStatus('正在加载混淆引擎...', 'loading');
             const response = await fetch('obfuscator_all.py');
-            if (!response.ok) {
-                throw new Error('混淆引擎文件下载失败: HTTP ' + response.status);
-            }
+            if (!response.ok) throw new Error('引擎文件下载失败: HTTP ' + response.status);
             const pyCode = await response.text();
+            setProgress(75);
 
-            // 运行 Python 代码
             pyodide.runPython(pyCode);
+            setProgress(90);
 
-            // 创建代理函数
             do_obfuscate_py = pyodide.runPython(`
 from pyodide.ffi import create_proxy
 
@@ -286,98 +696,121 @@ def _do_obfuscate(code):
 
 create_proxy(_do_obfuscate)
 `);
+            setProgress(100);
 
-            // 成功
             btn.disabled = false;
-            status.textContent = '引擎就绪，可以开始混淆';
-            status.className = 'status success';
+            setStatus('引擎就绪，可以开始混淆', 'success');
             setTimeout(() => {
-                status.textContent = '';
-                status.className = 'status';
-            }, 3000);
+                setStatus('准备就绪', 'idle');
+                setProgress(0);
+            }, 2000);
 
             pyodideLoading = false;
             return;
 
         } catch (err) {
             console.error(`CDN ${i+1} 失败:`, err);
-            status.textContent = `[${i+1}/${PYODIDE_CDNS.length}] 失败: ${err.message}`;
-            status.className = 'status error';
-
-            // 清理可能残留的 script 标签
-            if (typeof loadPyodide !== 'undefined') {
-                // 已经加载了 pyodide.js 但初始化失败，不需要再试其他 CDN
-                if (err.message.includes('混淆引擎') || err.message.includes('初始化')) {
-                    // Pyodide 加载成功但后续步骤失败，可以重试
-                    break;
-                }
+            setStatus(`CDN ${i+1} 失败: ${err.message}`, 'error');
+            if (typeof loadPyodide !== 'undefined' && (err.message.includes('引擎') || err.message.includes('初始化'))) {
+                break;
             }
         }
     }
 
-    // 所有 CDN 都失败
-    status.textContent = '加载失败，请检查网络后点击重试。如果反复失败，请使用科学上网或换一个网络环境。';
-    status.className = 'status error';
-    retryArea.style.display = 'block';
+    setStatus('加载失败，请检查网络后重试。建议开启 VPN 或更换网络环境。', 'error');
+    document.getElementById('retry-area').classList.remove('hidden');
     pyodideLoading = false;
 }
 
+// ===== 混淆 =====
 async function doObfuscate() {
     const code = document.getElementById('input-code').value.trim();
     if (!code) {
-        document.getElementById('status').textContent = '请先输入代码';
-        document.getElementById('status').className = 'status error';
+        setStatus('请先输入或上传代码', 'error');
         return;
     }
-
     if (!do_obfuscate_py) {
-        document.getElementById('status').textContent = '引擎还在加载中，请稍等...';
-        document.getElementById('status').className = 'status loading';
+        setStatus('引擎还在加载中，请稍等...', 'loading');
         return;
     }
 
     const btn = document.getElementById('btn-run');
-    const status = document.getElementById('status');
     btn.disabled = true;
-    btn.textContent = '混淆中...';
-    status.textContent = '正在处理，请稍候...';
-    status.className = 'status loading';
+    btn.innerHTML = '<div class="spinner"></div> 混淆中...';
+    setStatus('正在混淆，请稍候...', 'loading');
+    setProgress(30);
 
     try {
         await new Promise(r => setTimeout(r, 50));
+        setProgress(60);
         const result = do_obfuscate_py(code);
+        setProgress(90);
+
         document.getElementById('output-code').value = result;
+        updateOutputStats();
 
         if (result.startsWith('ERROR:')) {
-            status.textContent = '混淆出错，请检查代码';
-            status.className = 'status error';
+            setStatus('混淆出错，请检查代码语法', 'error');
+            setProgress(0);
         } else {
-            status.textContent = '混淆完成';
-            status.className = 'status success';
+            setStatus('混淆完成', 'success');
+            setProgress(100);
+            setTimeout(() => { setProgress(0); setStatus('完成', 'idle'); }, 2000);
         }
     } catch (e) {
-        status.textContent = '错误: ' + e.message;
-        status.className = 'status error';
+        setStatus('错误: ' + e.message, 'error');
+        setProgress(0);
         console.error(e);
     } finally {
         btn.disabled = false;
-        btn.textContent = '开始混淆';
+        btn.innerHTML = '<span>开始混淆</span>';
     }
 }
 
+// ===== 复制 =====
 function copyResult() {
     const output = document.getElementById('output-code');
+    if (!output.value) {
+        setStatus('没有可复制的内容', 'error');
+        return;
+    }
     output.select();
     output.setSelectionRange(0, 99999);
-    document.execCommand('copy');
-    const status = document.getElementById('status');
-    status.textContent = '已复制到剪贴板';
-    status.className = 'status success';
-    setTimeout(() => {
-        status.textContent = '';
-        status.className = 'status';
-    }, 2000);
+    try {
+        document.execCommand('copy');
+        setStatus('已复制到剪贴板', 'success');
+        setTimeout(() => setStatus('准备就绪', 'idle'), 2000);
+    } catch (e) {
+        setStatus('复制失败，请手动选择复制', 'error');
+    }
 }
+
+// ===== 下载 =====
+function downloadResult() {
+    const output = document.getElementById('output-code');
+    if (!output.value) {
+        setStatus('没有可下载的内容', 'error');
+        return;
+    }
+    let name = loadedFileName ?
+        loadedFileName.replace(/\.(lua|luau|txt)$/, '_obfuscated.lua') :
+        'obfuscated.lua';
+
+    const blob = new Blob([output.value], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    setStatus(`已下载: ${name}`, 'success');
+    setTimeout(() => setStatus('准备就绪', 'idle'), 2000);
+}
+
+updateStats();
 </script>
 
 </body>
