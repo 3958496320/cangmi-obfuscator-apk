@@ -4,8 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>苍米独家混淆</title>
-    <link rel="stylesheet" href="https://pyscript.net/releases/2024.1.1/core.css">
-    <script type="module" src="https://pyscript.net/releases/2024.1.1/core.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -70,6 +68,7 @@
         .btn-run:disabled {
             background: #333;
             color: #666;
+            cursor: not-allowed;
         }
         .btn-clear {
             background: #2a3142;
@@ -87,15 +86,9 @@
             margin: 8px 0;
             min-height: 16px;
         }
-        .loading {
-            color: #ff9800;
-        }
-        .success {
-            color: #4caf50;
-        }
-        .error {
-            color: #f44336;
-        }
+        .loading { color: #ff9800; }
+        .success { color: #4caf50; }
+        .error { color: #f44336; }
         #pwd-screen {
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
@@ -157,10 +150,10 @@
 
     <div class="btn-row">
         <button class="btn-clear" onclick="document.getElementById('input-code').value=''">清空</button>
-        <button class="btn-run" id="btn-run" onclick="doObfuscate()">开始混淆</button>
+        <button class="btn-run" id="btn-run" onclick="doObfuscate()" disabled>开始混淆</button>
     </div>
 
-    <div class="status" id="status"></div>
+    <div class="status" id="status">正在加载Python环境，请稍候...</div>
 
     <label>输出结果</label>
     <textarea id="output-code" placeholder="混淆后的代码将显示在这里..." readonly></textarea>
@@ -170,29 +163,14 @@
     </div>
 </div>
 
-<py-config>
-  [[fetch]]
-  files = ["obfuscator_all.py"]
-</py-config>
-
-<py-script>
-from obfuscator_all import obfuscate_code
-from pyodide.ffi import create_proxy
-
-def _do_obfuscate(code):
-    try:
-        result = obfuscate_code(code)
-        return result
-    except Exception as e:
-        import traceback
-        return "ERROR: " + str(e) + "\n" + traceback.format_exc()
-
-do_obfuscate_py = create_proxy(_do_obfuscate)
-</py-script>
-
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
 <script>
-// 访问密码 - 改成你自己的密码
+// 访问密码
 const ACCESS_PASSWORD = "cangmi2024";
+
+// Python 环境
+let pyodide = null;
+let do_obfuscate_py = null;
 
 function checkPwd() {
     const input = document.getElementById('pwd-input').value;
@@ -200,6 +178,10 @@ function checkPwd() {
         sessionStorage.setItem('authed', '1');
         document.getElementById('pwd-screen').style.display = 'none';
         document.getElementById('app').style.display = 'block';
+        // 首次进入时初始化 Pyodide
+        if (!pyodide) {
+            initPyodide();
+        }
     } else {
         document.getElementById('pwd-error').style.display = 'block';
     }
@@ -209,6 +191,9 @@ function checkPwd() {
 if (sessionStorage.getItem('authed') === '1') {
     document.getElementById('pwd-screen').style.display = 'none';
     document.getElementById('app').style.display = 'block';
+    if (!pyodide) {
+        initPyodide();
+    }
 }
 
 // 回车提交密码
@@ -216,11 +201,70 @@ document.getElementById('pwd-input').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') checkPwd();
 });
 
+async function initPyodide() {
+    const btn = document.getElementById('btn-run');
+    const status = document.getElementById('status');
+
+    try {
+        status.textContent = '正在下载Python运行环境(约10MB)...';
+        status.className = 'status loading';
+
+        pyodide = await loadPyodide();
+
+        status.textContent = '正在加载混淆引擎...';
+
+        // 获取 Python 文件
+        const response = await fetch('obfuscator_all.py');
+        if (!response.ok) {
+            throw new Error('无法下载混淆引擎文件: ' + response.status);
+        }
+        const pyCode = await response.text();
+
+        // 运行 Python 代码（定义 obfuscate_code 函数）
+        pyodide.runPython(pyCode);
+
+        // 创建代理函数供 JS 调用
+        do_obfuscate_py = pyodide.runPython(`
+from pyodide.ffi import create_proxy
+
+def _do_obfuscate(code):
+    try:
+        result = obfuscate_code(code)
+        return result
+    except Exception as e:
+        import traceback
+        return "ERROR: " + str(e) + "\\n" + traceback.format_exc()
+
+create_proxy(_do_obfuscate)
+`);
+
+        // 加载完成，启用按钮
+        btn.disabled = false;
+        status.textContent = '引擎就绪，可以开始混淆';
+        status.className = 'status success';
+        setTimeout(() => {
+            status.textContent = '';
+            status.className = 'status';
+        }, 3000);
+
+    } catch (err) {
+        status.textContent = '加载失败: ' + err.message;
+        status.className = 'status error';
+        console.error('Pyodide init error:', err);
+    }
+}
+
 async function doObfuscate() {
     const code = document.getElementById('input-code').value.trim();
     if (!code) {
         document.getElementById('status').textContent = '请先输入代码';
         document.getElementById('status').className = 'status error';
+        return;
+    }
+
+    if (!do_obfuscate_py) {
+        document.getElementById('status').textContent = '引擎还在加载中，请稍等...';
+        document.getElementById('status').className = 'status loading';
         return;
     }
 
@@ -232,10 +276,19 @@ async function doObfuscate() {
     status.className = 'status loading';
 
     try {
+        // 让 UI 先刷新再执行（Python 是同步阻塞的）
+        await new Promise(r => setTimeout(r, 50));
+
         const result = do_obfuscate_py(code);
         document.getElementById('output-code').value = result;
-        status.textContent = '混淆完成';
-        status.className = 'status success';
+
+        if (result.startsWith('ERROR:')) {
+            status.textContent = '混淆出错，请检查代码';
+            status.className = 'status error';
+        } else {
+            status.textContent = '混淆完成';
+            status.className = 'status success';
+        }
     } catch (e) {
         status.textContent = '错误: ' + e.message;
         status.className = 'status error';
@@ -249,6 +302,7 @@ async function doObfuscate() {
 function copyResult() {
     const output = document.getElementById('output-code');
     output.select();
+    output.setSelectionRange(0, 99999);
     document.execCommand('copy');
     const status = document.getElementById('status');
     status.textContent = '已复制到剪贴板';
