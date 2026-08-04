@@ -1152,15 +1152,30 @@ class CodeGenerator:
         if t == "Table":
             return self.gen_table(node)
         if t == "BinOp":
+            op = node.get("op")
+            # Luau/Roblox 不支持原生位运算符（~ >> << & |），
+            # 必须用 bit32 库。这是 100% 稳定运行的关键。
+            # bit32 在 Roblox/Luau/忍者注入器中全局可用。
+            _BIT32_FN = {
+                "~": "bxor", ">>": "rshift", "<<": "lshift",
+                "&": "band", "|": "bor",
+            }
+            if op in _BIT32_FN:
+                left = self.gen_expr(node.get("left"))
+                right = self.gen_expr(node.get("right"))
+                return f"bit32.{_BIT32_FN[op]}({left}, {right})"
             left = self.gen_expr(node.get("left"))
             right = self.gen_expr(node.get("right"))
-            op = node.get("op")
             # 对字符串连接与某些运算符加括号保护优先级
             left = self.wrap_if_needed(node.get("left"), left, op, True)
             right = self.wrap_if_needed(node.get("right"), right, op, False)
             return f"{left} {op} {right}"
         if t == "UnaryOp":
             op = node.get("op")
+            # 一元 ~ (按位非) 同样转 bit32.bnot
+            if op == "~":
+                operand = self.gen_expr(node.get("operand"))
+                return f"bit32.bnot({operand})"
             operand = self.gen_expr(node.get("operand"))
             if node.get("operand").type in ("BinOp",):
                 operand = f"({operand})"
@@ -2915,6 +2930,67 @@ class _NotVMable(Exception):
     pass
 
 
+def _modifies_external_name(func: Node) -> bool:
+    """检测函数是否对「自身 params/locals 之外」的 Name 变量赋值。
+
+    VM 编译时把 upvalue 复制到 U 表（值拷贝，见 U[i] = name），
+    把全局复制到 G 表。对 upvalue/全局的赋值只改 U/G 副本，不回写原变量，
+    导致闭包计数器等场景下 upvalue 共享丢失（输出 1,1,1 而非 1,2,3）。
+    因此 VM 必须跳过此类函数，改由 CFF 处理（CFF 保持 upvalue 语义）。
+
+    检测逻辑：收集函数自身 params + body LocalAssign 名字 = own_locals，
+    若存在 Assign 的 target 是 Name 且不在 own_locals，则返回 True。
+    """
+    own_locals = set(func.get("params") or [])
+
+    def _collect_locals(node):
+        if not isinstance(node, Node):
+            return
+        if node.type == "LocalAssign":
+            for nm in node.get("names") or []:
+                own_locals.add(nm)
+        for k, v in node.attrs.items():
+            if isinstance(v, Node):
+                _collect_locals(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, Node):
+                        _collect_locals(item)
+                    elif isinstance(item, tuple):
+                        for sub in item:
+                            if isinstance(sub, Node):
+                                _collect_locals(sub)
+    _collect_locals(func)
+
+    found = [False]
+
+    def _check(node):
+        if found[0] or not isinstance(node, Node):
+            return
+        if node.type == "Assign":
+            for tgt in node.get("targets") or []:
+                if tgt.type == "Name" and tgt.get("name") not in own_locals:
+                    found[0] = True
+                    return
+        for k, v in node.attrs.items():
+            if found[0]:
+                return
+            if isinstance(v, Node):
+                _check(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if found[0]:
+                        return
+                    if isinstance(item, Node):
+                        _check(item)
+                    elif isinstance(item, tuple):
+                        for sub in item:
+                            if isinstance(sub, Node):
+                                _check(sub)
+    _check(func)
+    return found[0]
+
+
 def vm_compile_function(func: Node, rng: random.Random,
                         gen: NameGenerator):
     """尝试将函数编译为 VM 字节码 + 解释器。
@@ -2923,6 +2999,10 @@ def vm_compile_function(func: Node, rng: random.Random,
     为保持简单与安全：返回的 Function 主体是「内联解释器循环」，
     参数与原函数一致，返回值与原函数一致。
     """
+    # 安全闸：函数若修改 upvalue/外部变量，VM 值拷贝会破坏语义，跳过 VM。
+    # 这类函数改由 CFF 处理（CFF 保持 upvalue 语义），100% 稳定。
+    if _modifies_external_name(func):
+        return None
     compiler = _VMCompiler(rng, gen)
     src = compiler.compile(func)
     if src is None:
@@ -3903,6 +3983,20 @@ def disrupt_ast(chunk: Node, rng: random.Random,
                     noreturn_ids.add(id(e))
         elif node.type == "Return":
             # return 的表达式列表：禁止加括号（保留多返回值与尾调用语义）
+            for e in node.get("exprs") or []:
+                if isinstance(e, Node):
+                    noreturn_ids.add(id(e))
+        elif node.type == "LocalAssign":
+            # LocalAssign 的表达式列表：禁止加括号。
+            # 关键：`local a, b, c = f()` 中 f() 是最后一个（或唯一）表达式，
+            # 需保留多返回值。若被包成 (f()) 则只返回第一个值 → a,b,c 后两个为 nil。
+            # 保守保护所有 exprs（牺牲极少量括号扰乱，换 100% 语义稳定）。
+            for e in node.get("exprs") or []:
+                if isinstance(e, Node):
+                    noreturn_ids.add(id(e))
+        elif node.type == "Assign":
+            # Assign 的表达式列表：同 LocalAssign，保护多返回值赋值。
+            # 例：a, b, c = f() 若 f() 被包成 (f()) 则丢失多返回值。
             for e in node.get("exprs") or []:
                 if isinstance(e, Node):
                     noreturn_ids.add(id(e))
@@ -5244,14 +5338,20 @@ def apply_dyninst(chunk: Node, rng: random.Random,
     rng.shuffle(candidates)
     chosen = candidates[:max_points]
 
-    # 3. 为每种运算符分配一个随机 _G 键（共享，减少函数数量）
+    # 3. 为每种运算符分配一个随机键（共享，减少函数数量）
+    #    关键修复：不能用 _G 存储运算符函数！Luau/Roblox 中 _G 是只读表，
+    #    写入会抛 "attempt to modify a readonly table" 错误。
+    #    改用 chunk 顶层 local 表（闭包对所有后续函数可见），100% 稳定。
     op_to_key = {}
     used_ops = sorted({c.get("op") for c in chosen}, key=lambda x: rng.random())
     for op in used_ops:
         op_to_key[op] = gen.fresh()
+    # 运算符函数存放表（chunk 级 local，所有函数通过 upvalue 捕获）
+    tbl_name = gen.fresh()
 
     # 4. 注入运算符函数注册块（位于 Chunk 顶部）
-    #    _G["<key>"] = function(a, b) return a <op> b end
+    #    local <tbl> = {}            ← chunk 顶层，所有函数可见
+    #    do <tbl>["<key>"] = function(a, b) return a <op> b end ... end
     reg_body = []
     for op in used_ops:
         key = op_to_key[op]
@@ -5268,10 +5368,13 @@ def apply_dyninst(chunk: Node, rng: random.Random,
         # 此处同时设 _cff_done / _no_flatten 以彻底跳过 VM 与 CFF。
         fn.attrs["_cff_done"] = True
         fn.attrs["_no_flatten"] = True
-        # _G[key] = fn   （用 Index 赋值）
+        # <tbl>[key] = fn   （用 Index 赋值到本地表，非 _G）
         reg_body.append(N("Assign",
-            targets=[N("Index", obj=name_node("_G"), key=string_node(key))],
+            targets=[N("Index", obj=name_node(tbl_name), key=string_node(key))],
             exprs=[fn]))
+    # chunk 顶层 local 表声明（必须在 Do 块外，保证 upvalue 可见性）
+    tbl_decl = N("LocalAssign", names=[tbl_name],
+                 exprs=[N("Table", fields=[])])
     reg_block = N("Do", body=reg_body)
 
     # 5. 标记已选节点，避免 transform 时重复处理；用 set(id) 追踪
@@ -5282,7 +5385,7 @@ def apply_dyninst(chunk: Node, rng: random.Random,
         if n.type == "BinOp" and id(n) in chosen_ids and n.get("op") in op_to_key:
             key = op_to_key[n.get("op")]
             new_node = call_node(
-                N("Index", obj=name_node("_G"), key=string_node(key)),
+                N("Index", obj=name_node(tbl_name), key=string_node(key)),
                 [n.get("left"), n.get("right")],
             )
             replaced[0] += 1
@@ -5291,9 +5394,10 @@ def apply_dyninst(chunk: Node, rng: random.Random,
 
     transform(chunk, visit)
 
-    # 6. 把注册块插到最前
+    # 6. 把 local 表声明 + 注册块插到最前（声明在前，保证可见性）
     body = chunk.get("body")
     body.insert(0, reg_block)
+    body.insert(0, tbl_decl)
 
     return {"points": replaced[0], "funcs": len(used_ops)}
 
