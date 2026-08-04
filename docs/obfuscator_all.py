@@ -3087,21 +3087,47 @@ def redirect_apis(chunk: Node, rng: random.Random,
     env_name = env_name or gen.fresh()
 
     # 构造解析器定义 AST
-    # local function <f>() local ok, e = pcall(function() return getfenv() end); if ok and e then return e end; return _G end
-    # 用 function 包裹 getfenv() 而非直接 pcall(getfenv())，避免 Lua 5.3 中
-    # getfenv 为 nil 时 getfenv() 在 pcall 外先求值导致崩溃
+    # 优先级：getgenv() > getfenv() > _G
+    # getgenv() 是 Roblox 注入器（如忍者注入器）提供的全局环境获取函数，
+    # 返回真正的全局环境（不受沙箱限制）。
+    # getfenv() 在 Luau 中已弃用，部分注入器返回受限沙箱环境，
+    # 可能缺少 print/wait 等 API → 脚本静默失败。
+    # 最终兜底 _G（标准全局表）。
+    #
+    # 等价 Luau：
+    #   local function <f>()
+    #       local ok1, genv = pcall(function() return getgenv() end)
+    #       if ok1 and genv then return genv end
+    #       local ok2, fenv = pcall(function() return getfenv() end)
+    #       if ok2 and fenv then return fenv end
+    #       return _G
+    #   end
     inner_fn = N("Function", params=[], is_vararg=False, body=[
-        N("LocalAssign", names=["ok", "e"],
+        # 尝试 getgenv()
+        N("LocalAssign", names=["ok1", "genv"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Function", params=[], is_vararg=False, body=[
+                       N("Return", exprs=[N("Call",
+                           func=N("Name", name="getgenv"), args=[])])
+                   ])])]),
+        N("If",
+          cond=N("BinOp", op="and", left=N("Name", name="ok1"),
+                 right=N("Name", name="genv")),
+          body=[N("Return", exprs=[N("Name", name="genv")])],
+          elifs=[], else_body=None),
+        # 尝试 getfenv()
+        N("LocalAssign", names=["ok2", "fenv"],
           exprs=[N("Call", func=N("Name", name="pcall"),
                    args=[N("Function", params=[], is_vararg=False, body=[
                        N("Return", exprs=[N("Call",
                            func=N("Name", name="getfenv"), args=[])])
                    ])])]),
         N("If",
-          cond=N("BinOp", op="and", left=N("Name", name="ok"),
-                 right=N("Name", name="e")),
-          body=[N("Return", exprs=[N("Name", name="e")])],
+          cond=N("BinOp", op="and", left=N("Name", name="ok2"),
+                 right=N("Name", name="fenv")),
+          body=[N("Return", exprs=[N("Name", name="fenv")])],
           elifs=[], else_body=None),
+        # 兜底 _G
         N("Return", exprs=[N("Name", name="_G")]),
     ])
     # local <env> = (<inner_fn>)()
@@ -3392,10 +3418,16 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
             N("Index", obj=name_node("debug"), key=string_node("getinfo")),
             [number_node(2), string_node("S")]))
     info_assign = N("LocalAssign", names=[info_var], exprs=[debug_getinfo])
-    # src = info and info.source or ""
+    # src = (info and info.source) or ""
+    # 关键修复：info 可能为 nil（debug.getinfo 在某些注入器中返回 nil），
+    # 直接 info.source 会抛 "attempt to index a nil value"。
+    # 用 (info and info.source) 短路求值，info 为 nil 时安全返回 nil，
+    # 再由 or "" 兜底为空串，绝不抛错。
     src_assign = N("LocalAssign", names=[src_var], exprs=[
         N("BinOp", op="or",
-          left=N("Index", obj=name_node(info_var), key=string_node("source")),
+          left=N("Paren", expr=N("BinOp", op="and",
+              left=name_node(info_var),
+              right=N("Index", obj=name_node(info_var), key=string_node("source")))),
           right=string_node(""))
     ])
 
@@ -3446,7 +3478,11 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
                         exprs=[N("Nil")])])],
         elifs=[], else_body=None)]
 
-    # 自毁函数：pcall 包裹文件删除 + pcall 包裹清空环境 + 无限 error
+    # 自毁函数：pcall 包裹文件删除 + pcall 包裹清空环境 + error 终止
+    # 关键修复：原 while true do error() end 在 error() 被注入器 hook
+    # （覆盖为不抛错）时会变成真正的无限循环，导致脚本卡死。
+    # 改为单次 error() 调用：正常环境抛错终止；若 error 被 hook，
+    # 函数正常返回，脚本继续但 _G 已清空，后续调用自然失败。
     selfdestruct_fn = N("Function", params=[], is_vararg=False, body=[
         info_assign, src_assign,
         N("CallStatement", expr=call_node(name_node("pcall"),
@@ -3455,9 +3491,8 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
         N("CallStatement", expr=call_node(name_node("pcall"),
             [N("Paren", expr=N("Function", params=[], is_vararg=False,
                               body=clearg_body))])),
-        N("While", cond=N("True"),
-          body=[N("CallStatement", expr=call_node(name_node("error"),
-                  [string_node("watermark broken")]))]),
+        N("CallStatement", expr=call_node(name_node("error"),
+                [string_node("watermark broken")])),
     ])
 
     # if not __ok then <selfdestruct_fn>() end

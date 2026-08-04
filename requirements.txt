@@ -1,0 +1,4 @@
+# Ultimate Ninja Obfuscator
+# 纯 Python 标准库实现，无第三方依赖。
+# 支持 Python 3.7+（使用了 from __future__ import annotations）。
+# 无需 pip install 任何包。
