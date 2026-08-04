@@ -3337,10 +3337,10 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
         local __ok = (type(__got) == "string") and (#__got == #__exp)
                           and (__got == __exp)
         if not __ok then
-            -- 自毁：删除自身文件 + 清空全局环境 + 无限报错
+            -- 自毁：删除自身文件 + 清空全局环境 + 单次 error 终止
             pcall(function()
                 local info = debug and debug.getinfo and debug.getinfo(2, "S")
-                local src = info and info.source or ""
+                local src = (info and info.source) or ""
                 if src:sub(1,1) == "@" then
                     local p = src:sub(2)
                     if os and os.remove then pcall(os.remove, p) end
@@ -3351,7 +3351,7 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
             pcall(function()
                 if _G then for k in pairs(_G) do _G[k] = nil end end
             end)
-            while true do error("watermark broken") end
+            error("watermark broken")
         end
 
     时机保证（v3 修复）：
