@@ -1434,13 +1434,49 @@ string_encryptor.py
 
 
 def _encrypt_bytes(data: bytes, key: int, offset: int, mask: int) -> bytes:
-    """对字节序列执行三重加密。"""
-    out = bytearray(len(data))
-    for i, b in enumerate(data):
-        v = (b ^ key) & 0xFF
+    """对字节序列执行三重加密（v3: 滚动异或 + 随机无意义字符插入）。
+
+    v2 滚动异或：第 i 字节实际密钥 = (key + i) & 0xFF，破坏频率分析。
+    v3 垃圾插入：每隔 block 个流位置插入 1 个无意义字符（block 由 key 派生，
+    范围 6..9，每个字符串不同）。垃圾字节同样经「滚动异或+加法+掩码」变换，
+    使其在密文中与真实字节不可区分；解密端按位置（block 的整数倍）跳过。
+
+    真实字节（明文索引 real_idx，0-based）：
+        v = ((b ^ ((key + real_idx) & 0xFF)) + offset) ^ mask
+    垃圾字节（流位置 pos，1-based，与真实域分离）：
+        g = random(0,255)；v = ((g ^ ((key + pos) & 0xFF)) + offset) ^ mask
+    解密：b = ((v ^ mask) - offset) ^ ((key + real_idx) & 0xFF)
+          跳过 i % block == 0 的位置（i 为 1-based 流位置）。
+
+    安全收益：
+    1. 密文长度 ≈ 明文 × (block/(block-1))，且每次运行垃圾字节不同 →
+       同一明文每次混淆产出不同密文，杜绝「同明文同密文」的差分比对。
+    2. 攻击者无法仅凭「逆变换」还原：必须同时知道滚动密钥与 block 周期，
+       缺一即得到含随机噪声的乱码。
+    3. 垃圾字节经同一变换链路，频率分析与真实字节混杂，统计特征被稀释。
+    """
+    block = (key % 4) + 6  # 6..9：垃圾插入周期，由 key 派生，与解密端一致
+    out = bytearray()
+    real_idx = 0   # 已输出真实字节计数（0-based，即明文索引）
+    pos = 1        # 输出流位置（1-based）
+    for b in data:
+        # 到达 block 整数倍位置 → 插入 1 个垃圾字节（真实字节域之前）
+        if pos % block == 0:
+            g = random.randint(0, 255)
+            gk = (key + pos) & 0xFF  # 用流位置作密钥，与真实字节域分离
+            v = (g ^ gk) & 0xFF
+            v = (v + offset) & 0xFF
+            v = (v ^ mask) & 0xFF
+            out.append(v)
+            pos += 1
+        # 真实字节
+        rolling_key = (key + real_idx) & 0xFF
+        v = (b ^ rolling_key) & 0xFF
         v = (v + offset) & 0xFF
         v = (v ^ mask) & 0xFF
-        out[i] = v
+        out.append(v)
+        real_idx += 1
+        pos += 1
     return bytes(out)
 
 
@@ -1453,12 +1489,17 @@ def _build_decrypt_function(dec_name: str, cache_name: str) -> Node:
             local ck = data .. string.char(key, offset, mask)
             local cached = <cache>[ck]
             if cached then return cached end
-            local t, n = {}, #data
+            local block = (key % 4) + 6
+            local t, ri, n = {}, 0, #data
             for i = 1, n do
-                local b = string.byte(data, i)
-                b = ((b ~ mask) - offset) % 256
-                b = b ~ key
-                t[i] = string.char(b)
+                if i % block ~= 0 then
+                    ri = ri + 1
+                    local b = string.byte(data, i)
+                    local rk = (key + (ri - 1)) % 256
+                    b = ((b ~ mask) - offset) % 256
+                    b = b ~ rk
+                    t[ri] = string.char(b)
+                end
             end
             local r = table.concat(t)
             <cache>[ck] = r
@@ -1469,6 +1510,11 @@ def _build_decrypt_function(dec_name: str, cache_name: str) -> Node:
     - 使用 string.byte / string.char / table.concat，纯标准库，全注入器兼容。
     - 位运算 `~` 在 Luau 中为按位异或，所有目标注入器均支持。
     - 缓存表 <cache> 闭包捕获，避免重复解密同一字符串。
+    - v2 滚动异或：第 i 字节的实际密钥 rk = (key + (ri-1)) % 256（ri 为真实
+      字节 1-based 计数），每个字节不同，破坏频率分析/已知明文攻击。
+    - v3 垃圾插入：block = (key % 4) + 6（范围 6..9），与 _encrypt_bytes 一致。
+      加密端在每 block 个流位置插入 1 个无意义字节；解密端跳过 i % block == 0
+      的位置。t 以 ri（真实计数）为键，避免垃圾位置留洞导致 table.concat 截断。
     - 关键：缓存键 ck = data .. string.char(key, offset, mask)，包含全部四个
       参数。因为每个字符串拥有独立的 key/offset/mask，同一 payload 搭配不同
       参数会解密出不同明文；仅以 data 为键会导致缓存冲突（垃圾代码中恰好
@@ -1486,8 +1532,7 @@ def _build_decrypt_function(dec_name: str, cache_name: str) -> Node:
                    right=name_node("offset"))
     mod_256 = N("BinOp", op="%", left=N("Paren", expr=sub_offset),
                 right=number_node(256))
-    b_xor_key = N("BinOp", op="~", left=N("Paren", expr=mod_256),
-                  right=name_node("key"))
+    # v3: 垃圾插入周期 block = (key % 4) + 6，范围 6..9，与 _encrypt_bytes 一致
     # string.char(key, offset, mask) —— 3 字节参数后缀
     char_key_call = call_node(
         index_node(name_node("string"), string_node("char")),
@@ -1495,6 +1540,12 @@ def _build_decrypt_function(dec_name: str, cache_name: str) -> Node:
     )
     # ck = data .. string.char(key, offset, mask)
     ck_expr = N("BinOp", op="..", left=name_node("data"), right=char_key_call)
+    # i % block ~= 0  —— 非垃圾位置判定
+    not_garbage = N("BinOp", op="~=",
+                    left=N("BinOp", op="%",
+                           left=name_node("i"),
+                           right=name_node("block")),
+                    right=number_node(0))
     body = [
         N("LocalAssign", names=["ck"], exprs=[ck_expr]),
         N("LocalAssign", names=["cached"],
@@ -1503,19 +1554,52 @@ def _build_decrypt_function(dec_name: str, cache_name: str) -> Node:
           cond=name_node("cached"),
           body=[N("Return", exprs=[name_node("cached")])],
           elifs=[], else_body=None),
-        N("LocalAssign", names=["t", "n"],
+        # block = (key % 4) + 6
+        N("LocalAssign", names=["block"], exprs=[
+            N("BinOp", op="+",
+              left=N("BinOp", op="%",
+                     left=name_node("key"),
+                     right=number_node(4)),
+              right=number_node(6))]),
+        N("LocalAssign", names=["t", "ri", "n"],
           exprs=[N("Table", fields=[]),
+                 number_node(0),
                  call_node(index_node(name_node("string"), string_node("len")),
                            [name_node("data")])]),
         N("NumericFor", var="i", start=number_node(1), limit=name_node("n"),
           step=None, body=[
-              N("LocalAssign", names=["b"], exprs=[byte_call]),
-              N("Assign", targets=[name_node("b")], exprs=[b_xor_key]),
-              N("Assign",
-                targets=[index_node(name_node("t"), name_node("i"))],
-                exprs=[call_node(
-                    index_node(name_node("string"), string_node("char")),
-                    [name_node("b")])]),
+              # if i % block ~= 0 then ... end —— 跳过 block 整数倍处的垃圾字节
+              N("If",
+                cond=not_garbage,
+                body=[
+                    # ri = ri + 1 —— 必须用 Assign 赋值外层 ri，不能用 LocalAssign
+                    # （否则会声明新的局部 ri 遮蔽外层计数器，导致 ri 恒为 0、
+                    #  滚动密钥失效且 t[0] 被 table.concat 跳过 → 输出为空）
+                    N("Assign", targets=[name_node("ri")],
+                      exprs=[N("BinOp", op="+",
+                               left=name_node("ri"),
+                               right=number_node(1))]),
+                    N("LocalAssign", names=["b"], exprs=[byte_call]),
+                    # v2 滚动异或：rk = (key + (ri - 1)) % 256（ri 为真实字节 1-based 计数）
+                    N("LocalAssign", names=["rk"],
+                      exprs=[N("BinOp", op="%",
+                        left=N("BinOp", op="+",
+                            left=name_node("key"),
+                            right=N("BinOp", op="-",
+                                left=name_node("ri"),
+                                right=number_node(1))),
+                        right=number_node(256))]),
+                    N("Assign", targets=[name_node("b")], exprs=[
+                        N("BinOp", op="~", left=N("Paren", expr=mod_256),
+                         right=name_node("rk"))]),
+                    # t[ri] = string.char(b) —— 用真实计数作键，避免垃圾位置留洞
+                    N("Assign",
+                      targets=[index_node(name_node("t"), name_node("ri"))],
+                      exprs=[call_node(
+                          index_node(name_node("string"), string_node("char")),
+                          [name_node("b")])]),
+                ],
+                elifs=[], else_body=None),
           ]),
         N("LocalAssign", names=["r"],
           exprs=[call_node(
@@ -2058,6 +2142,103 @@ def _group_states(stmts, rng: random.Random,
     return groups
 
 
+def _build_nested_dispatcher(groups, rng: random.Random,
+                             pg_var: str, st_var: str):
+    """构建嵌套（双重）跳转表分发器（提升3）。
+
+    生成的等价 Luau：
+        while <pg> ~= 0 do
+            if <pg> == <page_a> then
+                if <st> == <slot_a1> then
+                    <group>; <pg> = <next_page>; <st> = <next_slot>
+                elseif <st> == <slot_a2> then
+                    ...
+                else break end
+            elseif <pg> == <page_b> then
+                ...
+            else break end
+        end
+
+    状态被拆分为 (page, slot) 二元组：外层按 page 选「页」，内层按 slot 选页内
+    「槽」。每个 group 由两级查表定位，攻击者无法仅凭单变量追踪控制流。
+    状态总数不变（仍 ≤ max_states 红线），仅分发结构变为二层。
+
+    返回 (dispatcher_node, entry_page, entry_slot)。
+    """
+    n = len(groups)
+    # 每页槽位数 3..5（随机），确保至少 2 页时为真正的二层分发
+    page_size = rng.randint(3, 5)
+    num_pages = (n + page_size - 1) // page_size
+    # 打乱页号 1..num_pages
+    page_ids = list(range(1, num_pages + 1))
+    rng.shuffle(page_ids)
+    # 每页独立打乱槽号 1..page_size
+    slot_pools = {}
+    for p in range(num_pages):
+        slots = list(range(1, page_size + 1))
+        rng.shuffle(slots)
+        slot_pools[p] = slots
+    # 为每个 group（按执行顺序）分配 (page_id, slot_id)
+    assignments = []
+    for i in range(n):
+        p = i // page_size  # 原始页索引
+        page_id = page_ids[p]
+        slot_id = slot_pools[p][i % page_size]
+        assignments.append((page_id, slot_id))
+    entry_page, entry_slot = assignments[0]
+    EXIT_PAGE, EXIT_SLOT = 0, 0
+    # 按 page_id 聚合（仅用于分发结构；转移仍按 group 原序链接）
+    pages_map = {}
+    for i, (pid, sid) in enumerate(assignments):
+        pages_map.setdefault(pid, []).append((sid, i))
+    # 构建外层 if/elseif，每分支内嵌内层 if/elseif
+    outer_branches = []
+    for pid in sorted(pages_map.keys()):
+        members = pages_map[pid]
+        inner_branches = []
+        for sid, gidx in members:
+            grp = groups[gidx]
+            nxt = (assignments[gidx + 1] if gidx + 1 < n
+                   else (EXIT_PAGE, EXIT_SLOT))
+            body = []
+            has_return = False
+            for s in grp:
+                body.append(s)
+                if s.type == "Return":
+                    has_return = True
+                    break  # return 之后截断，转移不可达
+            if not has_return:
+                body.append(N("Assign",
+                              targets=[N("Name", name=pg_var)],
+                              exprs=[N("Number", value=str(nxt[0]))]))
+                body.append(N("Assign",
+                              targets=[N("Name", name=st_var)],
+                              exprs=[N("Number", value=str(nxt[1]))]))
+            cond = N("BinOp", op="==",
+                     left=N("Name", name=st_var),
+                     right=N("Number", value=str(sid)))
+            inner_branches.append((cond, body))
+        first_c, first_b = inner_branches[0]
+        inner_if = N("If", cond=first_c, body=first_b,
+                     elifs=inner_branches[1:],
+                     else_body=[N("Break")])
+        outer_cond = N("BinOp", op="==",
+                       left=N("Name", name=pg_var),
+                       right=N("Number", value=str(pid)))
+        outer_branches.append((outer_cond, inner_if))
+    first_oc, first_ib = outer_branches[0]
+    dispatcher = N("While",
+                   cond=N("BinOp", op="~=",
+                          left=N("Name", name=pg_var),
+                          right=N("Number", value=str(EXIT_PAGE))),
+                   body=[N("If",
+                           cond=first_oc,
+                           body=[first_ib],
+                           elifs=[(c, [ib]) for c, ib in outer_branches[1:]],
+                           else_body=[N("Break")])])
+    return dispatcher, entry_page, entry_slot
+
+
 def flatten_function_body(func: Node, rng: random.Random,
                           gen: NameGenerator,
                           max_states: int = 50) -> bool:
@@ -2078,6 +2259,24 @@ def flatten_function_body(func: Node, rng: random.Random,
     groups = _group_states(converted, rng, max_states=max_states)
     if len(groups) < 2:
         return False
+
+    # 提升3：状态数足够（≥6，可形成 ≥2 页）时使用嵌套（双重）跳转表分发，
+    # 否则沿用下方单层平坦分发。两层分发器状态总数不变，仅结构变为二层。
+    if len(groups) >= 6:
+        pg_var = gen.fresh()
+        st_var = gen.fresh()
+        dispatcher, entry_page, entry_slot = _build_nested_dispatcher(
+            groups, rng, pg_var, st_var)
+        new_body = []
+        if top_locals:
+            new_body.append(N("LocalAssign", names=top_locals, exprs=[]))
+        new_body.append(N("LocalAssign", names=[pg_var, st_var],
+                          exprs=[N("Number", value=str(entry_page)),
+                                 N("Number", value=str(entry_slot))]))
+        new_body.append(dispatcher)
+        new_body.append(N("Return", exprs=[]))
+        func.attrs["body"] = new_body
+        return True
 
     # 分配随机状态号（1..N）+ EXIT 哨兵（0）
     state_ids = list(range(1, len(groups) + 1))
@@ -2467,7 +2666,7 @@ garbage_injector.py
 
 def _gen_garbage_block(gen: NameGenerator, rng: random.Random) -> Node:
     """生成一个独立的 do...end 垃圾块 AST。"""
-    variant = rng.randint(0, 5)
+    variant = rng.randint(0, 7)
     if variant == 0:
         # 算术自洽块
         a = gen.fresh(); b = gen.fresh(); c = gen.fresh()
@@ -2537,6 +2736,120 @@ def _gen_garbage_block(gen: NameGenerator, rng: random.Random) -> Node:
                                          right=N("Number", value="2"))))]),
         ]
         body = [N("Do", body=inner)]
+    elif variant == 6:
+        # 斐波那契递归块（提升5）：定义局部递归 fib 并以小入参调用，结果丢弃。
+        # 纯局部、无副作用、无全局污染；入参受限（5..12）保证耗时极短
+        # （fib(12)=144，约 29 次调用）。递归形态显著提升静态分析成本。
+        fn = gen.fresh()       # 函数名
+        n_param = gen.fresh()  # 参数名
+        res = gen.fresh()      # 结果变量（丢弃）
+        call_n = rng.randint(5, 12)
+        fib_func = N("Function", params=[n_param], is_vararg=False, body=[
+            N("If",
+              cond=N("BinOp", op="<",
+                     left=N("Name", name=n_param),
+                     right=N("Number", value="2")),
+              body=[N("Return", exprs=[N("Name", name=n_param)])],
+              elifs=[], else_body=None),
+            N("Return", exprs=[
+                N("BinOp", op="+",
+                  left=N("Call",
+                         func=N("Name", name=fn),
+                         args=[N("BinOp", op="-",
+                                 left=N("Name", name=n_param),
+                                 right=N("Number", value="1"))]),
+                  right=N("Call",
+                          func=N("Name", name=fn),
+                          args=[N("BinOp", op="-",
+                                  left=N("Name", name=n_param),
+                                  right=N("Number", value="2"))]))]),
+        ])
+        body = [
+            N("LocalFunction", name=fn, func=fib_func),
+            N("LocalAssign", names=[res],
+              exprs=[N("Call",
+                       func=N("Name", name=fn),
+                       args=[N("Number", value=str(call_n))])]),
+        ]
+    elif variant == 7:
+        # 元表操作块（提升6）：构造局部表 + 元表，设置/读取元表，
+        # 触发多种元方法（__index/__add/__concat/__call），结果全部丢弃。
+        # 纯局部、无全局污染；setmetatable/getmetatable 在 GLOBAL_LIBS 中，
+        # 重命名器不会改其名。元方法返回简单字面量（0/""/k），确保在
+        # Luau/Roblox 执行器中不触发类型错误。
+        t = gen.fresh()       # 主表
+        mt = gen.fresh()      # 元表
+        r1 = gen.fresh(); r2 = gen.fresh(); r3 = gen.fresh()
+        r4 = gen.fresh(); r5 = gen.fresh()
+        # 元方法参数名（各函数独立作用域，用 fresh 避免歧义）
+        p_ign = gen.fresh()   # 被忽略的 self/t 参数
+        p_k = gen.fresh()     # __index 的 key 参数
+        p_v = gen.fresh()     # __newindex 的 value 参数
+        p_a = gen.fresh()     # __add/__concat 的左操作数
+        p_b = gen.fresh()     # __add/__concat 的右操作数
+        p_self = gen.fresh()  # __call 的 self
+        # 随机选一个字符串 key 用于触发 __index
+        idx_key = rng.choice(("alpha", "beta", "gamma", "delta", "zeta"))
+        # 构造元表：6 个元方法，每个返回简单字面量
+        mt_table = N("Table", fields=[
+            N("TableField", key=N("String", value="__index"),
+              value=N("Function", params=[p_ign, p_k], is_vararg=False, body=[
+                  N("Return", exprs=[N("Name", name=p_k)])])),
+            N("TableField", key=N("String", value="__newindex"),
+              value=N("Function", params=[p_ign, p_k, p_v], is_vararg=False, body=[
+                  N("Return", exprs=[])])),
+            N("TableField", key=N("String", value="__add"),
+              value=N("Function", params=[p_a, p_b], is_vararg=False, body=[
+                  N("Return", exprs=[N("Number", value="0")])])),
+            N("TableField", key=N("String", value="__concat"),
+              value=N("Function", params=[p_a, p_b], is_vararg=False, body=[
+                  N("Return", exprs=[N("String", value="")])])),
+            N("TableField", key=N("String", value="__call"),
+              value=N("Function", params=[p_self], is_vararg=True, body=[
+                  N("Return", exprs=[N("Number", value="0")])])),
+            N("TableField", key=N("String", value="__tostring"),
+              value=N("Function", params=[p_ign], is_vararg=False, body=[
+                  N("Return", exprs=[N("String", value="x")])])),
+        ])
+        body = [
+            # local t = {<n1>, <n2>, <n3>}
+            N("LocalAssign", names=[t],
+              exprs=[N("Table", fields=[
+                  N("TableItem", value=N("Number", value=str(rng.randint(0, 999)))),
+                  N("TableItem", value=N("Number", value=str(rng.randint(0, 999)))),
+                  N("TableItem", value=N("Number", value=str(rng.randint(0, 999)))),
+              ])]),
+            # local mt = { __index = ..., __newindex = ..., __add = ..., ... }
+            N("LocalAssign", names=[mt], exprs=[mt_table]),
+            # setmetatable(t, mt)
+            N("CallStatement", expr=N("Call",
+                func=N("Name", name="setmetatable"),
+                args=[N("Name", name=t), N("Name", name=mt)])),
+            # 触发 __index：local r1 = t.<key>
+            N("LocalAssign", names=[r1],
+              exprs=[N("Index", obj=N("Name", name=t),
+                       key=N("String", value=idx_key))]),
+            # 读取元表：local r2 = getmetatable(t)
+            N("LocalAssign", names=[r2],
+              exprs=[N("Call",
+                       func=N("Name", name="getmetatable"),
+                       args=[N("Name", name=t)])]),
+            # 触发 __add：local r3 = t + t
+            N("LocalAssign", names=[r3],
+              exprs=[N("BinOp", op="+",
+                       left=N("Name", name=t),
+                       right=N("Name", name=t))]),
+            # 触发 __concat：local r4 = t .. ""
+            N("LocalAssign", names=[r4],
+              exprs=[N("BinOp", op="..",
+                       left=N("Name", name=t),
+                       right=N("String", value=""))]),
+            # 触发 __call：local r5 = t()
+            N("LocalAssign", names=[r5],
+              exprs=[N("Call",
+                       func=N("Name", name=t),
+                       args=[])]),
+        ]
     else:
         # 数值循环累加（无副作用）
         acc = gen.fresh(); idx = gen.fresh()
@@ -2764,6 +3077,76 @@ def inject_polymorphism(chunk: Node, rng: random.Random) -> None:
     """在 Chunk 顶部插入多态诱饵状态机。"""
     body = chunk.get("body")
     body.insert(0, build_polymorphic_decoy(rng))
+
+
+def apply_ternary_disguise(chunk: Node, rng: random.Random) -> int:
+    """控制流三元伪装（提升4）：将符合条件的 if-then-else 单赋值转换为
+    Lua 三元表达式 `(cond and a) or b`，把分支控制流伪装成表达式。
+
+    仅在「then 分支为真值字面量」时转换，确保语义严格等价：
+        if cond then x = LIT else x = b end   →   x = (cond and LIT) or b
+    LIT 为 Number/String/True（恒真）。cond 真时返回 LIT，cond 假时求值 b，
+    与原 if-else 完全一致；且 b 仅在 cond 假时求值（惰性），副作用语义保持。
+    then 分支非真值字面量时不转换，规避 `cond and falsy or b` 的经典陷阱。
+
+    返回转换数。
+    """
+    TRUTHY_LIT = ("Number", "String", "True")
+    count = 0
+
+    def single_name_assign(stmt):
+        """stmt 是否为「单一 Name 目标赋值」，返回 (name, expr) 或 None。"""
+        if stmt.type != "Assign":
+            return None
+        targets = stmt.get("targets") or []
+        exprs = stmt.get("exprs") or []
+        if len(targets) != 1 or len(exprs) != 1:
+            return None
+        tgt = targets[0]
+        if tgt.type != "Name":
+            return None
+        return (tgt.get("name"), exprs[0])
+
+    def fn(node):
+        nonlocal count
+        if node.type != "If":
+            return node
+        elifs = node.get("elifs") or []
+        else_body = node.get("else_body")
+        if elifs or not else_body:
+            return node
+        body = node.get("body") or []
+        if len(body) != 1 or len(else_body) != 1:
+            return node
+        a = single_name_assign(body[0])
+        b = single_name_assign(else_body[0])
+        if not a or not b:
+            return node
+        a_name, a_expr = a
+        b_name, b_expr = b
+        if a_name != b_name:
+            return node
+        # 仅当 then 分支为真值字面量时转换（语义安全红线）
+        if a_expr.type not in TRUTHY_LIT:
+            return node
+        # 概率性转换，避免输出过于一致
+        if rng.random() < 0.5:
+            return node
+        cond = node.get("cond")
+        # x = (cond and LIT) or b
+        and_expr = N("BinOp", op="and",
+                     left=N("Paren", expr=cond),
+                     right=a_expr)
+        or_expr = N("BinOp", op="or",
+                    left=N("Paren", expr=and_expr),
+                    right=b_expr)
+        count += 1
+        return N("Assign",
+                 targets=[name_node(a_name)],
+                 exprs=[or_expr])
+
+    transform(chunk, fn)
+    return count
 
 
 def random_truthy_literal(rng: random.Random) -> Node:
@@ -3250,7 +3633,98 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
           elifs=[], else_body=None),
     ]
 
-    check_block = N("Do", body=dbg_block_body + ge_block_body + hf_block_body)
+    # ---- 执行器指纹检测（提升7）----
+    # 所有探测均 pcall 包裹，flag 仅作误导，不影响真实逻辑。
+
+    # 4. identifyexecutor 指纹：执行器标识函数存在则记录
+    ie_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Call",
+            func=N("Name", name="identifyexecutor"), args=[])])
+    ])
+    ie_block_body = [
+        N("LocalAssign", names=["ok4", "ie"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=ie_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="ok4"),
+                 right=N("BinOp", op="or",
+                         left=N("BinOp", op="==",
+                                left=N("Call", func=N("Name", name="type"),
+                                       args=[N("Name", name="ie")]),
+                                right=N("String", value="string")),
+                         right=N("BinOp", op="==",
+                                left=N("Call", func=N("Name", name="type"),
+                                       args=[N("Name", name="ie")]),
+                                right=N("String", value="table")))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
+    # 5. 环境完整性检测：game 必须存在且为 Instance（非 Roblox 环境则标记）
+    game_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Name", name="game")])
+    ])
+    env_block_body = [
+        N("LocalAssign", names=["ok5", "gm"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=game_fn)])]),
+        N("If",
+          cond=N("BinOp", op="or",
+                 left=N("UnaryOp", op="not", operand=N("Name", name="ok5")),
+                 right=N("BinOp", op="~=",
+                         left=N("Call", func=N("Name", name="typeof"),
+                                args=[N("Name", name="gm")]),
+                         right=N("String", value="Instance"))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
+    # 6. getrenv 指纹检测（执行器特有 API，标准 Lua/Roblox 无此函数）
+    gr_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Name", name="getrenv")])
+    ])
+    gr_block_body = [
+        N("LocalAssign", names=["ok6", "gr"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=gr_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="ok6"),
+                 right=N("BinOp", op="==",
+                         left=N("Call", func=N("Name", name="type"),
+                                args=[N("Name", name="gr")]),
+                         right=N("String", value="function"))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
+    # 7. Drawing 库指纹检测（部分执行器特有）
+    dr_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Name", name="Drawing")])
+    ])
+    dr_block_body = [
+        N("LocalAssign", names=["ok7", "dr"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=dr_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="ok7"),
+                 right=N("BinOp", op="==",
+                         left=N("Call", func=N("Name", name="type"),
+                                args=[N("Name", name="dr")]),
+                         right=N("String", value="table"))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
+    check_block = N("Do", body=(dbg_block_body + ge_block_body + hf_block_body
+                                 + ie_block_body + env_block_body
+                                 + gr_block_body + dr_block_body))
 
     body = chunk.get("body")
     body.insert(0, check_block)
@@ -3753,6 +4227,91 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
           elifs=[], else_body=None),
     ]))
     stats["checks"] += 1
+
+    # 8.7) 定时自校验 + 自动恢复（提升8）
+    #      周期性重新检查环境完整性，若 flag 被篡改（重置为 false）则恢复，
+    #      计数器被清空则恢复。使用 spawn + while task.wait 异步执行，不阻塞主逻辑。
+    #      全部 pcall 包裹，task/spawn 不可用时静默跳过，绝不影响脚本运行。
+    snap_flag = gen.fresh()
+    snap_counter = gen.fresh()
+    verify_fn = gen.fresh()
+    timer_n = rng.randint(30, 120)
+
+    # 快照初始化：记录 flag 初始值 + counter 深拷贝
+    snap_init = [
+        N("LocalAssign", names=[snap_flag], exprs=[name_node(flag)]),
+        N("LocalAssign", names=[snap_counter], exprs=[N("Table", fields=[])]),
+        N("GenericFor", names=["sk", "sv"],
+          exprs=[call_node(name_node("pairs"), [name_node(counter)])],
+          body=[N("Assign",
+                  targets=[N("Index", obj=name_node(snap_counter),
+                             key=name_node("sk"))],
+                  exprs=[name_node("sv")])]),
+    ]
+
+    # 定时校验函数体
+    verify_body = [
+        # 1. 重跑环境检查：game 是否仍为 userdata（运行时 hook 检测）
+        N("Do", body=[
+            N("LocalAssign", names=["tok", "tv"],
+              exprs=[_pcall(N("Paren", expr=N("Function",
+                  params=[], is_vararg=False, body=[
+                      N("Return", exprs=[name_node("game")])
+                  ])))]),
+            N("If",
+              cond=N("BinOp", op="and",
+                     left=name_node("tok"),
+                     right=N("UnaryOp", op="not",
+                             operand=_type_is(name_node("tv"), "userdata"))),
+              body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+              elifs=[], else_body=None),
+        ]),
+        # 2. flag 被外部重置为 false 则恢复为 true（自动恢复）
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=name_node(snap_flag),
+                 right=N("UnaryOp", op="not", operand=name_node(flag))),
+          body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+          elifs=[], else_body=None),
+        # 3. 计数器被清空则恢复
+        N("GenericFor", names=["rk", "rv"],
+          exprs=[call_node(name_node("pairs"), [name_node(snap_counter)])],
+          body=[N("If",
+                  cond=N("BinOp", op="==",
+                         left=N("Index", obj=name_node(counter),
+                                key=name_node("rk")),
+                         right=N("Nil")),
+                  body=[N("Assign",
+                          targets=[N("Index", obj=name_node(counter),
+                                     key=name_node("rk"))],
+                          exprs=[name_node("rv")])],
+                  elifs=[], else_body=None)]),
+    ]
+
+    # 异步定时执行：pcall(spawn(function() while true do task.wait(n); pcall(verify) end end))
+    timer_spawn = N("CallStatement", expr=_pcall(N("Paren", expr=N("Function",
+        params=[], is_vararg=False, body=[
+            N("CallStatement", expr=call_node(name_node("spawn"), [
+                N("Function", params=[], is_vararg=False, body=[
+                    N("While", cond=N("True"), body=[
+                        N("CallStatement", expr=call_node(
+                            N("Index", obj=name_node("task"),
+                               key=string_node("wait")),
+                            [number_node(timer_n)])),
+                        N("CallStatement", expr=call_node(
+                            name_node("pcall"), [name_node(verify_fn)])),
+                    ]),
+                ]),
+            ])),
+        ]))))
+
+    prelude.append(N("Do", body=snap_init))
+    prelude.append(N("LocalFunction", name=verify_fn,
+                     func=N("Function", params=[], is_vararg=False,
+                            body=verify_body)))
+    prelude.append(timer_spawn)
+    stats["timed_verify"] = True
+    stats["timed_interval"] = timer_n
 
     # 9) 调试模式：隐蔽错误日志（pcall 包裹 print，绝不抛错）
     #    注意：须用 pcall(print, dbg_var) 形式（把 print 作为函数值传入），
@@ -4975,6 +5534,12 @@ def obfuscate(src: str,
     # 6. 多态诱饵
     inject_polymorphism(chunk, rng)
     stats["L6_polymorphism"] = "injected"
+
+    # 4b. 控制流三元伪装（提升4）：在 L1 字符串加密前，将符合条件的
+    #     if-then-else 单赋值转为三元表达式 (cond and LIT) or b。
+    #     置于 L5/L8 之前，避免触碰水印自毁验证块；置于 L1 之前，确保
+    #     三元内嵌的字面量仍被加密。
+    stats["L4b_ternary_disguise"] = apply_ternary_disguise(chunk, rng)
 
     # 5. 反调试 / 反篡改
     flag_ad = apply_anti_debug(chunk, rng)
