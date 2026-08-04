@@ -8,12 +8,23 @@ import sys
 import json
 from flask import Flask, request, jsonify, send_from_directory
 
-# 添加 src 目录到 path
-SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src')
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
-
-from obfuscator_core import obfuscate
+# 优先使用 docs/obfuscator_all.py（增强单文件版，含全部提升5-11增强层）。
+# 该文件是自包含的，无需 src/ 模块依赖，且始终与最新增强同步。
+# src/obfuscator_core.py 为旧版模块化实现，仅作回退。
+_BASE = os.path.dirname(os.path.abspath(__file__))
+_OBF_ALL = os.path.join(_BASE, 'docs', 'obfuscator_all.py')
+if os.path.isfile(_OBF_ALL):
+    # 执行单文件增强版，从中获取 obfuscate 函数
+    _ns = {'__name__': '_obf_all', '__file__': _OBF_ALL}
+    with open(_OBF_ALL, 'r', encoding='utf-8') as _f:
+        exec(compile(_f.read(), _OBF_ALL, 'exec'), _ns)
+    obfuscate = _ns['obfuscate']
+else:
+    # 回退到 src/ 模块化版本
+    SRC_DIR = os.path.join(_BASE, 'src')
+    if SRC_DIR not in sys.path:
+        sys.path.insert(0, SRC_DIR)
+    from obfuscator_core import obfuscate
 
 app = Flask(__name__, static_folder='web_static')
 
