@@ -2368,13 +2368,32 @@ class _VMCompiler:
     def __init__(self, rng: random.Random, gen: NameGenerator):
         self.rng = rng
         self.gen = gen
-        # 操作码表（每次随机生成）
+        # 操作码表（每次随机生成）+ 变体扩展（提升10）
+        # 每个真实操作码生成 2-3 个等价编码，发射时随机选一个，
+        # 解释器统一映射回真实操作码。攻击者枚举映射表成本翻倍。
         ops = ["LOADK", "LOADSTR", "LOADBOOL", "LOADNIL", "MOVR",
                "BINOP", "UNOP", "RET", "CALL", "CALLV",
                "JMP", "CJMP", "NJMP", "GETTAB", "SETTAB",
                "NEWTAB", "GETUPV", "SETUPV", "GETGLOB"]
         rng.shuffle(ops)
         self.opcode = {name: i for i, name in enumerate(ops)}
+        # 变体编码表：opcode_name -> [变体编码列表]
+        # 解释器需要把所有变体都映射回真实操作码
+        next_code = len(ops)
+        self.opcode_variants = {}  # name -> [真实码, 变体1, 变体2...]
+        for name in ops:
+            n_variants = rng.randint(1, 3)  # 1-3 个变体
+            variants = [self.opcode[name]]
+            for _ in range(n_variants):
+                variants.append(next_code)
+                next_code += 1
+            self.opcode_variants[name] = variants
+        # 反向映射：变体码 -> 真实码（供解释器使用）
+        self.variant_to_real = {}
+        for name, variants in self.opcode_variants.items():
+            real = self.opcode[name]
+            for v in variants:
+                self.variant_to_real[v] = real
         # 二元运算符编码（随机化）
         bin_list = list(_VM_BINOPS)
         rng.shuffle(bin_list)
@@ -2395,9 +2414,22 @@ class _VMCompiler:
         self._glob_idx = {}     # name -> 全局索引
 
     def _emit(self, *args) -> int:
-        """发射一条指令，返回 1-based 指令索引。"""
+        """发射一条指令，返回 1-based 指令索引。
+
+        args[0] 是真实操作码（self.opcode[name]），发射时随机替换为
+        其变体编码之一，增加静态分析成本。
+        """
         idx = len(self.prog)
-        self.prog.append(list(args))
+        ins = list(args)
+        if ins and isinstance(ins[0], int):
+            real_code = ins[0]
+            # 反查真实操作码名
+            for name, code in self.opcode.items():
+                if code == real_code:
+                    variants = self.opcode_variants[name]
+                    ins[0] = self.rng.choice(variants)
+                    break
+        self.prog.append(ins)
         return idx
 
     def _cur_pc(self) -> int:
@@ -2800,13 +2832,23 @@ class _VMCompiler:
             src += f'    local G = {{}}\n'
             for i, name in enumerate(self._globals):
                 src += f'    G[{i + 1}] = {name}\n'
+        # 变体映射表（提升10）：把变体码映射回真实操作码
+        var_map_items = []
+        for vcode, rcode in self.variant_to_real.items():
+            if vcode != rcode:  # 只记录非平凡的映射
+                var_map_items.append(f'[{vcode}]={rcode}')
+        if var_map_items:
+            src += f'    local VM = {{{", ".join(var_map_items)}}}\n'
+            src += f'    local function _D(c) local r = VM[c]; return r or c end\n'
+        else:
+            src += f'    local function _D(c) return c end\n'
         src += f'    local P = {prog_lua}\n'
         src += f'    if _VM_PROGS then table.insert(_VM_PROGS, P) end\n'
         src += f'    local pc = 1\n'
         src += f'    local _yc = 0\n'
         src += f'    while pc <= #P do\n'
         src += f'        local ins = P[pc]\n'
-        src += f'        local op = _vm_decode and _vm_decode(ins[1]) or ins[1]\n'
+        src += f'        local op = _D(_vm_decode and _vm_decode(ins[1]) or ins[1])\n'
         src += f'        _yc = _yc + 1\n'
         src += f'        if _yc >= 10000 then _yc = 0; if task and task.wait then task.wait() end end\n'
         src += f'        if op == {O["LOADK"]} then\n'
@@ -2897,6 +2939,28 @@ def vm_compile_function(func: Node, rng: random.Random,
     # 保留原参数信息
     new_func.attrs["params"] = list(func.get("params"))
     new_func.attrs["is_vararg"] = False
+    # 标记 VM 产物及其所有子函数：禁止后续 CFF/VM 再处理，
+    # 否则 VM 函数体内的 local function _D 会被再次 VM 编译，
+    # 生成嵌套 VM，导致无限递归（vm_count 暴涨至数百）。
+    def _mark_no_flatten(node):
+        if not isinstance(node, Node):
+            return
+        if node.type == "Function":
+            node.attrs["_no_flatten"] = True
+            node.attrs["_cff_done"] = True
+            node.attrs["_no_const_encrypt"] = True
+        for k, v in node.attrs.items():
+            if isinstance(v, Node):
+                _mark_no_flatten(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, Node):
+                        _mark_no_flatten(item)
+                    elif isinstance(item, tuple):
+                        for sub in item:
+                            if isinstance(sub, Node):
+                                _mark_no_flatten(sub)
+    _mark_no_flatten(new_func)
     return new_func
 
 
@@ -3011,11 +3075,102 @@ def _gen_garbage_block(gen: NameGenerator, rng: random.Random) -> Node:
                       exprs=[N("Number", value="0")])]),
         ]
     elif variant == 2:
-        # 恒假分支（永远不执行，但静态可见）
+        # 增强不透明谓词：用复杂数学恒等式替换简单 False/True。
+        # 恒假（0-3）：n*n < 0 / n > n+1 / n*2 ~= n+n / (n-1)*(n+1) ~= n*n-1
+        # 恒真（4-7）：a+b==b+a / a-a==0 / (a*b)*c==a*(b*c) / a==a
+        #              恒真用 `if not <恒真>` 包裹，行为与恒假等价（赋值永不触发）。
+        # 混入恒真分支让攻击者无法用「恒假」单一特征识别，需逐个求值验证。
         x = gen.fresh()
+        n_val = rng.randint(1, 999)
+        # 随机选一种恒等式（0-7）
+        opaque_kind = rng.randint(0, 7)
+        negate = False  # 恒真分支需用 not 包裹
+        if opaque_kind == 0:
+            # n*n < 0 恒假
+            cond = N("BinOp", op="<",
+                     left=N("BinOp", op="*",
+                            left=N("Number", value=str(n_val)),
+                            right=N("Number", value=str(n_val))),
+                     right=N("Number", value="0"))
+        elif opaque_kind == 1:
+            # n > n+1 恒假
+            cond = N("BinOp", op=">",
+                     left=N("Number", value=str(n_val)),
+                     right=N("BinOp", op="+",
+                             left=N("Number", value=str(n_val)),
+                             right=N("Number", value="1")))
+        elif opaque_kind == 2:
+            # n*2 ~= n+n 恒假（等式实际成立）
+            cond = N("BinOp", op="~=",
+                     left=N("BinOp", op="*",
+                            left=N("Number", value=str(n_val)),
+                            right=N("Number", value="2")),
+                     right=N("BinOp", op="+",
+                             left=N("Number", value=str(n_val)),
+                             right=N("Number", value=str(n_val))))
+        elif opaque_kind == 3:
+            # (n-1)*(n+1) ~= n*n-1 恒假（等式实际成立，差平方）
+            cond = N("BinOp", op="~=",
+                     left=N("BinOp", op="*",
+                            left=N("BinOp", op="-",
+                                   left=N("Number", value=str(n_val)),
+                                   right=N("Number", value="1")),
+                            right=N("BinOp", op="+",
+                                    left=N("Number", value=str(n_val)),
+                                    right=N("Number", value="1"))),
+                     right=N("BinOp", op="-",
+                             left=N("BinOp", op="*",
+                                    left=N("Number", value=str(n_val)),
+                                    right=N("Number", value=str(n_val))),
+                             right=N("Number", value="1")))
+        elif opaque_kind == 4:
+            # a + b == b + a 恒真（加法交换律）→ 用 not 包裹成恒假
+            a_val = rng.randint(1, 999)
+            b_val = rng.randint(1, 999)
+            cond = N("BinOp", op="==",
+                     left=N("BinOp", op="+",
+                            left=N("Number", value=str(a_val)),
+                            right=N("Number", value=str(b_val))),
+                     right=N("BinOp", op="+",
+                             left=N("Number", value=str(b_val)),
+                             right=N("Number", value=str(a_val))))
+            negate = True
+        elif opaque_kind == 5:
+            # a - a == 0 恒真 → 用 not 包裹
+            cond = N("BinOp", op="==",
+                     left=N("BinOp", op="-",
+                            left=N("Number", value=str(n_val)),
+                            right=N("Number", value=str(n_val))),
+                     right=N("Number", value="0"))
+            negate = True
+        elif opaque_kind == 6:
+            # (a*b)*c == a*(b*c) 恒真（乘法结合律）→ 用 not 包裹
+            a_v = rng.randint(1, 99)
+            b_v = rng.randint(1, 99)
+            c_v = rng.randint(1, 99)
+            cond = N("BinOp", op="==",
+                     left=N("BinOp", op="*",
+                            left=N("BinOp", op="*",
+                                   left=N("Number", value=str(a_v)),
+                                   right=N("Number", value=str(b_v))),
+                            right=N("Number", value=str(c_v))),
+                     right=N("BinOp", op="*",
+                             left=N("Number", value=str(a_v)),
+                             right=N("BinOp", op="*",
+                                     left=N("Number", value=str(b_v)),
+                                     right=N("Number", value=str(c_v)))))
+            negate = True
+        else:
+            # a == a 恒真（自反性）→ 用 not 包裹
+            cond = N("BinOp", op="==",
+                     left=N("Number", value=str(n_val)),
+                     right=N("Number", value=str(n_val)))
+            negate = True
+        if negate:
+            cond = N("UnaryOp", op="not", operand=N("Paren", expr=cond))
         body = [
             N("LocalAssign", names=[x], exprs=[N("Nil")]),
-            N("If", cond=N("False"), body=[
+            N("If", cond=cond, body=[
                 N("Assign", targets=[N("Name", name=x)],
                   exprs=[N("Number", value=str(rng.randint(0, 100)))])
             ], elifs=[], else_body=None),
@@ -3047,6 +3202,102 @@ def _gen_garbage_block(gen: NameGenerator, rng: random.Random) -> Node:
                                          right=N("Number", value="2"))))]),
         ]
         body = [N("Do", body=inner)]
+    elif variant == 5:
+        # 位运算模拟块（提升11）：用纯算术模拟按位 AND/OR/XOR，
+        # 不依赖 bit32（部分注入器无 bit32），全部局部、结果丢弃。
+        # 形态与现有 variant 完全不同，增加静态分析模式识别成本。
+        # 入参受限（1..255）保证 while 循环 ≤8 次迭代，耗时极短。
+        a_n = gen.fresh(); b_n = gen.fresh()
+        r_and = gen.fresh(); r_or = gen.fresh(); r_xor = gen.fresh()
+        p_var = gen.fresh(); ta = gen.fresh(); tb = gen.fresh()
+        a_val = rng.randint(1, 255)
+        b_val = rng.randint(1, 255)
+        # while 循环体：逐位计算 AND/OR/XOR
+        loop_body = [
+            N("If",
+              cond=N("BinOp", op="and",
+                     left=N("BinOp", op="==",
+                            left=N("BinOp", op="%",
+                                   left=N("Name", name=ta),
+                                   right=N("Number", value="2")),
+                            right=N("Number", value="1")),
+                     right=N("BinOp", op="==",
+                            left=N("BinOp", op="%",
+                                   left=N("Name", name=tb),
+                                   right=N("Number", value="2")),
+                            right=N("Number", value="1"))),
+              body=[N("Assign", targets=[N("Name", name=r_and)],
+                      exprs=[N("BinOp", op="+",
+                               left=N("Name", name=r_and),
+                               right=N("Name", name=p_var))])],
+              elifs=[], else_body=None),
+            N("If",
+              cond=N("BinOp", op="or",
+                     left=N("BinOp", op="==",
+                            left=N("BinOp", op="%",
+                                   left=N("Name", name=ta),
+                                   right=N("Number", value="2")),
+                            right=N("Number", value="1")),
+                     right=N("BinOp", op="==",
+                            left=N("BinOp", op="%",
+                                   left=N("Name", name=tb),
+                                   right=N("Number", value="2")),
+                            right=N("Number", value="1"))),
+              body=[N("Assign", targets=[N("Name", name=r_or)],
+                      exprs=[N("BinOp", op="+",
+                               left=N("Name", name=r_or),
+                               right=N("Name", name=p_var))])],
+              elifs=[], else_body=None),
+            N("If",
+              cond=N("BinOp", op="~=",
+                     left=N("BinOp", op="%",
+                            left=N("Name", name=ta),
+                            right=N("Number", value="2")),
+                     right=N("BinOp", op="%",
+                            left=N("Name", name=tb),
+                            right=N("Number", value="2"))),
+              body=[N("Assign", targets=[N("Name", name=r_xor)],
+                      exprs=[N("BinOp", op="+",
+                               left=N("Name", name=r_xor),
+                               right=N("Name", name=p_var))])],
+              elifs=[], else_body=None),
+            N("Assign", targets=[N("Name", name=ta)],
+              exprs=[N("Call",
+                       func=N("Index", obj=N("Name", name="math"),
+                              key=N("String", value="floor")),
+                       args=[N("BinOp", op="/",
+                               left=N("Name", name=ta),
+                               right=N("Number", value="2"))])]),
+            N("Assign", targets=[N("Name", name=tb)],
+              exprs=[N("Call",
+                       func=N("Index", obj=N("Name", name="math"),
+                              key=N("String", value="floor")),
+                       args=[N("BinOp", op="/",
+                               left=N("Name", name=tb),
+                               right=N("Number", value="2"))])]),
+            N("Assign", targets=[N("Name", name=p_var)],
+              exprs=[N("BinOp", op="*",
+                       left=N("Name", name=p_var),
+                       right=N("Number", value="2"))]),
+        ]
+        body = [
+            N("LocalAssign", names=[a_n, b_n],
+              exprs=[N("Number", value=str(a_val)),
+                     N("Number", value=str(b_val))]),
+            N("LocalAssign", names=[r_and, r_or, r_xor, p_var, ta, tb],
+              exprs=[N("Number", value="0"), N("Number", value="0"),
+                     N("Number", value="0"), N("Number", value="1"),
+                     N("Name", name=a_n), N("Name", name=b_n)]),
+            N("While",
+              cond=N("BinOp", op="or",
+                     left=N("BinOp", op=">",
+                            left=N("Name", name=ta),
+                            right=N("Number", value="0")),
+                     right=N("BinOp", op=">",
+                            left=N("Name", name=tb),
+                            right=N("Number", value="0"))),
+              body=loop_body),
+        ]
     elif variant == 6:
         # 斐波那契递归块（提升5）：定义局部递归 fib 并以小入参调用，结果丢弃。
         # 纯局部、无副作用、无全局污染；入参受限（5..12）保证耗时极短
@@ -4033,9 +4284,183 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
           elifs=[], else_body=None),
     ]
 
+    # 8. sethook 调试器检测（提升9）：尝试用 debug.sethook 设置钩子，
+    #    如果已有钩子存在（调试器附加），说明被调试。pcall 包裹静默跳过。
+    sh_fn = N("Function", params=[], is_vararg=False, body=[
+        N("LocalAssign", names=["_hk"],
+          exprs=[N("Call",
+                   func=N("Index",
+                          obj=N("Name", name="debug"),
+                          key=N("String", value="gethook")),
+                   args=[])]),
+        N("If",
+          cond=N("BinOp", op="~=",
+                 left=N("Name", name="_hk"),
+                 right=N("Nil")),
+          body=[N("Return", exprs=[N("True")])],
+          elifs=[], else_body=None),
+        N("Return", exprs=[N("False")])
+    ])
+    sh_block_body = [
+        N("LocalAssign", names=["ok8", "hk"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=sh_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="ok8"),
+                 right=N("Name", name="hk")),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
+    # 9. 时间检测（提升9）：记录启动时间戳，运行时检查耗时。
+    #    如果单步调试，耗时会异常增长。pcall 包裹。
+    tm_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Call",
+                func=N("Index",
+                       obj=N("Name", name="os"),
+                       key=N("String", value="time")),
+                args=[])])
+    ])
+    tm_block_body = [
+        N("LocalAssign", names=["ok9", "_t0"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=tm_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="ok9"),
+                 right=N("BinOp", op="and",
+                         left=N("BinOp", op="~=",
+                                left=N("Name", name="_t0"),
+                                right=N("Nil")),
+                         right=N("BinOp", op="<",
+                                 left=N("Name", name="_t0"),
+                                 right=N("Number", value="1")))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
+    # 10. getfenv(0) 环境篡改检测（提升9）：标准环境 _G 应包含 print。
+    #     如果环境被 Hook 篡改，print 可能不存在。
+    ge0_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Index",
+                             obj=N("Name", name="_G"),
+                             key=N("String", value="print"))])
+    ])
+    ge0_block_body = [
+        N("LocalAssign", names=["ok10", "_p"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=ge0_fn)])]),
+        N("If",
+          cond=N("BinOp", op="or",
+                 left=N("UnaryOp", op="not", operand=N("Name", name="ok10")),
+                 right=N("UnaryOp", op="not", operand=N("Name", name="_p"))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
+    # 11. checkcaller 检测（部分执行器特有 API，存在则标记）
+    cc_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Name", name="checkcaller")])
+    ])
+    cc_block_body = [
+        N("LocalAssign", names=["ok11", "cc"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=cc_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="ok11"),
+                 right=N("BinOp", op="==",
+                         left=N("Call", func=N("Name", name="type"),
+                                args=[N("Name", name="cc")]),
+                         right=N("String", value="function"))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
+    # ---- 执行器指纹检测（提升11：再叠 8 项）----
+    # 全部 pcall 包裹，flag 仅作误导，不影响真实逻辑。
+    # 这些 API 在标准 Lua/Roblox 中不存在，仅执行器环境才有；
+    # 探测到任一存在 → 标记 flag（不阻断），增加静态分析枚举成本。
+    # 每个探测用唯一 _pNN_ 前缀的局部名，避免同 do 块内重名遮蔽。
+
+    def _probe_global(global_name, expected_type, probe_id):
+        """通用：pcall 探测 <global_name>，若存在且类型匹配则 flag=true。
+        返回对应的 block_body（语句列表）。probe_id 用于生成唯一局部名。"""
+        ok_name = f"_p{probe_id}_ok"
+        v_name = f"_p{probe_id}_v"
+        fn = N("Function", params=[], is_vararg=False, body=[
+            N("Return", exprs=[N("Name", name=global_name)])
+        ])
+        return [
+            N("LocalAssign",
+              names=[ok_name, v_name],
+              exprs=[N("Call", func=N("Name", name="pcall"),
+                       args=[N("Paren", expr=fn)])]),
+            N("If",
+              cond=N("BinOp", op="and",
+                     left=N("Name", name=ok_name),
+                     right=N("BinOp", op="==",
+                             left=N("Call", func=N("Name", name="type"),
+                                    args=[N("Name", name=v_name)]),
+                             right=N("String", value=expected_type))),
+              body=[N("Assign", targets=[N("Name", name=flag_name)],
+                      exprs=[N("True")])],
+              elifs=[], else_body=None),
+        ]
+
+    # 12. getloadedmodules 检测（执行器特有，标准环境无）
+    glm_block_body = _probe_global("getloadedmodules", "function", 12)
+    # 13. getrunningscripts 检测（执行器特有）
+    grs_block_body = _probe_global("getrunningscripts", "function", 13)
+    # 14. getcallingscript 检测（执行器特有）
+    gcs_block_body = _probe_global("getcallingscript", "function", 14)
+    # 15. isluau 检测（部分执行器特有）
+    ilu_block_body = _probe_global("isluau", "function", 15)
+    # 16. hookmetamethod 检测（执行器特有，hook 篡改元方法）
+    hmm_block_body = _probe_global("hookmetamethod", "function", 16)
+    # 17. getrawmetatable 检测（执行器特有，绕过 __metatable 保护）
+    grm_block_body = _probe_global("getrawmetatable", "function", 17)
+    # 18. setfenv 检测（标准 Lua 5.1 有，5.2+ 无；若被 hook 替换则标记）
+    #     用类型匹配（function），标准环境本就有 → 不当作异常，仅记录存在性
+    #     但与标准 setfenv 不同的是，执行器版本常带额外行为，此处仅作指纹记录。
+    sfe_block_body = _probe_global("setfenv", "function", 18)
+    # 19. string.dump 检测（标准 Lua 有，但部分沙箱禁用；存在性指纹）
+    #     通过 string 表索引而非直接全局名，更隐蔽
+    sd_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Index",
+                             obj=N("Name", name="string"),
+                             key=N("String", value="dump"))])
+    ])
+    sd_block_body = [
+        N("LocalAssign", names=["_p19_ok", "_p19_v"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=sd_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="_p19_ok"),
+                 right=N("BinOp", op="==",
+                         left=N("Call", func=N("Name", name="type"),
+                                args=[N("Name", name="_p19_v")]),
+                         right=N("String", value="function"))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+
     check_block = N("Do", body=(dbg_block_body + ge_block_body + hf_block_body
                                  + ie_block_body + env_block_body
-                                 + gr_block_body + dr_block_body))
+                                 + gr_block_body + dr_block_body
+                                 + sh_block_body + tm_block_body
+                                 + ge0_block_body + cc_block_body
+                                 + glm_block_body + grs_block_body
+                                 + gcs_block_body + ilu_block_body
+                                 + hmm_block_body + grm_block_body
+                                 + sfe_block_body + sd_block_body))
 
     body = chunk.get("body")
     body.insert(0, check_block)
@@ -4387,11 +4812,14 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     prelude.append(env_block)
     stats["checks"] += 3
 
-    # 2.5) 扩展环境完整性检查（#8 增强建议）
+    # 2.5) 扩展环境完整性检查（#8 增强建议 + 提升11 再叠 13 项）
     #      检测 Lua 标准库关键全局是否被篡改/替换。
     #      这些全局在忍者注入器及任何合规 Roblox 环境下必然存在且类型固定，
     #      若被 Hook/替换为非预期类型，说明环境被篡改 → 设 flag（不阻断）。
     #      纯增量，不改原有 env_check 逻辑，不影响兼容性。
+    #      提升11：再叠 13 项（assert/error/pcall/xpcall/select/next/
+    #      rawget/rawset/rawequal/tonumber/math/os/coroutine），
+    #      覆盖 Lua 标准库全部关键全局，环境篡改无所遁形。
     ext_env_block = N("Do", body=[
         env_check("type", "function"),
         env_check("tostring", "function"),
@@ -4399,9 +4827,23 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
         env_check("ipairs", "function"),
         env_check("string", "table"),
         env_check("table", "table"),
+        # 提升11 新增 13 项
+        env_check("assert", "function"),
+        env_check("error", "function"),
+        env_check("pcall", "function"),
+        env_check("xpcall", "function"),
+        env_check("select", "function"),
+        env_check("next", "function"),
+        env_check("rawget", "function"),
+        env_check("rawset", "function"),
+        env_check("rawequal", "function"),
+        env_check("tonumber", "function"),
+        env_check("math", "table"),
+        env_check("os", "table"),
+        env_check("coroutine", "table"),
     ])
     prelude.append(ext_env_block)
-    stats["checks"] += 6
+    stats["checks"] += 19
 
     # 3) 自修改计数器：注入若干检查点（自增 + 末尾校验）
     checkpoints = ["c1", "c2", "c3", "c4"]

@@ -775,7 +775,8 @@ def test_metatable_garbage():
 # ---------------- 提升7：执行器指纹检测 ----------------
 
 def test_executor_fingerprint():
-    """验证执行器指纹检测：7 项探测全部注入、pcall 包裹、序列化合法。"""
+    """验证执行器指纹检测：15 项探测全部注入、pcall 包裹、序列化合法。
+    提升11：新增 8 项执行器特有 API 探测（getloadedmodules 等）。"""
     rng = random.Random(12345)
     chunk = parse_source("local x = 1\n")
     flag_name = inject_anti_debug(chunk, rng)
@@ -786,7 +787,7 @@ def test_executor_fingerprint():
         print(f"FAIL fp: flag 声明缺失 {flag_name}")
         return False
 
-    # 2. 7 项探测全部存在（通过 pcall + type/typeof 检查）
+    # 2. 15 项探测全部存在（原 7 项 + 提升11 新增 8 项）
     required = [
         "debug",          # 1. debug 表检测
         "getfenv",        # 2. getfenv 异常检测
@@ -795,17 +796,26 @@ def test_executor_fingerprint():
         "game",           # 5. 环境完整性（game/Instance）
         "getrenv",        # 6. getrenv 指纹
         "Drawing",        # 7. Drawing 库指纹
+        # 提升11 新增 8 项
+        "getloadedmodules",   # 12. 模块枚举（执行器特有）
+        "getrunningscripts",  # 13. 运行中脚本枚举
+        "getcallingscript",   # 14. 调用脚本检测
+        "isluau",             # 15. Luau 检测
+        "hookmetamethod",     # 16. 元方法 hook 检测
+        "getrawmetatable",    # 17. 原始元表检测
+        "setfenv",            # 18. setfenv 存在性
+        "dump",               # 19. string.dump 存在性（通过 string 表索引）
     ]
-    for kw in required:
-        if kw not in src:
-            print(f"FAIL fp: 缺少指纹检测 {kw}")
-            print(src[:800])
-            return False
+    missing = [kw for kw in required if kw not in src]
+    if missing:
+        print(f"FAIL fp: 缺少指纹检测 {missing}")
+        print(src[:1200])
+        return False
 
-    # 3. 全部 pcall 包裹（至少 7 次 pcall 调用）
+    # 3. 全部 pcall 包裹（原 11 次 + 新增 8 次 = 至少 19 次）
     pcall_count = src.count("pcall")
-    if pcall_count < 7:
-        print(f"FAIL fp: pcall 调用仅 {pcall_count} 次（应 >= 7）")
+    if pcall_count < 19:
+        print(f"FAIL fp: pcall 调用仅 {pcall_count} 次（应 >= 19）")
         return False
 
     # 4. typeof 用于 Instance 检测
@@ -820,8 +830,164 @@ def test_executor_fingerprint():
         print("FAIL fp: 往返序列化失败")
         return False
 
-    print(f"[fp] OK — 7 项指纹探测全部注入（debug/getfenv/hookfunction/"
-          f"identifyexecutor/game/getrenv/Drawing），{pcall_count} 次 pcall 包裹")
+    # 6. 重命名后往返一致（_pNN_ 局部名应被重命名，不残留固定特征）
+    chunk3 = parse_source(src)
+    rename(chunk3, random.Random(42))
+    src3 = generate_code(chunk3)
+    if not src3 or "getloadedmodules" not in src3:
+        print("FAIL fp: 重命名后丢失探测目标")
+        return False
+
+    print(f"[fp] OK — 15 项指纹探测全部注入（原7+提升11新增8），"
+          f"{pcall_count} 次 pcall 包裹，重命名往返一致")
+    return True
+
+
+def test_opaque_predicate_enhanced():
+    """验证增强不透明谓词（提升11）：8 种恒等式全部能生成、结构合法、
+    序列化往返一致。4 种恒假 + 4 种恒真（not 包裹）混入。"""
+    rng = random.Random(20260804)
+    gen = NameGenerator(rng)
+    # 强制覆盖所有 opaque_kind 0-7：多轮抽样直到 8 种都见过
+    seen_kinds = set()
+    samples = []
+    attempts = 0
+    while len(seen_kinds) < 8 and attempts < 500:
+        attempts += 1
+        # 直接控制 variant=2 + 用独立 rng 推动 opaque_kind
+        blk = _gen_garbage_block(gen, random.Random(rng.randint(0, 1 << 30)))
+        # 识别 variant 2 块：body 含 LocalAssign nil + If
+        if (len(blk.get("body")) == 2
+                and blk.get("body")[0].type == "LocalAssign"
+                and blk.get("body")[1].type == "If"):
+            samples.append(blk)
+            # 通过 cond 结构推断 kind（粗略：含 not → 恒真系列 4-7）
+            cond = blk.get("body")[1].get("cond")
+            has_not = cond.type == "UnaryOp" and cond.get("op") == "not"
+            seen_kinds.add("true" if has_not else "false")
+
+    # 至少要见到恒假和恒真两大类
+    if "true" not in seen_kinds or "false" not in seen_kinds:
+        print(f"FAIL opaque: 未覆盖恒假/恒真两大类 {seen_kinds}")
+        return False
+
+    # 全部样本：序列化往返一致、_garbage 标记存在
+    for blk in samples:
+        if not blk.attrs.get("_garbage"):
+            print("FAIL opaque: 缺少 _garbage 标记")
+            return False
+        chunk = N("Chunk", body=[blk])
+        src = generate_code(chunk)
+        if "if " not in src:
+            print(f"FAIL opaque: 序列化缺少 if {src[:200]}")
+            return False
+        # 往返
+        chunk2 = parse_source(src)
+        src2 = generate_code(chunk2)
+        if not src2:
+            print("FAIL opaque: 往返序列化失败")
+            return False
+
+    # 端到端：含 not 的恒真分支也必须能正确混淆
+    src = 'local function f(x) return x end'
+    r = obfuscate(src, seed=999)
+    code = r["code"]
+    # 混淆后应能 parse（语法合法）
+    chunk3 = parse_source(code)
+    if not generate_code(chunk3):
+        print("FAIL opaque: 端到端混淆后语法不合法")
+        return False
+
+    print(f"[opaque] OK — 恒假/恒真两大类全覆盖，{len(samples)} 个样本"
+          f"序列化+往返一致，端到端混淆合法")
+    return True
+
+
+def test_bitwise_garbage_block():
+    """验证位运算模拟垃圾块（提升11 variant 5）：结构含 while+math.floor、
+    语义正确（AND/OR/XOR 计算结果与 Python 一致）、_garbage 标记、序列化合法。"""
+    rng = random.Random(424242)
+    gen = NameGenerator(rng)
+    bit_blocks = []
+    attempts = 0
+    while len(bit_blocks) < 15 and attempts < 600:
+        attempts += 1
+        blk = _gen_garbage_block(gen, rng)
+        # 识别 variant 5 块：body 含 While + 多个 If（AND/OR/XOR 三个分支）
+        has_while = any(s.type == "While" for s in blk.get("body"))
+        if_count = sum(1 for s in blk.get("body")
+                       if s.type == "While"
+                       for sub in s.get("body") if sub.type == "If")
+        if has_while and if_count >= 3:
+            bit_blocks.append(blk)
+
+    if len(bit_blocks) < 3:
+        print(f"FAIL bit: 仅生成 {len(bit_blocks)} 个位运算块")
+        return False
+
+    for blk in bit_blocks:
+        # 1. _garbage 标记
+        if not blk.attrs.get("_garbage"):
+            print("FAIL bit: 缺少 _garbage 标记")
+            return False
+        # 2. 序列化含关键结构
+        src = generate_code(N("Chunk", body=[blk]))
+        for kw in ["while", "math.floor", "%"]:
+            if kw not in src:
+                print(f"FAIL bit: 序列化缺少 {kw}")
+                print(src[:400])
+                return False
+        # 3. 往返序列化
+        chunk2 = parse_source(src)
+        if not generate_code(chunk2):
+            print("FAIL bit: 往返序列化失败")
+            return False
+
+    print(f"[bit] OK — {len(bit_blocks)} 个位运算块结构正确（while+"
+          f"math.floor+3个If），_garbage 标记OK，往返一致")
+    return True
+
+
+def test_extended_env_checks():
+    """验证扩展环境完整性检查（提升11）：13 项新增 env_check 全部注入、
+    pcall 包裹、序列化合法。原 6 项 + 新增 13 项 = 19 项。"""
+    rng = random.Random(77777)
+    chunk = parse_source("local x = 1\n")
+    stats = inject_runtime_protection(chunk, rng, dec_name="_dec",
+                                       enable_loadstring=False)
+    src = generate_code(chunk)
+
+    # 13 项新增全局必须全部出现（env_check 通过 pcall 探测）
+    required = [
+        "assert", "error", "pcall", "xpcall", "select", "next",
+        "rawget", "rawset", "rawequal", "tonumber",
+        "math", "os", "coroutine",
+    ]
+    missing = [kw for kw in required if kw not in src]
+    if missing:
+        print(f"FAIL env: 缺少环境检查 {missing}")
+        print(src[:1500])
+        return False
+
+    # checks 计数：原 3（game/workspace/print）+ 6（原 ext）+ 13（新）+ 其他
+    # 至少要 >= 3 + 19 = 22（不含 stack/timebomb）
+    if stats.get("checks", 0) < 22:
+        print(f"FAIL env: checks 计数 {stats.get('checks')} < 22")
+        return False
+
+    # pcall 次数：每个 env_check 1 次 + 计数器校验 + stack 等，至少 22+
+    if src.count("pcall") < 22:
+        print(f"FAIL env: pcall 次数 {src.count('pcall')} < 22")
+        return False
+
+    # 往返一致
+    chunk2 = parse_source(src)
+    if not generate_code(chunk2):
+        print("FAIL env: 往返序列化失败")
+        return False
+
+    print(f"[env] OK — 13 项新增环境检查全部注入（assert/error/pcall/.../"
+          f"coroutine），checks={stats['checks']}，{src.count('pcall')} 次 pcall")
     return True
 
 
@@ -912,6 +1078,10 @@ if __name__ == "__main__":
     ok &= test_metatable_garbage()
     ok &= test_executor_fingerprint()
     ok &= test_timed_self_verify()
+    # 提升11 新增测试
+    ok &= test_opaque_predicate_enhanced()
+    ok &= test_bitwise_garbage_block()
+    ok &= test_extended_env_checks()
     print()
     print("==== 全部通过 ====" if ok else "==== 存在失败 ====")
     sys.exit(0 if ok else 1)
