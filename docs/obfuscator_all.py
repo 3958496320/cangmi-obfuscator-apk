@@ -2343,28 +2343,70 @@ def flatten_function_body(func: Node, rng: random.Random,
 # 二、虚拟机模拟（VM）
 # ---------------------------------------------------------------------------
 
-# 支持的二元运算符（仅算术，保证纯函数可编译）
-_VM_BINOPS = {"+", "-", "*", "/", "%", "^"}
+# 支持的二元运算符（全功能 VM）
+_VM_BINOPS = ["+", "-", "*", "/", "%", "^", "..", "==", "~=", "<", ">", "<=", ">=", "and", "or"]
+# 支持的一元运算符
+_VM_UNOPS = ["-", "not", "#"]
+# and/or 需要短路语义，单独处理
+_VM_SHORTCIRCUIT = {"and", "or"}
 
 
 class _VMCompiler:
-    """将「纯算术函数」编译为自定义字节码 + 解释器。"""
+    """全功能 VM 编译器：将函数编译为字节码 + PC 解释器。
+
+    支持：算术/比较/逻辑/拼接/长度运算、if/elseif/else、while、
+    函数调用、表构造/索引读写、局部变量、upvalue 闭包捕获、全局变量。
+    and/or 采用条件跳转实现严格短路语义。
+
+    不支持（编译失败返回 None，调用方回退原函数）：
+    goto/label、可变参数(...)、多变量赋值、MethodCall、
+    NumericFor/GenericFor/Repeat、Continue/Break。
+
+    严格回退保障：任何编译异常 → 返回 None → 原函数保留，绝不报错。
+    """
 
     def __init__(self, rng: random.Random, gen: NameGenerator):
         self.rng = rng
         self.gen = gen
-        # 指令操作码表（每次随机生成）
-        ops = ["LOADK", "MOVR", "BINOP", "RET"]
+        # 操作码表（每次随机生成）
+        ops = ["LOADK", "LOADSTR", "LOADBOOL", "LOADNIL", "MOVR",
+               "BINOP", "UNOP", "RET", "CALL", "CALLV",
+               "JMP", "CJMP", "NJMP", "GETTAB", "SETTAB",
+               "NEWTAB", "GETUPV", "SETUPV", "GETGLOB"]
         rng.shuffle(ops)
         self.opcode = {name: i for i, name in enumerate(ops)}
-        # 运算符编码表（每次随机生成）
+        # 二元运算符编码（随机化）
         bin_list = list(_VM_BINOPS)
         rng.shuffle(bin_list)
         self.bincode = {op: i for i, op in enumerate(bin_list)}
-        self.prog = []      # 指令列表
-        self.consts = []   # 常量池
-        self._reg = {}            # var name -> 寄存器键（字符串）
-        self._next_reg = 0
+        # 一元运算符编码（随机化）
+        un_list = list(_VM_UNOPS)
+        rng.shuffle(un_list)
+        self.uncode = {op: i for i, op in enumerate(un_list)}
+        # 程序列表（1-based，prog[0] 是占位）
+        self.prog = [[None]]
+        self.consts = []        # 数字常量池
+        self.strs = []          # 字符串常量池
+        self._reg = {}          # var name -> 寄存器键
+        self._visible = set()   # 当前可见的局部名集合
+        self._upvalues = []     # upvalue 名列表
+        self._upval_idx = {}    # name -> upvalue 索引(0-based)
+        self._globals = []      # 全局变量名列表
+        self._glob_idx = {}     # name -> 全局索引
+
+    def _emit(self, *args) -> int:
+        """发射一条指令，返回 1-based 指令索引。"""
+        idx = len(self.prog)
+        self.prog.append(list(args))
+        return idx
+
+    def _cur_pc(self) -> int:
+        """下一条将被发射的指令的 1-based 索引。"""
+        return len(self.prog)
+
+    def _patch(self, idx: int, field: int, value):
+        """回填指令 idx 的第 field 个字段（0-based）。"""
+        self.prog[idx][field] = value
 
     def _reg_of(self, name: str) -> str:
         if name not in self._reg:
@@ -2372,14 +2414,31 @@ class _VMCompiler:
         return self._reg[name]
 
     def _new_reg(self) -> str:
-        r = self.gen.fresh()
-        self._reg[("__tmp__", self._next_reg)] = r
-        self._next_reg += 1
-        return r
+        return self.gen.fresh()
 
-    def _const_index(self, val: float) -> int:
+    def _const_idx(self, val) -> int:
         self.consts.append(val)
         return len(self.consts) - 1
+
+    def _str_idx(self, s: str) -> int:
+        self.strs.append(s)
+        return len(self.strs) - 1
+
+    def _upval_of(self, name: str) -> int:
+        if name not in self._upval_idx:
+            self._upval_idx[name] = len(self._upvalues)
+            self._upvalues.append(name)
+        return self._upval_idx[name]
+
+    def _glob_of(self, name: str) -> int:
+        if name not in self._glob_idx:
+            self._glob_idx[name] = len(self._globals)
+            self._globals.append(name)
+        return self._glob_idx[name]
+
+    # ------------------------------------------------------------------
+    # 表达式编译
+    # ------------------------------------------------------------------
 
     def _compile_expr(self, expr: Node) -> str:
         """编译表达式，返回存放结果的寄存器键。"""
@@ -2387,30 +2446,257 @@ class _VMCompiler:
         if t == "Number":
             try:
                 val = float(expr.get("value"))
-            except ValueError:
+            except (ValueError, TypeError):
                 val = 0.0
             dst = self._new_reg()
-            self.prog.append([self.opcode["LOADK"], dst, ("K", self._const_index(val))])
+            self._emit(self.opcode["LOADK"], dst, self._const_idx(val))
             return dst
-        if t == "Name":
-            return self._reg_of(expr.get("name"))
-        if t == "BinOp" and expr.get("op") in _VM_BINOPS:
-            a = self._compile_expr(expr.get("left"))
-            b = self._compile_expr(expr.get("right"))
+        if t == "String":
             dst = self._new_reg()
-            self.prog.append([self.opcode["BINOP"], dst, a, b, self.bincode[expr.get("op")]])
+            self._emit(self.opcode["LOADSTR"], dst,
+                       self._str_idx(expr.get("value")))
             return dst
-        if t == "UnaryOp" and expr.get("op") == "-":
-            # -x 编译为 0 - x
-            inner = self._compile_expr(expr.get("operand"))
-            zero_dst = self._new_reg()
-            self.prog.append([self.opcode["LOADK"], zero_dst, ("K", self._const_index(0.0))])
+        if t == "True":
             dst = self._new_reg()
-            self.prog.append([self.opcode["BINOP"], dst, zero_dst, inner, self.bincode["-"]])
+            self._emit(self.opcode["LOADBOOL"], dst, 1)
+            return dst
+        if t == "False":
+            dst = self._new_reg()
+            self._emit(self.opcode["LOADBOOL"], dst, 0)
+            return dst
+        if t == "Nil":
+            dst = self._new_reg()
+            self._emit(self.opcode["LOADNIL"], dst)
             return dst
         if t == "Paren":
             return self._compile_expr(expr.get("expr"))
-        raise _NotVMable("表达式不可编译")
+        if t == "Name":
+            name = expr.get("name")
+            if name in self._visible:
+                return self._reg_of(name)
+            # 全局库或保留字 → GETGLOB
+            if name in GLOBAL_LIBS or name in RESERVED:
+                dst = self._new_reg()
+                self._emit(self.opcode["GETGLOB"], dst,
+                           self._glob_of(name))
+                return dst
+            # 视为 upvalue（闭包捕获的外层局部）
+            idx = self._upval_of(name)
+            dst = self._new_reg()
+            self._emit(self.opcode["GETUPV"], dst, idx)
+            return dst
+        if t == "BinOp":
+            op = expr.get("op")
+            if op in _VM_SHORTCIRCUIT:
+                return self._compile_shortcircuit(expr, op)
+            a = self._compile_expr(expr.get("left"))
+            b = self._compile_expr(expr.get("right"))
+            dst = self._new_reg()
+            self._emit(self.opcode["BINOP"], dst, a, b, self.bincode[op])
+            return dst
+        if t == "UnaryOp":
+            op = expr.get("op")
+            inner = self._compile_expr(expr.get("operand"))
+            dst = self._new_reg()
+            self._emit(self.opcode["UNOP"], dst, inner, self.uncode[op])
+            return dst
+        if t == "Call":
+            fn = self._compile_expr(expr.get("func"))
+            args = [self._compile_expr(a) for a in expr.get("args", [])]
+            if len(args) > 4:
+                raise _NotVMable("调用参数过多 (>4)")
+            dst = self._new_reg()
+            self._emit(self.opcode["CALL"], dst, fn, len(args), *args)
+            return dst
+        if t == "Index":
+            obj = self._compile_expr(expr.get("obj"))
+            key = expr.get("key")
+            if key.type == "String":
+                k = self._new_reg()
+                self._emit(self.opcode["LOADSTR"], k,
+                           self._str_idx(key.get("value")))
+            else:
+                k = self._compile_expr(key)
+            dst = self._new_reg()
+            self._emit(self.opcode["GETTAB"], dst, obj, k)
+            return dst
+        if t == "Table":
+            dst = self._new_reg()
+            self._emit(self.opcode["NEWTAB"], dst)
+            arr_idx = 0
+            for f in expr.get("fields", []):
+                if f.type == "TableField":
+                    key = f.get("key")
+                    if key.type == "String":
+                        k = self._new_reg()
+                        self._emit(self.opcode["LOADSTR"], k,
+                                   self._str_idx(key.get("value")))
+                    else:
+                        k = self._compile_expr(key)
+                else:
+                    arr_idx += 1
+                    k = self._new_reg()
+                    self._emit(self.opcode["LOADK"], k,
+                               self._const_idx(float(arr_idx)))
+                v = self._compile_expr(f.get("value"))
+                self._emit(self.opcode["SETTAB"], dst, k, v)
+            return dst
+        raise _NotVMable(f"表达式不可编译: {t}")
+
+    def _compile_shortcircuit(self, expr: Node, op: str) -> str:
+        """编译 and/or 短路求值（条件跳转实现，语义严格等价）。
+
+        a and b: a falsy → result=a（跳过 b 求值）
+        a or  b: a truthy → result=a（跳过 b 求值）
+        """
+        ra = self._compile_expr(expr.get("left"))
+        r_result = self._new_reg()
+        self._emit(self.opcode["MOVR"], r_result, ra)
+        if op == "and":
+            jmp_idx = self._emit(self.opcode["NJMP"], ra, -1)
+        else:
+            jmp_idx = self._emit(self.opcode["CJMP"], ra, -1)
+        rb = self._compile_expr(expr.get("right"))
+        self._emit(self.opcode["MOVR"], r_result, rb)
+        target = self._cur_pc()
+        self._patch(jmp_idx, 2, target)
+        return r_result
+
+    # ------------------------------------------------------------------
+    # 语句编译
+    # ------------------------------------------------------------------
+
+    def _compile_stmt(self, stmt: Node):
+        """编译单条语句。"""
+        t = stmt.type
+        if t == "LocalAssign":
+            names = stmt.get("names")
+            exprs = stmt.get("exprs") or []
+            if len(names) != 1 or len(exprs) != 1:
+                raise _NotVMable("多变量赋值不支持")
+            nm = names[0]
+            src = self._compile_expr(exprs[0])
+            dst = self._reg_of(nm)
+            self._visible.add(nm)
+            self._emit(self.opcode["MOVR"], dst, src)
+            return
+        if t == "Assign":
+            targets = stmt.get("targets")
+            exprs = stmt.get("exprs") or []
+            if len(targets) != 1 or len(exprs) != 1:
+                raise _NotVMable("多目标赋值不支持")
+            tgt = targets[0]
+            src = self._compile_expr(exprs[0])
+            if tgt.type == "Name":
+                name = tgt.get("name")
+                if name in self._visible:
+                    dst = self._reg_of(name)
+                    self._emit(self.opcode["MOVR"], dst, src)
+                elif name in self._upval_idx:
+                    self._emit(self.opcode["SETUPV"],
+                               self._upval_of(name), src)
+                else:
+                    raise _NotVMable("全局赋值不支持")
+            elif tgt.type == "Index":
+                obj = self._compile_expr(tgt.get("obj"))
+                key = tgt.get("key")
+                if key.type == "String":
+                    k = self._new_reg()
+                    self._emit(self.opcode["LOADSTR"], k,
+                               self._str_idx(key.get("value")))
+                else:
+                    k = self._compile_expr(key)
+                self._emit(self.opcode["SETTAB"], obj, k, src)
+            else:
+                raise _NotVMable("赋值目标不支持")
+            return
+        if t == "If":
+            self._compile_if(stmt)
+            return
+        if t == "While":
+            self._compile_while(stmt)
+            return
+        if t == "Return":
+            exprs = stmt.get("exprs") or []
+            if not exprs:
+                self._emit(self.opcode["RET"], 0)
+                return
+            if len(exprs) > 5:
+                raise _NotVMable("返回值过多 (>5)")
+            regs = [self._compile_expr(e) for e in exprs]
+            self._emit(self.opcode["RET"], len(regs), *regs)
+            return
+        if t == "CallStatement":
+            call = stmt.get("expr")
+            if call.type != "Call":
+                raise _NotVMable("CallStatement 非 Call")
+            fn = self._compile_expr(call.get("func"))
+            args = [self._compile_expr(a) for a in call.get("args", [])]
+            if len(args) > 4:
+                raise _NotVMable("调用参数过多 (>4)")
+            self._emit(self.opcode["CALLV"], fn, len(args), *args)
+            return
+        if t == "Do":
+            self._compile_block(stmt.get("body"))
+            return
+        raise _NotVMable(f"语句不可编译: {t}")
+
+    def _compile_if(self, stmt: Node):
+        """编译 if/elseif/else（回跳补丁处理跳转目标）。"""
+        cond = self._compile_expr(stmt.get("cond"))
+        jmp_to_else = self._emit(self.opcode["NJMP"], cond, -1)
+        self._compile_block(stmt.get("body"))
+        jmp_ends = [self._emit(self.opcode["JMP"], -1)]
+        self._patch(jmp_to_else, 2, self._cur_pc())
+        for ec, eb in stmt.get("elifs", []):
+            econd = self._compile_expr(ec)
+            jmp_next = self._emit(self.opcode["NJMP"], econd, -1)
+            self._compile_block(eb)
+            jmp_ends.append(self._emit(self.opcode["JMP"], -1))
+            self._patch(jmp_next, 2, self._cur_pc())
+        else_body = stmt.get("else_body")
+        if else_body is not None:
+            self._compile_block(else_body)
+        end_pc = self._cur_pc()
+        for j in jmp_ends:
+            self._patch(j, 1, end_pc)
+
+    def _compile_while(self, stmt: Node):
+        """编译 while 循环（回跳补丁）。"""
+        loop_start = self._cur_pc()
+        cond = self._compile_expr(stmt.get("cond"))
+        jmp_exit = self._emit(self.opcode["NJMP"], cond, -1)
+        self._compile_block(stmt.get("body"))
+        self._emit(self.opcode["JMP"], loop_start)
+        self._patch(jmp_exit, 2, self._cur_pc())
+
+    def _compile_block(self, stmts):
+        """编译语句块。"""
+        for s in stmts:
+            self._compile_stmt(s)
+
+    # ------------------------------------------------------------------
+    # 预检查 & 函数编译入口
+    # ------------------------------------------------------------------
+
+    def _precheck_block(self, stmts):
+        """预检查语句块，拒绝不支持的语句类型（递归）。"""
+        for s in stmts:
+            t = s.type
+            if t in ("LocalAssign", "Assign", "If", "While", "Return",
+                     "CallStatement", "Do"):
+                if t == "If":
+                    self._precheck_block(s.get("body"))
+                    for ec, eb in s.get("elifs", []):
+                        self._precheck_block(eb)
+                    if s.get("else_body"):
+                        self._precheck_block(s.get("else_body"))
+                elif t == "While":
+                    self._precheck_block(s.get("body"))
+                elif t == "Do":
+                    self._precheck_block(s.get("body"))
+            else:
+                raise _NotVMable(f"不支持的语句: {t}")
 
     def compile(self, func: Node):
         """尝试编译函数。返回等价的 Luau 源码字符串；不可编译返回 None。"""
@@ -2418,90 +2704,48 @@ class _VMCompiler:
             return None
         params = func.get("params")
         body = func.get("body")
-        # 仅允许 LocalAssign + 末尾 Return
-        ret_idx = None
-        for i, s in enumerate(body):
-            if s.type == "LocalAssign":
-                if len(s.get("names")) != 1:
-                    return None
-                if len(s.get("exprs")) != 1:
-                    return None
-            elif s.type == "Return":
-                if ret_idx is not None or i != len(body) - 1:
-                    return None
-                ret_idx = i
-            else:
-                return None
-        if ret_idx is None:
+        if not body:
             return None
-        ret_exprs = body[ret_idx].get("exprs")
-        if len(ret_exprs) != 1:
-            return None
-
-        # 关键正确性检查：拒绝引用 upvalue（自由变量）的函数。
-        # VM 编译只把参数和函数体内 LocalAssign 声明的名字装入寄存器；
-        # 任何引用外部闭包变量（upvalue）的 Name 都不会有对应寄存器初值，
-        # 解释器会返回 nil，导致结果错误。闭包 `function() return count end`
-        # （count 为外层 local）就是典型反例。
-        # 通过预收集「本函数可见的局部名集合」并校验所有 Name 引用属于该集合
-        # 来排除此类函数。全局库（math/string 等）不会出现在纯算术表达式中
-        # （Call/Index 已被 _compile_expr 拒绝），故无需特别处理。
-        visible_names = set(params)
-        for s in body[:ret_idx]:
-            visible_names.update(s.get("names"))
-
-        def _check_names(expr: Node):
-            t = expr.type
-            if t == "Name":
-                if expr.get("name") not in visible_names:
-                    raise _NotVMable("引用 upvalue/全局名")
-            elif t == "BinOp":
-                _check_names(expr.get("left"))
-                _check_names(expr.get("right"))
-            elif t == "UnaryOp":
-                _check_names(expr.get("operand"))
-            elif t == "Paren":
-                _check_names(expr.get("expr"))
-            # Number / 其它类型不引用名字
-
         try:
-            # 预校验：所有表达式中的 Name 必须可见
-            for s in body[:ret_idx]:
-                _check_names(s.get("exprs")[0])
-            _check_names(ret_exprs[0])
-
-            # 参数寄存器
-            for p in params:
-                self._reg_of(p)
-            # 编译每条 local x = expr
-            for s in body[:ret_idx]:
-                nm = s.get("names")[0]
-                dst = self._reg_of(nm)
-                src = self._compile_expr(s.get("exprs")[0])
-                self.prog.append([self.opcode["MOVR"], dst, src])
-            ret_reg = self._compile_expr(ret_exprs[0])
-            self.prog.append([self.opcode["RET"], ret_reg])
+            self._precheck_block(body)
         except _NotVMable:
             return None
-
+        self._visible = set(params)
+        for p in params:
+            self._reg_of(p)
+        try:
+            self._compile_block(body)
+        except _NotVMable:
+            return None
+        except Exception:
+            return None
+        # 无显式 return 则补一个
+        if not self.prog or self.prog[-1][0] != self.opcode["RET"]:
+            self._emit(self.opcode["RET"], 0)
         return self._emit_source(params)
 
+    # ------------------------------------------------------------------
+    # 解释器源码生成
+    # ------------------------------------------------------------------
+
     def _emit_source(self, params) -> str:
-        """生成解释器 Luau 源码。"""
-        # 常量池表（整数常量输出为整数形式，避免 14.0 之类的浮点显示）
+        """生成 PC 解释器 Luau 源码。"""
         def fmt_const(c):
             if isinstance(c, float) and c.is_integer():
                 return str(int(c))
             return repr(c)
         consts_lua = "{" + ", ".join(fmt_const(c) for c in self.consts) + "}"
-        # 程序表：每条指令是一个 {op, ...} 表
+
+        def fmt_str(s):
+            return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        strs_lua = "{" + ", ".join(fmt_str(s) for s in self.strs) + "}"
+
+        # 程序表（跳过 prog[0] 占位）
         prog_lines = []
-        for ins in self.prog:
+        for ins in self.prog[1:]:
             parts = []
             for p in ins:
-                if isinstance(p, tuple) and p and p[0] == "K":
-                    parts.append(f'{{"K",{p[1]}}}')
-                elif isinstance(p, str):
+                if isinstance(p, str):
                     parts.append(f'"{p}"')
                 elif isinstance(p, (int, float)):
                     parts.append(str(p))
@@ -2510,52 +2754,118 @@ class _VMCompiler:
             prog_lines.append("{" + ",".join(parts) + "}")
         prog_lua = "{" + ",".join(prog_lines) + "}"
 
-        # 参数寄存器映射：params -> reg keys
         param_regs = [self._reg_of(p) for p in params]
-        # 解释器函数体
         param_str = ", ".join(params) if params else ""
 
-        # binop 分发（按编码顺序生成）
-        # bincode: op->code；反转得 code->op
-        code_to_op = {c: op for op, c in self.bincode.items()}
-        op_dispatch = []
+        # binop 分发（按编码顺序）
+        code_to_binop = {c: op for op, c in self.bincode.items()}
+        bin_dispatch = []
         for code in range(len(_VM_BINOPS)):
-            op = code_to_op[code]
-            op_dispatch.append(f'if c=={code} then R[d]=R[a]{op}R[b] end')
-        op_disp_str = " ".join(op_dispatch)
+            op = code_to_binop[code]
+            if op == "and":
+                bin_dispatch.append(f'if c=={code} then R[d]=R[a] and R[b] end')
+            elif op == "or":
+                bin_dispatch.append(f'if c=={code} then R[d]=R[a] or R[b] end')
+            else:
+                bin_dispatch.append(f'if c=={code} then R[d]=R[a]{op}R[b] end')
+        bin_disp_str = " ".join(bin_dispatch)
 
-        # opcode 常量
-        O_LOADK = self.opcode["LOADK"]
-        O_MOVR = self.opcode["MOVR"]
-        O_BINOP = self.opcode["BINOP"]
-        O_RET = self.opcode["RET"]
+        # unop 分发
+        code_to_unop = {c: op for op, c in self.uncode.items()}
+        un_dispatch = []
+        for code in range(len(_VM_UNOPS)):
+            op = code_to_unop[code]
+            if op == "-":
+                un_dispatch.append(f'if c=={code} then R[d]=-R[a] end')
+            elif op == "not":
+                un_dispatch.append(f'if c=={code} then R[d]=not R[a] end')
+            elif op == "#":
+                un_dispatch.append(f'if c=={code} then R[d]=#R[a] end')
+        un_disp_str = " ".join(un_dispatch)
 
-        src = f'''
-local function {self.gen.fresh()}({param_str})
-    local R = {{}}
-    local C = {consts_lua}
-'''
-        # 参数装入寄存器
+        O = self.opcode
+        fn_name = self.gen.fresh()
+
+        src = f'local function {fn_name}({param_str})\n'
+        src += f'    local R = {{}}\n'
+        src += f'    local C = {consts_lua}\n'
+        src += f'    local S = {strs_lua}\n'
         for p, rk in zip(params, param_regs):
             src += f'    R["{rk}"] = {p}\n'
+        if self._upvalues:
+            src += f'    local U = {{}}\n'
+            for i, name in enumerate(self._upvalues):
+                src += f'    U[{i + 1}] = {name}\n'
+        if self._globals:
+            src += f'    local G = {{}}\n'
+            for i, name in enumerate(self._globals):
+                src += f'    G[{i + 1}] = {name}\n'
         src += f'    local P = {prog_lua}\n'
-        src += f'    for _i = 1, #P do\n'
-        src += f'        local ins = P[_i]\n'
-        src += f'        local op = ins[1]\n'
-        src += f'        if op == {O_LOADK} then\n'
-        src += f'            local k = ins[3]; R[ins[2]] = C[k[2] + 1]\n'
-        src += f'        elseif op == {O_MOVR} then\n'
+        src += f'    if _VM_PROGS then table.insert(_VM_PROGS, P) end\n'
+        src += f'    local pc = 1\n'
+        src += f'    local _yc = 0\n'
+        src += f'    while pc <= #P do\n'
+        src += f'        local ins = P[pc]\n'
+        src += f'        local op = _vm_decode and _vm_decode(ins[1]) or ins[1]\n'
+        src += f'        _yc = _yc + 1\n'
+        src += f'        if _yc >= 10000 then _yc = 0; if task and task.wait then task.wait() end end\n'
+        src += f'        if op == {O["LOADK"]} then\n'
+        src += f'            R[ins[2]] = C[ins[3] + 1]\n'
+        src += f'        elseif op == {O["LOADSTR"]} then\n'
+        src += f'            R[ins[2]] = S[ins[3] + 1]\n'
+        src += f'        elseif op == {O["LOADBOOL"]} then\n'
+        src += f'            R[ins[2]] = (ins[3] == 1)\n'
+        src += f'        elseif op == {O["LOADNIL"]} then\n'
+        src += f'            R[ins[2]] = nil\n'
+        src += f'        elseif op == {O["MOVR"]} then\n'
         src += f'            R[ins[2]] = R[ins[3]]\n'
-        src += f'        elseif op == {O_BINOP} then\n'
+        src += f'        elseif op == {O["BINOP"]} then\n'
         src += f'            local d, a, b, c = ins[2], ins[3], ins[4], ins[5]\n'
-        src += f'            {op_disp_str}\n'
-        src += f'        elseif op == {O_RET} then\n'
-        src += f'            return R[ins[2]]\n'
+        src += f'            {bin_disp_str}\n'
+        src += f'        elseif op == {O["UNOP"]} then\n'
+        src += f'            local d, a, c = ins[2], ins[3], ins[4]\n'
+        src += f'            {un_disp_str}\n'
+        src += f'        elseif op == {O["RET"]} then\n'
+        src += f'            local n = ins[2]\n'
+        src += f'            if n == 0 then return end\n'
+        src += f'            if n == 1 then return R[ins[3]] end\n'
+        src += f'            return R[ins[3]], R[ins[4]], R[ins[5]], R[ins[6]], R[ins[7]]\n'
+        src += f'        elseif op == {O["CALL"]} then\n'
+        src += f'            local d, f, n = ins[2], ins[3], ins[4]\n'
+        src += f'            if n == 0 then R[d] = R[f]()\n'
+        src += f'            elseif n == 1 then R[d] = R[f](R[ins[5]])\n'
+        src += f'            elseif n == 2 then R[d] = R[f](R[ins[5]], R[ins[6]])\n'
+        src += f'            elseif n == 3 then R[d] = R[f](R[ins[5]], R[ins[6]], R[ins[7]])\n'
+        src += f'            else R[d] = R[f](R[ins[5]], R[ins[6]], R[ins[7]], R[ins[8]]) end\n'
+        src += f'        elseif op == {O["CALLV"]} then\n'
+        src += f'            local f, n = ins[2], ins[3]\n'
+        src += f'            if n == 0 then R[f]()\n'
+        src += f'            elseif n == 1 then R[f](R[ins[4]])\n'
+        src += f'            elseif n == 2 then R[f](R[ins[4]], R[ins[5]])\n'
+        src += f'            elseif n == 3 then R[f](R[ins[4]], R[ins[5]], R[ins[6]])\n'
+        src += f'            else R[f](R[ins[4]], R[ins[5]], R[ins[6]], R[ins[7]]) end\n'
+        src += f'        elseif op == {O["JMP"]} then\n'
+        src += f'            pc = ins[2]\n'
+        src += f'        elseif op == {O["CJMP"]} then\n'
+        src += f'            if R[ins[2]] then pc = ins[3] else pc = pc + 1 end\n'
+        src += f'        elseif op == {O["NJMP"]} then\n'
+        src += f'            if not R[ins[2]] then pc = ins[3] else pc = pc + 1 end\n'
+        src += f'        elseif op == {O["GETTAB"]} then\n'
+        src += f'            R[ins[2]] = R[ins[3]][R[ins[4]]]\n'
+        src += f'        elseif op == {O["SETTAB"]} then\n'
+        src += f'            R[ins[2]][R[ins[3]]] = R[ins[4]]\n'
+        src += f'        elseif op == {O["NEWTAB"]} then\n'
+        src += f'            R[ins[2]] = {{}}\n'
+        src += f'        elseif op == {O["GETUPV"]} then\n'
+        src += f'            R[ins[2]] = U[ins[3] + 1]\n'
+        src += f'        elseif op == {O["SETUPV"]} then\n'
+        src += f'            U[ins[2] + 1] = R[ins[3]]\n'
+        src += f'        elseif op == {O["GETGLOB"]} then\n'
+        src += f'            R[ins[2]] = G[ins[3] + 1]\n'
         src += f'        end\n'
+        src += f'        if op ~= {O["JMP"]} and op ~= {O["CJMP"]} and op ~= {O["NJMP"]} then pc = pc + 1 end\n'
         src += f'    end\n'
         src += f'end\n'
-        # 注意：上面生成了一个 local function <name>(...) ... end
-        # 调用方需替换原函数为该函数引用
         return src
 
 
@@ -2623,6 +2933,7 @@ def apply_control_flow(chunk: Node, rng: random.Random,
                     node.attrs["params"] = vm.get("params")
                     node.attrs["is_vararg"] = vm.get("is_vararg")
                     node.attrs["_no_flatten"] = True  # VM 产物不再平坦化
+                    node.attrs["_no_const_encrypt"] = True  # VM 字节码数字不可加密
                     stats["vm_count"] += 1
                     handled = True
             if not handled:
@@ -5425,6 +5736,184 @@ _LEGAL_FOOTER = (
 _DEFAULT_RESERVE: Set[str] = set(GLOBAL_LIBS)
 
 
+def apply_const_encrypt(chunk: Node, rng: random.Random) -> dict:
+    """数字常量加密（②数据表随机化）：将整数常量替换为 XOR 解密表达式。
+
+    对所有整数 Number 节点（0..0x7FFFFFFF），替换为：
+        <bxor>(KEY, KEY_N)
+    其中 KEY 是随机密钥，KEY_N = KEY XOR int(value)。
+    运行时 <bxor>(KEY, KEY_N) = KEY XOR KEY_N = n，语义等价。
+
+    <bxor> 使用纯 Lua 逐位模拟实现，不依赖 bit32/bit 库，100% 兼容。
+    跳过标记 _no_const_encrypt 的子树（如 VM 生成的字节码，其数字是
+    操作码/操作数，不能被加密）。
+    """
+    KEY = rng.randint(1, 0x7FFFFFFF)
+    bxor_name = NameGenerator(rng).fresh()
+    count = [0]
+
+    def _encrypt(node):
+        if node is None:
+            return node
+        if node.attrs.get("_no_const_encrypt"):
+            return node
+        for k, v in list(node.attrs.items()):
+            if isinstance(v, Node):
+                node.attrs[k] = _encrypt(v)
+            elif isinstance(v, list):
+                nl = []
+                for item in v:
+                    if isinstance(item, Node):
+                        nl.append(_encrypt(item))
+                    elif isinstance(item, tuple):
+                        nl.append(tuple(
+                            _encrypt(s) if isinstance(s, Node) else s
+                            for s in item))
+                    else:
+                        nl.append(item)
+                node.attrs[k] = nl
+        if node.type == "Number":
+            try:
+                val = float(node.get("value"))
+                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                    n = int(val)
+                    kn = KEY ^ n
+                    count[0] += 1
+                    return N("Call",
+                             func=N("Name", name=bxor_name),
+                             args=[N("Number", value=str(KEY)),
+                                   N("Number", value=str(kn))])
+            except (ValueError, TypeError):
+                pass
+        return node
+
+    _encrypt(chunk)
+
+    # 插入 <bxor> 辅助函数（加密已完成，函数内数字不会被加密）
+    bxor_func = N("LocalFunction", name=bxor_name,
+                  func=N("Function", params=["a", "b"], is_vararg=False, body=[
+                      N("LocalAssign", names=["r"], exprs=[N("Number", value="0")]),
+                      N("LocalAssign", names=["p"], exprs=[N("Number", value="1")]),
+                      N("While",
+                        cond=N("BinOp", op="or",
+                               left=N("BinOp", op=">",
+                                      left=N("Name", name="a"),
+                                      right=N("Number", value="0")),
+                               right=N("BinOp", op=">",
+                                       left=N("Name", name="b"),
+                                       right=N("Number", value="0"))),
+                        body=[
+                            N("LocalAssign", names=["ab"],
+                              exprs=[N("BinOp", op="%",
+                                       left=N("Name", name="a"),
+                                       right=N("Number", value="2"))]),
+                            N("LocalAssign", names=["bb"],
+                              exprs=[N("BinOp", op="%",
+                                       left=N("Name", name="b"),
+                                       right=N("Number", value="2"))]),
+                            N("If",
+                              cond=N("BinOp", op="~=",
+                                     left=N("Name", name="ab"),
+                                     right=N("Name", name="bb")),
+                              body=[N("Assign",
+                                      targets=[N("Name", name="r")],
+                                      exprs=[N("BinOp", op="+",
+                                               left=N("Name", name="r"),
+                                               right=N("Name", name="p"))])],
+                              elifs=[], else_body=None),
+                            N("Assign",
+                              targets=[N("Name", name="a")],
+                              exprs=[N("Call",
+                                       func=N("Index",
+                                              obj=N("Name", name="math"),
+                                              key=N("String", value="floor")),
+                                       args=[N("BinOp", op="/",
+                                               left=N("Name", name="a"),
+                                               right=N("Number", value="2"))])]),
+                            N("Assign",
+                              targets=[N("Name", name="b")],
+                              exprs=[N("Call",
+                                       func=N("Index",
+                                              obj=N("Name", name="math"),
+                                              key=N("String", value="floor")),
+                                       args=[N("BinOp", op="/",
+                                               left=N("Name", name="b"),
+                                               right=N("Number", value="2"))])]),
+                            N("Assign",
+                              targets=[N("Name", name="p")],
+                              exprs=[N("BinOp", op="*",
+                                       left=N("Name", name="p"),
+                                       right=N("Number", value="2"))]),
+                        ]),
+                      N("Return", exprs=[N("Name", name="r")]),
+                  ]))
+
+    chunk.attrs["body"].insert(0, bxor_func)
+
+    return {"encrypted": count[0], "key": KEY}
+
+
+def _generate_vm_infra() -> str:
+    """生成 VM 操作码周期重映射基础设施代码（③操作码重映射）。
+
+    注入到混淆输出开头，在所有 VM 函数之前。VM 函数通过全局变量
+    _VM_PROGS（程序注册表）和 _vm_decode（操作码解码函数）与此设施交互。
+
+    定时器每 600 秒（10 分钟）重映射一次操作码：重新生成 XOR 密钥，
+    重编码所有已注册程序的字节码。分析者必须持续监控映射变化。
+
+    如果注入器不支持 spawn/task.wait，定时器不会启动，但 VM 仍正常工作
+    （_VM_XOR 保持 0，操作码为明文，_vm_decode 直接返回原值）。
+    """
+    return (
+        "-- VM 操作码周期重映射（③）\n"
+        "_VM_PROGS = {}\n"
+        "_VM_XOR = 0\n"
+        "local _pure_bxor = function(a, b)\n"
+        "    local r, p = 0, 1\n"
+        "    while a > 0 or b > 0 do\n"
+        "        local ab, bb = a % 2, b % 2\n"
+        "        if ab ~= bb then r = r + p end\n"
+        "        a = math.floor(a / 2)\n"
+        "        b = math.floor(b / 2)\n"
+        "        p = p * 2\n"
+        "    end\n"
+        "    return r\n"
+        "end\n"
+        "local _vm_bxor = (bit32 and bit32.bxor) or (bit and bit.bxor) or _pure_bxor\n"
+        "_vm_decode = function(code)\n"
+        "    if _VM_XOR == 0 then return code end\n"
+        "    return _vm_bxor(code, _VM_XOR)\n"
+        "end\n"
+        "local _vm_remap = function()\n"
+        "    local old = _VM_XOR\n"
+        "    _VM_XOR = math.random(0, 0x7FFFFFFF)\n"
+        "    if _VM_XOR == old then _VM_XOR = _VM_XOR + 1 end\n"
+        "    local new = _VM_XOR\n"
+        "    if new == 0 then return end\n"
+        "    for _, P in ipairs(_VM_PROGS) do\n"
+        "        for _, ins in ipairs(P) do\n"
+        "            if old ~= 0 then\n"
+        "                ins[1] = _vm_bxor(_vm_bxor(ins[1], old), new)\n"
+        "            else\n"
+        "                ins[1] = _vm_bxor(ins[1], new)\n"
+        "            end\n"
+        "        end\n"
+        "    end\n"
+        "end\n"
+        "if spawn and task and task.wait then\n"
+        "    spawn(function()\n"
+        "        while true do\n"
+        "            pcall(function()\n"
+        "                task.wait(600)\n"
+        "                _vm_remap()\n"
+        "            end)\n"
+        "        end\n"
+        "    end)\n"
+        "end\n"
+    )
+
+
 def obfuscate(src: str,
               seed: Optional[int] = None,
               debug: bool = False,
@@ -5552,6 +6041,11 @@ def obfuscate(src: str,
     else:
         stats["L11_anti_heuristic"] = {"probes": 0, "skipped": True}
 
+    # L1b. 数字常量加密（②数据表随机化）：在 L1 字符串加密前，
+    #      将整数常量替换为 XOR 解密表达式。新产生的字符串（math.floor）
+    #      会被 L1 加密。跳过 VM 字节码（_no_const_encrypt 标记）。
+    stats["L1b_const_encrypt"] = apply_const_encrypt(chunk, rng)
+
     # 1. 字符串三重加密（最后做，覆盖 L7/L9/L10/L3 等产生的新串）
     dec_name = encrypt_strings(
         chunk, rng, reserve_names=reserve)
@@ -5583,6 +6077,9 @@ def obfuscate(src: str,
     code = generate_code(chunk)
     # 苍米独家混淆 - 头部版权水印（内嵌加密串已在代码中，双重防删除）
     code = _WATERMARK_HEADER + code
+    # ③VM操作码周期重映射基础设施（仅有VM函数时注入）
+    if stats.get("L3_control_flow", {}).get("vm_count", 0) > 0:
+        code = _WATERMARK_HEADER + _generate_vm_infra() + code[len(_WATERMARK_HEADER):]
     # 尾部法律声明（代码末尾固定存在）
     code = code + _LEGAL_FOOTER
     stats["output_chars"] = len(code)
