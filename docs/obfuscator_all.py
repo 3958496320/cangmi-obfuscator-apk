@@ -5136,8 +5136,11 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     ]
 
     # 异步定时执行：pcall(spawn(function() while true do task.wait(n); pcall(verify) end end))
+    # 逃生：若 task.wait 未真正 yield（注入器缺陷），连续两次迭代间隔极短则跳出。
     timer_spawn = N("CallStatement", expr=_pcall(N("Paren", expr=N("Function",
         params=[], is_vararg=False, body=[
+            N("LocalAssign", names=[name_node("_tw_last")],
+              exprs=[call_node(name_node("tick"), [])]),
             N("CallStatement", expr=call_node(name_node("spawn"), [
                 N("Function", params=[], is_vararg=False, body=[
                     N("While", cond=N("True"), body=[
@@ -5147,6 +5150,16 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                             [number_node(timer_n)])),
                         N("CallStatement", expr=call_node(
                             name_node("pcall"), [name_node(verify_fn)])),
+                        N("LocalAssign", names=[name_node("_tw_now")],
+                          exprs=[call_node(name_node("tick"), [])]),
+                        N("If", cond=N("BinOp", op="<",
+                              left=N("BinOp", op="-",
+                                     left=name_node("_tw_now"),
+                                     right=name_node("_tw_last")),
+                              right=number_node(1)),
+                          body=[N("Return", exprs=[])], elifs=[], else_body=None),
+                        N("Assign", targets=[name_node("_tw_last")],
+                          exprs=[name_node("_tw_now")]),
                     ]),
                 ]),
             ])),
@@ -6449,11 +6462,17 @@ def _generate_vm_infra() -> str:
         "end\n"
         "if spawn and task and task.wait then\n"
         "    spawn(function()\n"
+        "        local _last = tick()\n"
         "        while true do\n"
         "            pcall(function()\n"
         "                task.wait(600)\n"
         "                _vm_remap()\n"
         "            end)\n"
+        "            -- 逃生：若 task.wait 未真正 yield（注入器缺陷），\n"
+        "            -- 连续两次迭代间隔极短，跳出避免死循环卡死脚本。\n"
+        "            local _now = tick()\n"
+        "            if (_now - _last) < 1 then return end\n"
+        "            _last = _now\n"
         "        end\n"
         "    end)\n"
         "end\n"
