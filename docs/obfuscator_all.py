@@ -990,6 +990,7 @@ class CodeGenerator:
 
     def gen_block(self, stmts) -> str:
         parts = []
+        last_code_idx = None  # 上一个「代码语句」在 parts 中的索引
         for s in stmts:
             if s.type == "NoOp":
                 continue
@@ -997,7 +998,19 @@ class CodeGenerator:
                 # 法律声明注释节点：输出注释文本 + 换行
                 parts.append(self.indent() + s.get("value") + "\n")
                 continue
-            parts.append(self.gen_stmt(s))
+            code = self.gen_stmt(s)
+            # Lua 语句边界歧义修复：
+            # 当某条语句以 ( { [ 或字符串字面量开头，且其前存在语句时，
+            # Lua 词法器会跨行把它合并为前一条语句的「调用延续」
+            # （如 f() 换行 (g())[k]=v  被解析为 f()(g())[k]=v），
+            # 导致赋值/调用语义被吞掉（实测会造成 ESPEnabled=false 等
+            # 配置赋值未执行、功能被误开）。在上一语句末尾插入 ';' 强制分隔。
+            if last_code_idx is not None and code:
+                head = code.lstrip()
+                if head and head[0] in "({[\"'":
+                    parts[last_code_idx] = parts[last_code_idx].rstrip("\n") + ";\n"
+            parts.append(code)
+            last_code_idx = len(parts) - 1
         return "".join(parts)
 
     def indent(self) -> str:
