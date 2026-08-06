@@ -188,10 +188,17 @@ def encrypt_strings(chunk: Node, rng: random.Random,
     transform(chunk, visit)
 
     # 在 Chunk 顶部插入缓存表与解密函数定义
+    # 标记 _dec_cache / _dec_func：供 obfuscator_core 在 L8 prelude 插入后
+    # 将二者重新搬回最前。否则 L8 prelude（水印自毁/loadstring）会出现在
+    # `local function <dec>` 之前，导致：运行时调用未定义的 local → 崩溃；
+    # 且 L2 renamer 顺序处理时，prelude 中的调用点先于定义被访问，
+    # scope.resolve 返回 None → 调用点不被改名，而定义被改名 → 名称不一致。
     body = chunk.get("body")
     cache_decl = N("LocalAssign", names=[cache_name],
                    exprs=[N("Table", fields=[])])
+    cache_decl.attrs["_dec_cache"] = True
     dec_func = _build_decrypt_function(dec_name, cache_name)
+    dec_func.attrs["_dec_func"] = True
     body.insert(0, dec_func)
     body.insert(0, cache_decl)
 

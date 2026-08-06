@@ -81,6 +81,11 @@ def apply_dyninst(chunk: Node, rng: random.Random,
             targets=[N("Index", obj=name_node("_G"), key=string_node(key))],
             exprs=[fn]))
     reg_block = N("Do", body=reg_body)
+    # 标记 _dyninst_reg：供 obfuscator_core 在 L1/L8 之后将该注册块重新搬回
+    # body 最前（位于 cache+dec 之后、wm_var 之前）。否则被 L1/L8/L0 诸层
+    # 顶部插入挤到后面，wm_var（经 split+dyninst 后含 _G[dec(key)] 调用）
+    # 与 prelude 会在注册之前使用，触发 "attempt to call a nil value"。
+    reg_block.attrs["_dyninst_reg"] = True
 
     # 5. 标记已选节点，避免 transform 时重复处理；用 set(id) 追踪
     chosen_ids = {id(c) for c in chosen}

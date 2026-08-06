@@ -69,6 +69,49 @@ from adaptive_engine import (
 _DEFAULT_RESERVE: Set[str] = set(GLOBAL_LIBS)
 
 
+def _reorder_decrypt_to_top(chunk: Node) -> None:
+    """把各层注入的「定义块」按依赖顺序搬到 body 最前。
+
+    多层在 body 头部插入，后插入的会把先插入的挤到后面，导致「使用先于定义」：
+      - L1 cache+dec 被 L8 prelude 超越 → dec 调用点先于 dec 定义（崩溃 + 改名不一致）
+      - L0 wm_var 被 L8 prelude 超越 → 水印自毁读到 nil 误判被篡改
+      - L9 dyninst 注册块被 L1/L0/L8 超越 → wm_var（split+dyninst 后含
+        _G[dec(key)] 调用）在注册前使用 → "attempt to call a nil value"
+    本函数在 L8 之后、L2 之前统一修正顺序：
+        cache -> dec -> dyninst_reg -> wm_var -> 其余
+    依据：
+      - dyninst_reg 的 _G[dec(key)] 索引键经 L1 加密，需 dec 已定义
+      - wm_var 的赋值经 L1 加密 + L9 dyninst 替换，需 dec 与 dyninst_reg 都已就绪
+    纯语句重排，不削弱任何混淆强度。
+    """
+    body = chunk.attrs.get("body")
+    if not isinstance(body, list):
+        return
+    dec_cache = None
+    dec_func = None
+    dyninst_reg = None
+    wm_decl = None
+    for s in body:
+        if not isinstance(s, Node):
+            continue
+        if s.attrs.get("_dec_cache") and dec_cache is None:
+            dec_cache = s
+        elif s.attrs.get("_dec_func") and dec_func is None:
+            dec_func = s
+        elif s.attrs.get("_dyninst_reg") and dyninst_reg is None:
+            dyninst_reg = s
+        elif s.attrs.get("_wm_var_decl") and wm_decl is None:
+            wm_decl = s
+    ordered = [n for n in (dec_cache, dec_func, dyninst_reg, wm_decl)
+               if n is not None]
+    if not ordered:
+        return
+    for s in ordered:
+        body.remove(s)
+    for i, s in enumerate(ordered):
+        body.insert(i, s)
+
+
 def obfuscate(src: str,
               seed: Optional[int] = None,
               debug: bool = False,
@@ -127,12 +170,16 @@ def obfuscate(src: str,
     # 苍米独家混淆 - 内嵌水印：local <rand> = "苍米独家混淆"
     # 字符串交由 L1 三重加密，变量名交由 L2 重命名，语句可能被 L3/L10 打散
     # 删除头部注释后，加密水印串仍埋伏在代码内部，反编译可见版权归属
+    # 标记 _wm_var_decl：L8 prelude（水印自毁验证）会读取 <wm_var>，
+    # 必须保证赋值在 prelude 之前；由 _reorder_decrypt_to_top 统一搬移到最前。
     _wm_var = NameGenerator(rng).fresh()
-    chunk.attrs["body"].insert(0, Node(
+    _wm_node = Node(
         "LocalAssign",
         names=[_wm_var],
         exprs=[Node("String", value=_WATERMARK_STRING)],
-    ))
+    )
+    _wm_node.attrs["_wm_var_decl"] = True
+    chunk.attrs["body"].insert(0, _wm_node)
     stats["L0_watermark"] = {"var": _wm_var, "embedded": True}
 
     # 7. 反自动化（pre-encryption）：字符串拆分 / API 重定向 / AST 扰动
@@ -190,6 +237,15 @@ def obfuscate(src: str,
                            and not disable_loadstring),
         debug=debug,
         wm_var=_wm_var)
+
+    # 修复：L8 prelude 在 body 头部插入，把 L1 的 `local <cache>` + `local function <dec>`
+    # 挤到了后面。导致 prelude（水印自毁 / loadstring 加载器）中对 <dec> 的调用出现在
+    # 定义之前——运行时触发 "attempt to call a nil value"，且 L2 renamer 顺序处理时
+    # 调用点先于定义被访问而不被改名，与定义的新名不一致（典型表现：ACS_Engine
+    # 客户端脚本加载即崩，OnClientEvent 处理函数从未注册，事件全部被丢弃）。
+    # 将 L1 的 cache + dec 重新搬回 body 最前，保证定义先于一切调用，且 L2 改名一致。
+    # 此举纯语句重排，不削弱任何混淆强度。
+    _reorder_decrypt_to_top(chunk)
 
     # 2. 作用域感知重命名（最后做，统一映射所有名称）
     rename_map = rename(chunk, rng, reserve_names=reserve)
