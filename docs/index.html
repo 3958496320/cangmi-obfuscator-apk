@@ -676,7 +676,7 @@ for (let i = 0; i < 15; i++) {
                 <span>开始混淆</span>
             </button>
             <button class="btn btn-secondary" onclick="clearInput()">清空</button>
-            <label class="ninja-toggle" title="关闭 VM 编译和 loadstring 动态加载，大幅减小产物体积。弱注入器（如忍者）解析大源码会超时，建议开启此模式。">
+            <label class="ninja-toggle" title="忍者注入器兼容模式：不降低任何保护层（VM/loadstring/dyninst 全开），仅对产物超长行做折行整形，帮助弱注入器更顺畅地解析大表字面量。卡顿本身是大型脚本正常现象，此模式为可选优化。">
                 <input type="checkbox" id="ninja-mode"> <span>忍者模式</span>
             </label>
         </div>

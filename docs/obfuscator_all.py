@@ -86,8 +86,8 @@ class Token:
 
 # 多字符符号运算符（按长度降序匹配，保证贪婪匹配）
 _MULTI_SYMBOLS = [
-    "...", "..", "::", "==", "~=", "<=", ">=", "<<", ">>", "//",
-    "+=", "-=", "*=", "/=", "%=", "^=", "..=",
+    "...", "..=", "..", "::", "==", "~=", "<=", ">=", "<<", ">>", "//",
+    "+=", "-=", "*=", "/=", "%=", "^=",
     "->",  # Luau 函数类型箭头
     "{", "}", "(", ")", "[", "]", ";", ":", ",", ".", "+", "-",
     "*", "/", "%", "^", "#", "<", ">", "=", "&", "|", "~",
@@ -683,23 +683,21 @@ class Parser:
     def parse_expr_statement(self) -> Node:
         """表达式语句：赋值或函数调用。"""
         expr = self.parse_suffixed_expr()
+        # 复合赋值 += 等（单目标）-> 拆解为普通赋值 target = target op rhs
+        # Luau 合法语法，必须支持；否则 x+=1 会误判为函数调用语句报错。
+        t = self.cur()
+        if t.type == "symbol" and t.value in ("+=", "-=", "*=", "/=", "%=", "^=", "..="):
+            op = ".." if t.value == "..=" else t.value[0]
+            self.next()
+            rhs = self.parse_expr()
+            return N("Assign", targets=[expr],
+                     exprs=[N("BinOp", op=op, left=expr, right=rhs)])
         if self.check("symbol", "=") or self.check("symbol", ","):
             # 赋值
             targets = [expr]
             while self.accept("symbol", ","):
                 targets.append(self.parse_suffixed_expr())
             self.expect("symbol", "=")
-            # 复合赋值 += 等 -> 拆解为普通赋值
-            t = self.cur()
-            if t.type == "symbol" and t.value in ("+=", "-=", "*=", "/=", "%=", "^=", "..="):
-                op = t.value[0]
-                if t.value == "..=":
-                    op = ".."
-                self.next()
-                rhs = self.parse_expr()
-                # target = target op rhs
-                exprs = [N("BinOp", op=op, left=expr, right=rhs)]
-                return N("Assign", targets=targets, exprs=exprs)
             exprs = [self.parse_expr()]
             while self.accept("symbol", ","):
                 exprs.append(self.parse_expr())
@@ -735,6 +733,9 @@ class Parser:
 
     def parse_unary_expr(self) -> Node:
         t = self.cur()
+        # Luau if 表达式（三元）：if cond then a else b / elseif 链
+        if t.type == "keyword" and t.value == "if":
+            return self.parse_if_expr()
         if t.type == "keyword" and t.value == "not":
             self.next()
             operand = self.parse_binop_expr(self.UNARY_PRIORITY)
@@ -744,6 +745,24 @@ class Parser:
             operand = self.parse_binop_expr(self.UNARY_PRIORITY)
             return N("UnaryOp", op=t.value, operand=operand)
         return self.parse_suffixed_expr()
+
+    def parse_if_expr(self) -> Node:
+        """解析 Luau if 表达式：if cond then expr (elseif cond then expr)* else expr。"""
+        self.expect("keyword", "if")
+        cond = self.parse_expr()
+        self.expect("keyword", "then")
+        then_e = self.parse_expr()
+        elifs = []
+        while self.check("keyword", "elseif"):
+            self.next()
+            ec = self.parse_expr()
+            self.expect("keyword", "then")
+            ee = self.parse_expr()
+            elifs.append((ec, ee))
+        self.expect("keyword", "else")
+        else_e = self.parse_expr()
+        return N("IfExpr", cond=cond, then_expr=then_e,
+                 elifs=elifs, else_expr=else_e)
 
     def parse_suffixed_expr(self) -> Node:
         """带后缀的表达式：.field / [key] / (args) / :method(args)。"""
@@ -1141,6 +1160,13 @@ class CodeGenerator:
             return "true"
         if t == "False":
             return "false"
+        if t == "IfExpr":
+            out = (f"if {self.gen_expr(node.get('cond'))} then "
+                   f"{self.gen_expr(node.get('then_expr'))}")
+            for ec, ee in node.get("elifs"):
+                out += f" elseif {self.gen_expr(ec)} then {self.gen_expr(ee)}"
+            out += f" else {self.gen_expr(node.get('else_expr'))}"
+            return out
         if t == "Number":
             return str(node.get("value"))
         if t == "String":
@@ -2036,6 +2062,14 @@ class Renamer:
         if t == "Paren":
             self._rewrite_expr(node.get("expr"), scope)
             return
+        if t == "IfExpr":
+            self._rewrite_expr(node.get("cond"), scope)
+            self._rewrite_expr(node.get("then_expr"), scope)
+            for ec, ee in node.get("elifs"):
+                self._rewrite_expr(ec, scope)
+                self._rewrite_expr(ee, scope)
+            self._rewrite_expr(node.get("else_expr"), scope)
+            return
         if t == "Table":
             for f in node.get("fields"):
                 if f.type == "TableField":
@@ -2122,16 +2156,74 @@ def _body_stmts(func: Node):
     return func.get("body")
 
 
+def _deep_has_stmttype(node, types) -> bool:
+    """递归检查节点树是否含指定类型的语句节点（任意深度）。"""
+    if isinstance(node, Node):
+        if node.type in types:
+            return True
+        for v in node.attrs.values():
+            if _deep_has_stmttype(v, types):
+                return True
+    elif isinstance(node, list):
+        for item in node:
+            if _deep_has_stmttype(item, types):
+                return True
+    elif isinstance(node, tuple):
+        for item in node:
+            if _deep_has_stmttype(item, types):
+                return True
+    return False
+
+
+def _reorder_continue_last(body):
+    """把块内 continue 之后的所有语句移到 continue 之前。
+
+    Luau 语法要求 continue 必须是块的最后一条语句（同 return）。
+    各注入 pass 可能在 continue 之后插入 do 块等语句，导致 Luau 解析报
+    'Expected end, got do'。continue 后的语句由注入 pass 产生（无副作用
+    垃圾/do 块；含 continue 的函数已被 CFF 跳过），前移不影响程序输出。
+    """
+    if not body:
+        return
+    ci = None
+    for i, s in enumerate(body):
+        if isinstance(s, Node) and s.type == "Continue":
+            ci = i
+            break
+    if ci is None or ci == len(body) - 1:
+        return  # 无 continue 或已是块末
+    cont = body[ci]
+    after = body[ci + 1:]
+    body[:] = body[:ci] + after + [cont]
+
+
+def _fix_continue_blocks(node):
+    """递归：确保每个语句块的 continue 是最后语句（Luau 语法要求）。"""
+    if isinstance(node, Node):
+        for v in node.attrs.values():
+            _fix_continue_blocks(v)
+    elif isinstance(node, list):
+        _reorder_continue_last(node)
+        for item in node:
+            _fix_continue_blocks(item)
+    elif isinstance(node, tuple):
+        for item in node:
+            _fix_continue_blocks(item)
+
+
 def _is_flattenable(stmts) -> bool:
     """判断函数体是否可安全平坦化。"""
     # 至少 4 条顶层语句才有收益
     if len(stmts) < 4:
         return False
+    # 递归检测：含 goto/label/break/continue（任意深度，含嵌套循环内）的
+    # 函数体不平坦化。这些跳转语句的循环/块作用域在 CFF 状态机重组下会被
+    # 破坏，导致 Luau 严格解析报 then/end 错配（如 continue 后紧跟 do，
+    # then 未关闭）。VM 编译器本就不支持这些跳转，故此类函数控制流层
+    # 保留原样，其余 11 层保护全开。
+    unsafe = ("Goto", "Label", "Break", "Continue")
     for s in stmts:
-        if s.type in ("Goto", "Label"):
-            return False
-        # 顶层 break/continue 在函数体非法，但防御性跳过
-        if s.type in ("Break", "Continue"):
+        if _deep_has_stmttype(s, unsafe):
             return False
     return True
 
@@ -7178,6 +7270,10 @@ def obfuscate(src: str,
     stats["legal_comments"] = legal_count
 
     # ∞. 代码生成
+    #     先修正 continue 块：Luau 要求 continue 是块最后语句（同 return），
+    #     各注入 pass 可能在 continue 后插入语句，此处统一把 continue 后的
+    #     语句前移，确保 Luau 解析通过。前移的语句为无副作用注入垃圾。
+    _fix_continue_blocks(chunk)
     code = generate_code(chunk)
     # 苍米独家混淆 - 头部版权水印（内嵌加密串已在代码中，双重防删除）
     code = _WATERMARK_HEADER + code
