@@ -7236,6 +7236,86 @@ def obfuscate(src: str,
 # 入口函数（网页版单文件调用入口）
 # =============================================================================
 
+def _wrap_one_line(raw: str, max_line: int) -> str:
+    """把单条超长行在表字面量项分隔逗号处安全折行。
+
+    只在「花括号深度=1、不在字符串/注释内」的逗号后切分，保护字符串字面量
+    与注释不被破坏。Luau 表字面量允许任意换行，故语义零变化。
+    """
+    # 注释行不折（折行会破坏注释结构）
+    if raw.lstrip().startswith("--"):
+        return raw
+    lead = raw[:len(raw) - len(raw.lstrip())]
+    cont = lead + "    "
+    n = len(raw)
+    # 扫描安全逗号位置：brace==1 且不在字符串/行注释内
+    safe = []
+    i = 0
+    in_str = None
+    brace = 0
+    while i < n:
+        c = raw[i]
+        if in_str is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c == "-" and i + 1 < n and raw[i + 1] == "-":
+            break  # 行注释开始，后续不再视为可折点
+        if c == '"' or c == "'":
+            in_str = c
+            i += 1
+            continue
+        if c == "{":
+            brace += 1
+        elif c == "}":
+            brace -= 1
+        elif c == "," and brace == 1:
+            safe.append(i)
+        i += 1
+    if not safe:
+        return raw  # 无安全折点，保持原样
+    # 按安全逗号切段（每段含尾逗号），累积超 max_line 即折行
+    segments = []
+    prev = 0
+    for ci in safe:
+        segments.append(raw[prev:ci + 1])
+        prev = ci + 1
+    segments.append(raw[prev:])  # 尾段
+    out = ""
+    cur_len = 0
+    for k, seg in enumerate(segments):
+        if k == 0:
+            out = seg
+            cur_len = len(seg)
+        else:
+            if cur_len + len(seg) > max_line:
+                out = out.rstrip() + "\n" + cont + seg.lstrip()
+                cur_len = len(cont) + len(seg.lstrip())
+            else:
+                out += seg
+                cur_len += len(seg)
+    return out
+
+
+def _wrap_long_lines(code: str, max_line: int = 200) -> str:
+    """行宽整形：把超长行在表字面量项分隔逗号处安全折行。
+
+    消除让 Luau 解析器（尤其弱注入器如忍者）卡顿的超长单行巨型表字面量。
+    语义零变化（Luau 表字面量允许任意换行），不降低任何保护强度。
+    只整形超过 max_line 的行，其余行原样保留。
+    """
+    if max_line <= 0:
+        return code
+    out = []
+    for raw in code.split("\n"):
+        out.append(raw if len(raw) <= max_line else _wrap_one_line(raw, max_line))
+    return "\n".join(out)
+
+
 def obfuscate_code(code_str, ninja_mode=False):
     """对 Luau 源码执行 12 层混淆，返回混淆后的代码字符串。
 
@@ -7243,14 +7323,16 @@ def obfuscate_code(code_str, ninja_mode=False):
     内部调用 obfuscate() 并取其返回字典中的 "code" 字段。
 
     参数：
-        ninja_mode: 忍者注入器兼容模式。关闭 VM 编译、loadstring 动态加载、
-                    动态指令替换（dyninst），大幅减小产物体积，避免弱注入器
-                    解析大源码超时。dyninst 会把简单运算变函数调用，既增加
-                    解析负担又是 VM 接管的根源，弱注入器上建议关闭。
+        ninja_mode: 忍者注入器兼容模式。**不关闭任何保护层**
+                    （VM / loadstring / dyninst 全开，保护强度不降低），
+                    仅对最终产物做更激进的行宽整形（max_line=120 vs 默认 200），
+                    消除让弱注入器解析卡顿的超长单行巨型表字面量。
+                    卡顿真凶是单行数千字符的表字面量（如雷达 Positions 表
+                    ×加密字符串展开），而非保护层本身；行宽整形在表项逗号处
+                    安全折行，Luau 表字面量允许换行，语义零变化。
     """
-    return obfuscate(code_str,
-                     disable_vm=ninja_mode,
-                     disable_loadstring=ninja_mode,
-                     disable_dyninst=ninja_mode)["code"]
+    code = obfuscate(code_str)["code"]  # 全保护，不 disable 任何层
+    max_line = 120 if ninja_mode else 200
+    return _wrap_long_lines(code, max_line=max_line)
 
 
