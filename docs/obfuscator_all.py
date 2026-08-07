@@ -4933,11 +4933,70 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
     # 33. request（HTTP 请求函数，执行器特有全局形式）
     req_block = _probe_global("request", "function", 33)
 
-    # v7 检测点分散（薄弱点1增强）：
+    # v7 检测点分散（薄弱点1增强 + 薄弱点C极致增强）：
     # 旧版所有检测塞进单个巨型 do-block，破解者定位一个 do-block 即可 patch 全部。
     # 新版把 33 个检测块随机分成多组，每组独立 Do 节点（独立作用域），
     # 组间插入计数器自增噪声语句，让 do-block 不相邻、位置随机。
     # 破解者必须定位并 patch 全部分散的 do-block 才能绕过。
+    # v8 薄弱点C极致增强：新增的 getloadedmodules/tick 检测旧版在分散后追加
+    # （位置固定末尾），破解者可用"末尾两块"定位。新版把它们加入 all_blocks
+    # 一起随机打散，位置完全随机。
+
+    # v7 新增检测：getloadedmodules 数量异常（反混淆器注入会改变模块数）
+    # 作为完整 Do 块加入 all_blocks，参与随机分组打散
+    glm_count_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Call",
+            func=N("Name", name="getloadedmodules"), args=[])])
+    ])
+    glm_count_chk = N("Do", body=[
+        N("LocalAssign", names=["_glm_ok", "_glm_list"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=glm_count_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="_glm_ok"),
+                 right=N("BinOp", op="and",
+                         left=N("BinOp", op="~=",
+                                left=N("Call", func=N("Name", name="type"),
+                                       args=[N("Name", name="_glm_list")]),
+                                right=N("String", value="table")),
+                         right=N("BinOp", op="~=",
+                                 left=N("Name", name="_glm_list"),
+                                 right=N("Nil")))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ])
+
+    # v7 新增检测：tick() 连续采样差值异常（单步调试特征）
+    # 正常执行两次 tick() 差值极小（<0.001s），单步调试时差值显著放大
+    # 全 pcall 包裹，tick 不可用时静默跳过
+    tick_fn1 = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Call", func=N("Name", name="tick"), args=[])])])
+    tick_fn2 = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Call", func=N("Name", name="tick"), args=[])])])
+    tick_chk = N("Do", body=[
+        N("LocalAssign", names=["_tk1_ok", "_tk1"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=tick_fn1)])]),
+        N("LocalAssign", names=["_tk2_ok", "_tk2"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=tick_fn2)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("BinOp", op="and",
+                        left=N("Name", name="_tk1_ok"),
+                        right=N("Name", name="_tk2_ok")),
+                 right=N("BinOp", op=">",
+                         left=N("BinOp", op="-",
+                                left=N("Name", name="_tk2"),
+                                right=N("Name", name="_tk1")),
+                         right=number_node(1))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ])
+
     all_blocks = (dbg_block_body + ge_block_body + hf_block_body
                   + ie_block_body + env_block_body
                   + gr_block_body + dr_block_body
@@ -4953,7 +5012,8 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
                   + guv_block + suv_block
                   + gr2_block + b64e_block
                   + ie2_block + pg_block
-                  + upg_block + req_block)
+                  + upg_block + req_block
+                  + [glm_count_chk, tick_chk])
 
     # 按 If 语句边界切分成独立检测单元（每个单元 = LocalAssign + If）
     units = []
@@ -4991,61 +5051,8 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
                           right=number_node(1))])
             ]))
 
-    # v7 新增检测：getloadedmodules 数量异常（反混淆器注入会改变模块数）
-    glm_count_fn = N("Function", params=[], is_vararg=False, body=[
-        N("Return", exprs=[N("Call",
-            func=N("Name", name="getloadedmodules"), args=[])])
-    ])
-    glm_count_chk = N("Do", body=[
-        N("LocalAssign", names=["_glm_ok", "_glm_list"],
-          exprs=[N("Call", func=N("Name", name="pcall"),
-                   args=[N("Paren", expr=glm_count_fn)])]),
-        N("If",
-          cond=N("BinOp", op="and",
-                 left=N("Name", name="_glm_ok"),
-                 right=N("BinOp", op="and",
-                         left=N("BinOp", op="~=",
-                                left=N("Call", func=N("Name", name="type"),
-                                       args=[N("Name", name="_glm_list")]),
-                                right=N("String", value="table")),
-                         right=N("BinOp", op="~=",
-                                 left=N("Name", name="_glm_list"),
-                                 right=N("Nil")))),
-          body=[N("Assign", targets=[N("Name", name=flag_name)],
-                  exprs=[N("True")])],
-          elifs=[], else_body=None),
-    ])
-    dispersed.append(glm_count_chk)
-
-    # v7 新增检测：tick() 连续采样差值异常（单步调试特征）
-    # 正常执行两次 tick() 差值极小（<0.001s），单步调试时差值显著放大
-    # 全 pcall 包裹，tick 不可用时静默跳过
-    tick_fn1 = N("Function", params=[], is_vararg=False, body=[
-        N("Return", exprs=[N("Call", func=N("Name", name="tick"), args=[])])])
-    tick_fn2 = N("Function", params=[], is_vararg=False, body=[
-        N("Return", exprs=[N("Call", func=N("Name", name="tick"), args=[])])])
-    tick_chk = N("Do", body=[
-        N("LocalAssign", names=["_tk1_ok", "_tk1"],
-          exprs=[N("Call", func=N("Name", name="pcall"),
-                   args=[N("Paren", expr=tick_fn1)])]),
-        N("LocalAssign", names=["_tk2_ok", "_tk2"],
-          exprs=[N("Call", func=N("Name", name="pcall"),
-                   args=[N("Paren", expr=tick_fn2)])]),
-        N("If",
-          cond=N("BinOp", op="and",
-                 left=N("BinOp", op="and",
-                        left=N("Name", name="_tk1_ok"),
-                        right=N("Name", name="_tk2_ok")),
-                 right=N("BinOp", op=">",
-                         left=N("BinOp", op="-",
-                                left=N("Name", name="_tk2"),
-                                right=N("Name", name="_tk1")),
-                         right=number_node(1))),
-          body=[N("Assign", targets=[N("Name", name=flag_name)],
-                  exprs=[N("True")])],
-          elifs=[], else_body=None),
-    ])
-    dispersed.append(tick_chk)
+    # v8 薄弱点C：glm/tick 检测已加入 all_blocks 随机打散（见上方构造），
+    # 不再在分散后追加，避免位置固定末尾被破解者定位。
 
     check_block = N("Do", body=dispersed)
 
@@ -5522,9 +5529,17 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     fb = gen.fresh()  # 子 flag B：扩展环境组
     fc = gen.fresh()  # 子 flag C：计数器/栈/时间组
     # 指纹初值：各不相同，正常时三者满足派生关系
+    # v8 派生常数随机化（薄弱点A极致增强）：
+    # 旧版 fb=fa+7、fc=fa*3%9973 的常数（7/3/9973）在所有产物中固定，
+    # 破解者分析一个产物即掌握全部规律，可写通用 patcher 批量破解。
+    # 新版每次混淆随机生成派生常数（delta_b/mul_c/mod_c），
+    # 破解者必须对每个产物单独逆向派生规则，无法通用化批量 patch。
     fa_init = rng.randint(1000, 9999)
-    fb_init = fa_init + 7        # fb 派生自 fa（+7）
-    fc_init = fa_init * 3 % 9973  # fc 派生自 fa（*3 mod 素数）
+    delta_b = rng.randint(3, 999)          # fb 派生偏移（随机）
+    mul_c = rng.randint(2, 9)              # fc 派生乘数（随机）
+    mod_c = rng.choice([9973, 7919, 6151, 4933, 4099, 3217, 2017, 991])  # fc 派生模数（随机素数）
+    fb_init = (fa_init + delta_b) % 100000        # fb 派生自 fa（+随机偏移）
+    fc_init = (fa_init * mul_c) % mod_c           # fc 派生自 fa（*随机乘数 mod 随机素数）
     prelude.append(N("LocalAssign", names=[flag], exprs=[N("False")]))
     prelude.append(N("LocalAssign", names=[counter],
                      exprs=[N("Table", fields=[])]))
@@ -5737,9 +5752,10 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     ]))
     stats["checks"] += 1
 
-    # 8.65) 多 flag 交叉校验汇总（薄弱点2增强核心）
+    # 8.65) 多 flag 交叉校验汇总（薄弱点2增强核心 + 薄弱点A极致增强）
     #       校验 fa/fb/fc 三者是否仍满足派生关系：
-    #         fb == fa + 7   且   fc == (fa * 3) % 9973
+    #         fb == (fa + delta_b) % 100000   且   fc == (fa * mul_c) % mod_c
+    #       （delta_b/mul_c/mod_c 每次混淆随机，破解者无法写通用 patcher）
     #       任一子 flag 被污染（篡改）→ 派生关系破裂 → 主 flag = true（触发自毁/误导）
     #       破解者必须同时 patch 三个子 flag 且保持派生关系一致，否则必被捕获。
     #       用 ~= 检测（不等即异常），全 pcall 安全。
@@ -5751,16 +5767,18 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
           cond=N("BinOp", op="or",
                  left=N("BinOp", op="~=",
                         left=name_node("_xb"),
-                        right=N("BinOp", op="+",
-                                left=name_node("_xa"),
-                                right=number_node(7))),
+                        right=N("BinOp", op="%",
+                                left=N("BinOp", op="+",
+                                       left=name_node("_xa"),
+                                       right=number_node(delta_b)),
+                                right=number_node(100000))),
                  right=N("BinOp", op="~=",
                          left=name_node("_xc"),
                          right=N("BinOp", op="%",
                                  left=N("BinOp", op="*",
                                         left=name_node("_xa"),
-                                        right=number_node(3)),
-                                 right=number_node(9973)))),
+                                        right=number_node(mul_c)),
+                                 right=number_node(mod_c)))),
           body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
           elifs=[], else_body=None),
     ])
@@ -5860,6 +5878,35 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                                      key=name_node("rk"))],
                           exprs=[name_node("rv")])],
                   elifs=[], else_body=None)]),
+        # 4. v8 交叉校验派生关系（薄弱点B极致增强）：
+        #    旧版交叉校验只在 prelude 执行一次，破解者 patch fa/fb/fc 后
+        #    运行时不再校验。新版在定时自校验里也做交叉校验，
+        #    patch 后定时器触发时也能捕获，迫使破解者必须持续维持派生关系。
+        N("Do", body=[
+            N("LocalAssign", names=["_xok2"], exprs=[
+                _pcall(N("Paren", expr=N("Function",
+                    params=[], is_vararg=False, body=[
+                        N("If",
+                          cond=N("BinOp", op="or",
+                                 left=N("BinOp", op="~=",
+                                        left=name_node(fb),
+                                        right=N("BinOp", op="%",
+                                                left=N("BinOp", op="+",
+                                                       left=name_node(fa),
+                                                       right=number_node(delta_b)),
+                                                right=number_node(100000))),
+                                 right=N("BinOp", op="~=",
+                                         left=name_node(fc),
+                                         right=N("BinOp", op="%",
+                                                 left=N("BinOp", op="*",
+                                                        left=name_node(fa),
+                                                        right=number_node(mul_c)),
+                                                 right=number_node(mod_c)))),
+                          body=[N("Assign", targets=[name_node(flag)],
+                                  exprs=[N("True")])],
+                          elifs=[], else_body=None),
+                    ])))]),
+        ]),
     ]
 
     # 异步定时执行：pcall(spawn(function() while true do task.wait(n); pcall(verify) end end))
