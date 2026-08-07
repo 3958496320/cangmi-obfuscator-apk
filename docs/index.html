@@ -404,6 +404,30 @@
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
+            align-items: center;
+        }
+        .ninja-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 10px 16px;
+            background: rgba(255, 200, 80, 0.12);
+            border: 1px solid rgba(255, 200, 80, 0.4);
+            border-radius: 12px;
+            font-size: 13px;
+            font-weight: 600;
+            color: #ffd580;
+            cursor: pointer;
+            user-select: none;
+        }
+        .ninja-toggle:hover {
+            background: rgba(255, 200, 80, 0.2);
+        }
+        .ninja-toggle input {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+            accent-color: #ffb000;
         }
         .btn {
             padding: 12px 20px;
@@ -652,6 +676,9 @@ for (let i = 0; i < 15; i++) {
                 <span>开始混淆</span>
             </button>
             <button class="btn btn-secondary" onclick="clearInput()">清空</button>
+            <label class="ninja-toggle" title="关闭 VM 编译和 loadstring 动态加载，大幅减小产物体积。弱注入器（如忍者）解析大源码会超时，建议开启此模式。">
+                <input type="checkbox" id="ninja-mode"> <span>忍者模式</span>
+            </label>
         </div>
 
         <div class="status-bar idle" id="status">
@@ -896,9 +923,9 @@ async function initPyodide() {
             do_obfuscate_py = pyodide.runPython(`
 from pyodide.ffi import create_proxy
 
-def _do_obfuscate(code):
+def _do_obfuscate(code, ninja_mode=False):
     try:
-        result = obfuscate_code(code)
+        result = obfuscate_code(code, ninja_mode=ninja_mode)
         return result
     except Exception as e:
         import traceback
@@ -953,7 +980,8 @@ async function doObfuscate() {
     try {
         await new Promise(r => setTimeout(r, 50));
         setProgress(60);
-        const result = do_obfuscate_py(code);
+        const ninjaMode = document.getElementById('ninja-mode').checked;
+        const result = do_obfuscate_py(code, ninjaMode);
         setProgress(90);
 
         document.getElementById('output-code').value = result;

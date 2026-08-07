@@ -3135,6 +3135,13 @@ def vm_compile_function(func: Node, rng: random.Random,
     # 这类函数改由 CFF 处理（CFF 保持 upvalue 语义），100% 稳定。
     if _modifies_external_name(func):
         return None
+    # 复杂度门槛：函数体语句过少时跳过 VM。
+    # VM 解释器本身有 19 个 handler + 洗牌循环 + 填充循环，固定开销约 300 行。
+    # 对极简函数（如 local x=1）启用 VM 会让产物体积暴增 10 倍+，且在弱注入器
+    # （如忍者）上因解析大源码导致启动超时。仅对有足够复杂度的函数启用 VM。
+    _body = func.get("body") or []
+    if len(_body) < 5:
+        return None
     compiler = _VMCompiler(rng, gen)
     src = compiler.compile(func)
     if src is None:
@@ -7015,7 +7022,8 @@ def obfuscate(src: str,
               disable_anti_heuristic: bool = False,
               disable_adaptive: bool = False,
               force_profile: Optional[str] = None,
-              disable_loadstring: bool = False) -> Dict[str, Any]:
+              disable_loadstring: bool = False,
+              disable_vm: bool = False) -> Dict[str, Any]:
     """对 Luau 源码执行 12 层混淆。
 
     参数：
@@ -7030,6 +7038,9 @@ def obfuscate(src: str,
         disable_adaptive:       关闭第 12 层自适应（强制全开）。
         force_profile:          强制档位 'small'/'medium'/'large'（调试用）。
         disable_loadstring:     关闭第 8 层的 loadstring（仍保留其余保护）。
+        disable_vm:             关闭第 3 层的 VM 编译（弱注入器如忍者推荐）。
+                                VM 解释器含 19 handler + 洗牌循环，固定开销大，
+                                在弱注入器上会导致大产物解析超时。
 
     返回：{"code": 混淆后源码, "stats": 各层统计, "profile": 档位信息}
     """
@@ -7103,8 +7114,10 @@ def obfuscate(src: str,
         stats["L10_chunk_split"] = {"split_count": 0, "skipped": True}
 
     # 3. 控制流平坦化 + VM（处理未被 L10 接管的的函数）
+    #    disable_vm 时关闭 VM（弱注入器如忍者推荐），仅保留 CFF。
+    _vm_enable = profile["vm_enable"] and not disable_vm
     stats["L3_control_flow"] = apply_control_flow(
-        chunk, rng, enable_vm=profile["vm_enable"],
+        chunk, rng, enable_vm=_vm_enable,
         max_states=profile.get("cff_max_states", 50))
 
     # 4. 垃圾代码注入
@@ -7223,12 +7236,21 @@ def obfuscate(src: str,
 # 入口函数（网页版单文件调用入口）
 # =============================================================================
 
-def obfuscate_code(code_str):
+def obfuscate_code(code_str, ninja_mode=False):
     """对 Luau 源码执行 12 层混淆，返回混淆后的代码字符串。
 
     便于网页版 / 外部调用：仅接受源码字符串，返回混淆结果字符串。
     内部调用 obfuscate() 并取其返回字典中的 "code" 字段。
+
+    参数：
+        ninja_mode: 忍者注入器兼容模式。关闭 VM 编译、loadstring 动态加载、
+                    动态指令替换（dyninst），大幅减小产物体积，避免弱注入器
+                    解析大源码超时。dyninst 会把简单运算变函数调用，既增加
+                    解析负担又是 VM 接管的根源，弱注入器上建议关闭。
     """
-    return obfuscate(code_str)["code"]
+    return obfuscate(code_str,
+                     disable_vm=ninja_mode,
+                     disable_loadstring=ninja_mode,
+                     disable_dyninst=ninja_mode)["code"]
 
 
