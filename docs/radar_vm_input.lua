@@ -1,0 +1,61 @@
+-- 雷达系统 + 距离计算（纯算术函数，VM会接管，动态操作码+JumpTable增强生效）
+local B = {}
+B.Toggle = function(self, opts)
+    self._state = opts.Value
+    self._cb = opts.Callback
+end
+
+B:Toggle({
+    Title = "雷达系统",
+    Value = false,
+    Callback = function(Value)
+        getgenv().ShowRadar = Value
+    end
+})
+
+local Positions = {
+    ["Alpha"] = CFrame.new(-1197, 65, -4790),
+    ["Bravo"] = CFrame.new(-220, 65, -4919),
+    ["Charlie"] = CFrame.new(797, 65, -4740),
+    ["Delta"] = CFrame.new(2044, 65, -3984),
+    ["Echo"] = CFrame.new(2742, 65, -3031),
+    ["Foxtrot"] = CFrame.new(3045, 65, -1788),
+    ["Golf"] = CFrame.new(3376, 65, -562),
+    ["Hotel"] = CFrame.new(3290, 65, 587),
+    ["Juliet"] = CFrame.new(2955, 65, 1804),
+    ["Kilo"] = CFrame.new(2569, 65, 2926),
+    ["Lima"] = CFrame.new(989, 65, 3419),
+    ["Omega"] = CFrame.new(-319, 65, 3932),
+    ["Romeo"] = CFrame.new(-1479, 65, 3722),
+    ["Sierra"] = CFrame.new(-2528, 65, 2549),
+    ["Tango"] = CFrame.new(-3018, 65, 1503),
+    ["Victor"] = CFrame.new(-3587, 65, 634),
+    ["Yankee"] = CFrame.new(-3957, 65, -287),
+    ["Zulu"] = CFrame.new(-4049, 65, -1334)
+}
+
+-- 纯算术函数：3D 距离计算（VM会编译为字节码+动态操作码解释器）
+local function Dist3D(x1, y1, z1, x2, y2, z2)
+    local dx = x2 - x1
+    local dy = y2 - y1
+    local dz = z2 - z1
+    local dx2 = dx * dx
+    local dy2 = dy * dy
+    local dz2 = dz * dz
+    local sum = dx2 + dy2 + dz2
+    return sum
+end
+
+-- 纯算术函数：坐标插值
+local function Lerp(a, b, t)
+    local diff = b - a
+    local result = a + diff * t
+    return result
+end
+
+getgenv().Positions = Positions
+getgenv().Dist3D = Dist3D
+getgenv().Lerp = Lerp
+
+print("Dist3D(0,0,0, 3,4,0) =", Dist3D(0, 0, 0, 3, 4, 0))
+print("Lerp(10, 20, 0.5) =", Lerp(10, 20, 0.5))
