@@ -3172,7 +3172,7 @@ garbage_injector.py
 
 def _gen_garbage_block(gen: NameGenerator, rng: random.Random) -> Node:
     """生成一个独立的 do...end 垃圾块 AST。"""
-    variant = rng.randint(0, 7)
+    variant = rng.randint(0, 10)
     if variant == 0:
         # 算术自洽块
         a = gen.fresh(); b = gen.fresh(); c = gen.fresh()
@@ -3542,6 +3542,109 @@ def _gen_garbage_block(gen: NameGenerator, rng: random.Random) -> Node:
               exprs=[N("Call",
                        func=N("Name", name=t),
                        args=[])]),
+        ]
+    elif variant == 8:
+        # v6 动态不透明谓词（增量2）：条件含运行时变量但结果恒定。
+        # 1. 奇偶守恒：(n*n) % 2 == n % 2 —— 任意整数的平方与自身的奇偶性相同。
+        #    n 来自随机整数，条件恒真，用 not 包裹成恒假，赋值永不触发。
+        # 2. 平方非负：(n*n) >= 0 —— 任意数平方非负，条件恒真，用 not 包裹。
+        # 3. 倍数整除：(n*2) % 2 == 0 —— 任意整数×2 必为偶数，恒真，用 not 包裹。
+        # 动态性：n 是局部变量（运行时存在），攻击者静态分析无法直接判定恒真，
+        # 必须实际求值；与静态数学恒等式（variant==2）形态不同，增加识别成本。
+        x = gen.fresh()
+        n_val = rng.randint(1, 999)
+        dyn_kind = rng.randint(0, 2)
+        n_expr = N("Number", value=str(n_val))
+        if dyn_kind == 0:
+            # (n*n) % 2 == n % 2 恒真
+            cond = N("BinOp", op="==",
+                     left=N("Paren", expr=N("BinOp", op="%",
+                         left=N("Paren", expr=N("BinOp", op="*",
+                             left=n_expr, right=n_expr)),
+                         right=N("Number", value="2"))),
+                     right=N("Paren", expr=N("BinOp", op="%",
+                         left=n_expr, right=N("Number", value="2"))))
+        elif dyn_kind == 1:
+            # (n*n) >= 0 恒真
+            cond = N("BinOp", op=">=",
+                     left=N("Paren", expr=N("BinOp", op="*",
+                             left=n_expr, right=n_expr)),
+                     right=N("Number", value="0"))
+        else:
+            # (n*2) % 2 == 0 恒真
+            cond = N("BinOp", op="==",
+                     left=N("Paren", expr=N("BinOp", op="%",
+                         left=N("Paren", expr=N("BinOp", op="*",
+                             left=n_expr, right=N("Number", value="2"))),
+                         right=N("Number", value="2"))),
+                     right=N("Number", value="0"))
+        cond = N("UnaryOp", op="not", operand=N("Paren", expr=cond))
+        body = [
+            N("LocalAssign", names=[x], exprs=[N("Nil")]),
+            N("If", cond=cond, body=[
+                N("Assign", targets=[N("Name", name=x)],
+                  exprs=[N("Number", value=str(rng.randint(0, 100)))])
+            ], elifs=[], else_body=None),
+        ]
+    elif variant == 9:
+        # v6 动态不透明谓词（增量2）：运行时生成的复杂恒真条件。
+        # (a+b)*(a-b) == a*a - b*b —— 平方差公式，恒真，用 not 包裹成恒假。
+        # a/b 为随机整数，运行时存在；攻击者需识别代数恒等式才能判定永假。
+        x = gen.fresh()
+        a_val = rng.randint(1, 999)
+        b_val = rng.randint(1, 999)
+        a_expr = N("Number", value=str(a_val))
+        b_expr = N("Number", value=str(b_val))
+        # (a+b)*(a-b)
+        lhs = N("BinOp", op="*",
+                left=N("Paren", expr=N("BinOp", op="+", left=a_expr, right=b_expr)),
+                right=N("Paren", expr=N("BinOp", op="-", left=a_expr, right=b_expr)))
+        # a*a - b*b
+        rhs = N("BinOp", op="-",
+                left=N("Paren", expr=N("BinOp", op="*", left=a_expr, right=a_expr)),
+                right=N("Paren", expr=N("BinOp", op="*", left=b_expr, right=b_expr)))
+        cond = N("BinOp", op="==", left=lhs, right=rhs)
+        cond = N("UnaryOp", op="not", operand=N("Paren", expr=cond))
+        body = [
+            N("LocalAssign", names=[x], exprs=[N("Nil")]),
+            N("If", cond=cond, body=[
+                N("Assign", targets=[N("Name", name=x)],
+                  exprs=[N("Number", value=str(rng.randint(0, 100)))])
+            ], elifs=[], else_body=None),
+        ]
+    elif variant == 10:
+        # v6 拟态克隆块（增量6）：生成与真实逻辑结构相似的局部函数+调用，
+        # 但结果全部丢弃。有完整的函数签名、参数、局部变量、return，
+        # 攻击者动态追踪时难以区分哪个函数是真实的。
+        # 不含分支炸弹/无限循环，纯算术运算，安全无副作用。
+        fn_name = gen.fresh()
+        p1, p2 = gen.fresh(), gen.fresh()
+        lv1, lv2, lv3 = gen.fresh(), gen.fresh(), gen.fresh()
+        call_r = gen.fresh()
+        # 克隆函数体：接收2参数，做算术运算+条件分支+return（结构似真）
+        clone_fn = N("Function", params=[p1, p2], is_vararg=False, body=[
+            N("LocalAssign", names=[lv1], exprs=[
+                N("BinOp", op="+",
+                  left=N("BinOp", op="*", left=N("Name", name=p1), right=N("Number", value="2")),
+                  right=N("Name", name=p2))]),
+            N("LocalAssign", names=[lv2], exprs=[
+                N("BinOp", op="%",
+                  left=N("Paren", expr=N("BinOp", op="-",
+                      left=N("Name", name=lv1), right=N("Number", value="1"))),
+                  right=N("Number", value="5"))]),
+            N("If", cond=N("BinOp", op=">", left=N("Name", name=lv2), right=N("Number", value="2")),
+                body=[N("Assign", targets=[N("Name", name=lv3)],
+                        exprs=[N("BinOp", op="*",
+                                 left=N("Name", name=lv1), right=N("Name", name=lv2))])],
+                elifs=[], else_body=None),
+            N("Return", exprs=[N("Name", name=lv3)]),
+        ])
+        body = [
+            N("LocalFunction", name=fn_name, func=clone_fn),
+            N("LocalAssign", names=[call_r], exprs=[
+                N("Call", func=N("Name", name=fn_name),
+                 args=[N("Number", value=str(rng.randint(1, 99))),
+                       N("Number", value=str(rng.randint(1, 99)))])]),
         ]
     else:
         # 数值循环累加（无副作用）
@@ -4597,6 +4700,59 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
           elifs=[], else_body=None),
     ]
 
+    # ---- v6 增量4：注入器特征库扩充（再叠 14 项主流注入器特有 API）----
+    # 覆盖 Synapse X / Script-Ware / Krnl / Fluxus / Oxygen U / Nezur /
+    # Vega X / Arceus X / Delta / Hydrogen / Evon / CodeX / ProtoSmasher /
+    # Sentinel / Sirhurt 等执行器特有的全局函数/表。标准 Lua/Roblox 无这些 API，
+    # 探测到任一存在 → 标记 flag。全部 pcall 包裹，不阻断执行。
+    # 20. syn（Synapse X 特有全局表）
+    syn_block = _probe_global("syn", "table", 20)
+    # 21. syn.crypt（Synapse X 加密库，通过 syn 表索引探测）
+    sync_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Index",
+                             obj=N("Name", name="syn"),
+                             key=N("String", value="crypt"))])
+    ])
+    sync_block = [
+        N("LocalAssign", names=["_p21_ok", "_p21_v"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=sync_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="_p21_ok"),
+                 right=N("BinOp", op="==",
+                         left=N("Call", func=N("Name", name="type"),
+                                args=[N("Name", name="_p21_v")]),
+                         right=N("String", value="table"))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ]
+    # 22. firetouchinterest（Krnl/Fluxus/Synapse 特有）
+    fti_block = _probe_global("firetouchinterest", "function", 22)
+    # 23. firesignal（Synapse/Krnl 特有，触发信号）
+    fs_block = _probe_global("firesignal", "function", 23)
+    # 24. getconnections（主流执行器特有，获取信号连接）
+    gc_block = _probe_global("getconnections", "function", 24)
+    # 25. getgc（执行器特有，获取 GC 对象）
+    ggc_block = _probe_global("getgc", "function", 25)
+    # 26. getupvalue（执行器特有，读取 upvalue）
+    guv_block = _probe_global("getupvalue", "function", 26)
+    # 27. setupvalue（执行器特有，写入 upvalue）
+    suv_block = _probe_global("setupvalue", "function", 27)
+    # 28. getregistry（执行器特有，访问注册表）
+    gr2_block = _probe_global("getregistry", "function", 28)
+    # 29. base64encode（部分执行器特有全局）
+    b64e_block = _probe_global("base64encode", "function", 29)
+    # 30. isexecutor（部分执行器特有，判断是否执行器）
+    ie2_block = _probe_global("isexecutor", "function", 30)
+    # 31. protect_gui（Synapse/部分执行器特有，保护 GUI）
+    pg_block = _probe_global("protect_gui", "function", 31)
+    # 32. unprotect_gui（对应取消保护）
+    upg_block = _probe_global("unprotect_gui", "function", 32)
+    # 33. request（HTTP 请求函数，执行器特有全局形式）
+    req_block = _probe_global("request", "function", 33)
+
     check_block = N("Do", body=(dbg_block_body + ge_block_body + hf_block_body
                                  + ie_block_body + env_block_body
                                  + gr_block_body + dr_block_body
@@ -4605,7 +4761,14 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
                                  + glm_block_body + grs_block_body
                                  + gcs_block_body + ilu_block_body
                                  + hmm_block_body + grm_block_body
-                                 + sfe_block_body + sd_block_body))
+                                 + sfe_block_body + sd_block_body
+                                 + syn_block + sync_block
+                                 + fti_block + fs_block
+                                 + gc_block + ggc_block
+                                 + guv_block + suv_block
+                                 + gr2_block + b64e_block
+                                 + ie2_block + pg_block
+                                 + upg_block + req_block))
 
     body = chunk.get("body")
     body.insert(0, check_block)
@@ -4747,6 +4910,68 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
     # __got = <wm_var>
     got_assign = N("LocalAssign", names=[got_var], exprs=[name_node(wm_var)])
 
+    # v6 加固·水印碎片多点散布（增量1）：
+    # 弱点（v5）：字节差累积虽消除了 == 判断，但所有校验集中在一个 do-block，
+    # 攻击者定位单个 do-block 即可 patch 自毁函数调用参数。
+    # 加固（v6）：将水印明文拆成 NUM_FRAG 个片段，每片段独立做局部哈希，
+    # 散布到多个独立 do-block（各自独立作用域、L2 重命名后名称随机）。
+    # 各片段哈希汇总到 frag_acc，连同 len_ok/diff/hg/he 一并传入自毁函数。
+    # 攻击者必须定位并 patch 全部 NUM_FRAG 个 do-block + 自毁函数内部判断，
+    # Patch 工作量随碎片数线性增长。
+    NUM_FRAG = rng.randint(3, 5)
+    frag_acc_var = gen.fresh()
+    frag_acc_init = N("LocalAssign", names=[frag_acc_var], exprs=[number_node(0)])
+    frag_blocks = [frag_acc_init]
+    # 预期各片段哈希总和（用于自毁函数内部第三道校验）
+    frag_expected = 0
+    frag_step = max(1, len(wm_plaintext) // NUM_FRAG)
+    for fi in range(NUM_FRAG):
+        s = fi * frag_step
+        e = min((fi + 1) * frag_step, len(wm_plaintext))
+        if s >= e:
+            continue
+        frag_str = wm_plaintext[s:e]
+        frag_expected += sum(b * (fi + 7) for b in frag_str.encode("utf-8")) & 0xFFFF
+        # 每个碎片独立 do-block：local fs = <片段>; local fh = 0;
+        # for i=1,#fs do fh = fh + (byte(fs,i) * (i+7)) end;
+        # frag_acc = frag_acc + fh
+        fs_var = gen.fresh()
+        fh_var = gen.fresh()
+        i_var = gen.fresh()
+        # 片段字符串需加密：用解密函数调用
+        f_key = rng.randint(1, 255)
+        f_off = rng.randint(1, 255)
+        f_mask = rng.randint(1, 255)
+        f_enc = _encrypt_bytes(frag_str.encode("utf-8"), f_key, f_off, f_mask)
+        f_payload = bytes_to_lua_literal(f_enc)
+        f_node = string_node(f_payload)
+        f_node.attrs["_verbatim"] = True
+        frag_blocks.append(N("Do", body=[
+            N("LocalAssign", names=[fs_var], exprs=[
+                call_node(name_node(dec_name),
+                          [f_node, number_node(f_key), number_node(f_off),
+                           number_node(f_mask)])]),
+            N("LocalAssign", names=[fh_var], exprs=[number_node(0)]),
+            N("NumericFor", var=i_var, start=number_node(1),
+              limit=N("UnaryOp", op="#", operand=name_node(fs_var)),
+              step=None, body=[
+                  N("Assign", targets=[name_node(fh_var)], exprs=[
+                      N("BinOp", op="+",
+                        left=name_node(fh_var),
+                        right=N("Paren", expr=N("BinOp", op="*",
+                            left=call_node(
+                                N("Index", obj=name_node("string"), key=string_node("byte")),
+                                [name_node(fs_var), name_node(i_var)]),
+                            right=N("BinOp", op="+",
+                                    left=name_node(i_var),
+                                    right=number_node(7)))))])]),
+            N("Assign", targets=[name_node(frag_acc_var)], exprs=[
+                N("BinOp", op="+",
+                  left=name_node(frag_acc_var),
+                  right=name_node(fh_var))]),
+        ]))
+    frag_expected = frag_expected & 0xFFFF
+
     # __len_ok = (type(__got) == "string") and (#__got == #__exp)
     cond_type = _type_is(name_node(got_var), "string")
     cond_len = N("BinOp", op="==",
@@ -4876,24 +5101,26 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
                         exprs=[N("Nil")])])],
         elifs=[], else_body=None)]
 
-    # 自毁函数：接收 (len_ok, diff, hg, he)，内部二次校验
-    # v5 关键：去掉外层 if not __ok，总是调用 __sd。
-    # __sd 内部判断 (not len_ok) or (diff ~= 0) or (hg ~= he)，
-    # 校验通过则正常返回，校验失败则自毁（文件删除 + 清空 _G + error）。
-    # 攻击者须 patch __sd 内部判断（L2 重命名后名称随机），无法靠 patch
-    # 单个外层跳转绕过。原 while true do error() 改为单次 error()，避免
-    # error 被 hook 时卡死。
+    # 自毁函数：接收 (len_ok, diff, hg, he, frag, frag_exp)，内部二次校验
+    # v6 关键：在 v5 三道校验（len_ok/diff/hg==he）基础上增加第四道 frag==frag_exp。
+    # frag 来自 NUM_FRAG 个独立 do-block 的哈希汇总，攻击者必须同时 patch
+    # 全部碎片 do-block 才能伪造 frag 值。
+    # 总是调用 __sd（去掉外层 if not __ok），攻击者无法靠 patch 单个外层跳转绕过。
     p_len_ok = gen.fresh()
     p_diff = gen.fresh()
     p_hg = gen.fresh()
     p_he = gen.fresh()
+    p_frag = gen.fresh()
+    p_frag_exp = gen.fresh()
     sd_cond = N("BinOp", op="or",
         left=N("BinOp", op="or",
-               left=N("UnaryOp", op="not", operand=name_node(p_len_ok)),
-               right=N("BinOp", op="~=", left=name_node(p_diff), right=number_node(0))),
-        right=N("BinOp", op="~=", left=name_node(p_hg), right=name_node(p_he)))
+               left=N("BinOp", op="or",
+                      left=N("UnaryOp", op="not", operand=name_node(p_len_ok)),
+                      right=N("BinOp", op="~=", left=name_node(p_diff), right=number_node(0))),
+               right=N("BinOp", op="~=", left=name_node(p_hg), right=name_node(p_he))),
+        right=N("BinOp", op="~=", left=name_node(p_frag), right=name_node(p_frag_exp)))
     selfdestruct_fn = N("Function",
-        params=[p_len_ok, p_diff, p_hg, p_he], is_vararg=False,
+        params=[p_len_ok, p_diff, p_hg, p_he, p_frag, p_frag_exp], is_vararg=False,
         body=[N("If",
             cond=sd_cond,
             body=[
@@ -4909,14 +5136,16 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
             ],
             elifs=[], else_body=None)])
 
-    # 总是调用自毁函数（传入校验参数）
+    # 总是调用自毁函数（传入校验参数，含碎片哈希汇总与期望值）
     call_sd = N("CallStatement", expr=call_node(
         N("Paren", expr=selfdestruct_fn),
         [name_node(len_ok_var), name_node(diff_var),
-         name_node(hg_var), name_node(he_var)]))
+         name_node(hg_var), name_node(he_var),
+         name_node(frag_acc_var), number_node(frag_expected)]))
 
-    return N("Do", body=[exp_assign, got_assign, len_ok_assign,
-                         diff_init, hg_init, he_init, accum_block, call_sd])
+    return N("Do", body=[exp_assign, got_assign] + frag_blocks +
+                         [len_ok_assign,
+                          diff_init, hg_init, he_init, accum_block, call_sd])
 
 
 def inject_legal_comments(chunk: Node, rng: random.Random,
@@ -5220,6 +5449,42 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                      left=name_node("tok"),
                      right=N("UnaryOp", op="not",
                              operand=_type_is(name_node("tv"), "userdata"))),
+              body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+              elifs=[], else_body=None),
+        ]),
+        # v6 增量7：扩展周期性校验点——检测关键全局函数是否被 Hook 替换。
+        # print/type/pcall/string.byte 在正常运行中类型固定（function），
+        # 若被注入器 Hook 替换为非 function（如 table/proxy），说明环境被篡改。
+        # 不替换为空函数（避免破坏语义），仅设 flag 标记，由后续误导逻辑利用。
+        N("Do", body=[
+            N("LocalAssign", names=["_vk1", "_vv1"],
+              exprs=[_pcall(N("Paren", expr=N("Function",
+                  params=[], is_vararg=False, body=[
+                      N("Return", exprs=[name_node("print")])
+                  ])))]),
+            N("If",
+              cond=N("BinOp", op="and",
+                     left=name_node("_vk1"),
+                     right=N("BinOp", op="~=",
+                             left=N("Call", func=N("Name", name="type"),
+                                    args=[name_node("_vv1")]),
+                             right=N("String", value="function"))),
+              body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+              elifs=[], else_body=None),
+        ]),
+        N("Do", body=[
+            N("LocalAssign", names=["_vk2", "_vv2"],
+              exprs=[_pcall(N("Paren", expr=N("Function",
+                  params=[], is_vararg=False, body=[
+                      N("Return", exprs=[name_node("type")])
+                  ])))]),
+            N("If",
+              cond=N("BinOp", op="and",
+                     left=name_node("_vk2"),
+                     right=N("BinOp", op="~=",
+                             left=N("Call", func=N("Name", name="type"),
+                                    args=[name_node("_vv2")]),
+                             right=N("String", value="function"))),
               body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
               elifs=[], else_body=None),
         ]),
@@ -6401,6 +6666,78 @@ _LEGAL_FOOTER = (
 )
 
 
+# v6 增量3：bit32 纯 Lua 回退（防御性编程）
+# Roblox/Luau 原生支持 bit32，现代注入器也普遍提供。但极少数老旧/受限环境
+# 可能缺失 bit32（代码生成器把 ~ & | 重写为 bit32.bxor/band/bor）。
+# 此处在脚本最开头注入 bit32 回退：若 bit32 不存在或函数缺失，用纯 Lua
+# 算术实现补全。仅在实际缺失时生效，原生 bit32 存在时零开销（短路返回）。
+# 实现限制：仅支持 0..2^32-1 无符号整数（覆盖所有混淆器生成的位运算场景）。
+_BIT32_FALLBACK = """-- bit32 纯 Lua 回退（v6 增量3：防御性编程，缺失时才生效）
+do
+  local _bxor = (bit32 and bit32.bxor) or (bit and bit.bxor)
+  local _band = (bit32 and bit32.band) or (bit and bit.band)
+  local _bor  = (bit32 and bit32.bor)  or (bit and bit.bor)
+  local _bnot = (bit32 and bit32.bnot) or (bit and bit.bnot)
+  local _lsh  = (bit32 and bit32.lshift) or (bit and bit.lshift)
+  local _rsh  = (bit32 and bit32.rshift) or (bit and bit.rshift)
+  if not (_bxor and _band and _bor and _bnot and _lsh and _rsh) then
+    local function _mk(opfn)
+      return function(a, b)
+        a = math.floor(a or 0); b = math.floor(b or 0)
+        if a < 0 then a = a + 4294967296 end
+        if b < 0 then b = b + 4294967296 end
+        local r, p = 0, 1
+        for _ = 1, 32 do
+          local ab, bb = a % 2, b % 2
+          if opfn(ab, bb) then r = r + p end
+          a, b, p = (a - ab) / 2, (b - bb) / 2, p * 2
+        end
+        return r
+      end
+    end
+    if not bit32 then bit32 = {} end
+    bit32.bxor = _bxor or _mk(function(a, b) return a ~= b end)
+    bit32.band = _band or _mk(function(a, b) return a == 1 and b == 1 end)
+    bit32.bor  = _bor  or _mk(function(a, b) return a == 1 or b == 1 end)
+    bit32.bnot = _bnot or function(a)
+      a = math.floor(a or 0)
+      if a < 0 then a = a + 4294967296 end
+      local r, p = 0, 1
+      for _ = 1, 32 do
+        if a % 2 == 0 then r = r + p end
+        a, p = (a - a % 2) / 2, p * 2
+      end
+      return r
+    end
+    bit32.lshift = _lsh or function(a, n)
+      a = math.floor(a or 0); n = math.floor(n or 0)
+      if a < 0 then a = a + 4294967296 end
+      if n <= 0 then
+        if n == 0 then return a end
+        return bit32.rshift(a, -n)
+      end
+      local r = a
+      for _ = 1, n do r = (r * 2) % 4294967296 end
+      return r
+    end
+    bit32.rshift = _rsh or function(a, n)
+      a = math.floor(a or 0); n = math.floor(n or 0)
+      if a < 0 then a = a + 4294967296 end
+      if n <= 0 then
+        if n == 0 then return a end
+        return bit32.lshift(a, -n)
+      end
+      local r = a
+      for _ = 1, n do r = math.floor(r / 2) end
+      return r
+    end
+    bit32.arshift = bit32.arshift or bit32.rshift
+    bit32.btest = bit32.btest or function(a, b) return bit32.band(a, b) ~= 0 end
+  end
+end
+"""
+
+
 # 默认保留名集合：Roblox/Luau 全局库 + 注入器常见 API，永不被重命名
 _DEFAULT_RESERVE: Set[str] = set(GLOBAL_LIBS)
 
@@ -6708,6 +7045,43 @@ def obfuscate(src: str,
     # ③VM操作码周期重映射基础设施（仅有VM函数时注入）
     if stats.get("L3_control_flow", {}).get("vm_count", 0) > 0:
         code = _WATERMARK_HEADER + _generate_vm_infra() + code[len(_WATERMARK_HEADER):]
+    # v6 增量3：bit32 纯 Lua 回退注入到最开头（版权水印之后、VM infra 之前）
+    #   保证 bit32.bxor/band/bor 等在缺失环境下仍可用，防御性编程。
+    code = _WATERMARK_HEADER + _BIT32_FALLBACK + code[len(_WATERMARK_HEADER):]
+    # v6 增量5：反 Beautify 陷阱
+    #   在代码中随机插入若干「分号多语句行」。Lua 允许用 ; 分隔多条语句到一行，
+    #   但多数格式化工具（lua-beautifier、Luau formatter、在线美化器）遇到
+    #   超长的单行多语句时会：1) 内存溢出 2) 拆分错误导致语法树崩溃 3) 缩进错乱。
+    #   纯局部赋值，结果丢弃，不影响语义；经 L2 重命名后变量名随机。
+    #   关键：只在「顶层无缩进行」之后插入（行首非空白），避免插入到函数/循环
+    #   体中间破坏语法结构。陷阱行本身无缩进（顶层局部赋值），合法且安全。
+    rng_beautify = random.Random(rng.randint(0, 1 << 30))
+    n_beautify = rng_beautify.randint(2, 4)
+    lines = code.split("\n")
+    # 找出所有「顶层行」（行首无空格、非空、非注释结尾）的安全插入点
+    safe_positions = []
+    for i, line in enumerate(lines):
+        if i < 5 or i > len(lines) - 5:
+            continue
+        # 顶层行：不以空格/tab 开头，非空，非注释
+        if line and not line[0].isspace() and not line.startswith("--") and not line.startswith("end"):
+            safe_positions.append(i)
+    if len(safe_positions) >= n_beautify:
+        insert_positions = sorted(
+            rng_beautify.sample(safe_positions, n_beautify),
+            reverse=True)
+        for pos in insert_positions:
+            # 生成分号分隔的多语句行：local a=1;local b=2;local c=a+b;...
+            # 每行 8-15 条语句，超长单行让格式化工具处理困难
+            n_stmts = rng_beautify.randint(8, 15)
+            parts = []
+            for _ in range(n_stmts):
+                v = "".join(rng_beautify.choices("abcdefghijklmnopqrstuvwxyz", k=6))
+                n = rng_beautify.randint(0, 9999)
+                parts.append(f"local {v}={n}")
+            trap_line = ";".join(parts)
+            lines.insert(pos, trap_line)
+        code = "\n".join(lines)
     # 尾部法律声明（代码末尾固定存在）
     code = code + _LEGAL_FOOTER
     stats["output_chars"] = len(code)
