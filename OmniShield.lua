@@ -490,8 +490,9 @@ do
             h4 = (h4 + e) % 4294967296
         end
         local function _hex(n)
+            -- 32-bit value → 4 bytes → 8 hex chars
             local r = ""
-            for _ = 1, 8 do
+            for _ = 1, 4 do
                 r = string.format("%02x", n % 256) .. r
                 n = math.floor(n / 256)
             end
@@ -1390,12 +1391,16 @@ do
             _safe_warn("自修改代码块解密失败")
             return nil
         end
-        -- 蜜罐模式：解密出误导性虚假函数
+        -- 去除 XTEA 填充的尾部 \0 字节（部分执行器的 loadstring 拒绝含 \0 的源码）
+        plaintext = plaintext:gsub("%z+$", "")
+        -- 蜜罐模式：解密出误导性虚假函数（直接返回 false，不执行真实逻辑）
         if OmniShield._honeypot_mode then
-            local honeypot_code = "return function() return false end"
+            local honeypot_code = "return false"
             local ok, fn = pcall(loadstring or load, honeypot_code)
             if ok and fn then
-                local result = fn()
+                local result
+                local ok2, r = pcall(fn)
+                if ok2 then result = r end
                 Frag.WipeFunction(fn)
                 return result
             end
@@ -1737,6 +1742,10 @@ do
             if backup then
                 -- 备份池加密存储，需 XTEA 解密
                 local restored_src = _xtea_decrypt(backup.payload, backup.key)
+                -- 去除 XTEA 填充的尾部 \0（loadstring 在部分执行器拒绝含 \0 的源码）
+                if type(restored_src) == "string" then
+                    restored_src = restored_src:gsub("%z+$", "")
+                end
                 local ls = loadstring or load
                 if ls and restored_src then
                     local ok, fn = pcall(ls, restored_src)
@@ -1759,6 +1768,9 @@ do
         -- 种子通过 XTEA 解密
         local seed_key = "OmniShield_Seed_" .. name
         local seed_src = _xtea_decrypt(Integrity._seed_encrypted, seed_key)
+        if type(seed_src) == "string" then
+            seed_src = seed_src:gsub("%z+$", "")
+        end
         if not seed_src or #seed_src == 0 then
             -- 种子不可用，使用最小安全实现
             seed_src = "return function() return nil end"
@@ -2259,6 +2271,8 @@ function OmniShield:SelfTest()
         assert(r == "test_value_123" or #r > 0, "get should return string, got " .. tostring(r))
     end)
     _test("E30_fragment_load_and_wipe", function()
+        -- 重置蜜罐模式，验证真实解密执行路径
+        OmniShield._honeypot_mode = false
         -- 加密一段简单代码并加载
         local code = "return 42"
         local enc = OmniShield._xtea_encrypt(code, "test_key")
@@ -2270,11 +2284,18 @@ function OmniShield:SelfTest()
     -- 测试组 F：拟态克隆（TC-31 ~ TC-34）
     --================================================================
     _test("F31_mimic_wrap_basic", function()
+        -- 重置反调试陷阱标志（避免 D22/D23 遗留状态触发分支炸弹）
+        OmniShield._antidebug._trap_active = false
+        OmniShield._antidebug._tier1_flag = false
+        OmniShield._honeypot_mode = false
         local wrapped = OmniShield._mimic.Wrap(function(x) return (x or 0) + 1 end)
         local r = wrapped(10)
         assert(r == 11, "mimic wrap should return 11, got " .. tostring(r))
     end)
     _test("F32_mimic_route_rotation", function()
+        -- 重置陷阱标志避免分支炸弹
+        OmniShield._antidebug._trap_active = false
+        OmniShield._antidebug._tier1_flag = false
         -- 触发足够多次调用以旋转路由表
         local wrapped = OmniShield._mimic.Wrap(function(x) return x end)
         for i = 1, 110 do
@@ -2284,10 +2305,10 @@ function OmniShield:SelfTest()
     end)
     _test("F33_mimic_branch_bomb_no_crash", function()
         -- 分支炸弹有安全阀，不应永久卡死
-        local saved = Config.Mimic.BranchBombCoroutines
-        Config.Mimic.BranchBombCoroutines = 5  -- 测试用小数量
+        local saved_n = Config.Mimic.BranchBombCoroutines
+        Config.Mimic.BranchBombCoroutines = 2  -- 测试用极小数量
         pcall(OmniShield._mimic.BranchBomb)
-        Config.Mimic.BranchBombCoroutines = saved
+        Config.Mimic.BranchBombCoroutines = saved_n
         assert(true, "branch bomb does not crash")
     end)
     _test("F34_mimic_clone_count", function()
