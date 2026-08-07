@@ -149,14 +149,15 @@ if not _task then
         return n, n
     end
     -- task.spawn(fn, ...)：异步执行
+    -- 注意：降级路径（无 task/spawn/delay/wait 任何一个）下，只创建协程不 resume，
+    -- 否则同步 resume 无限循环后台线程（反查/自我修复/动态重命名）会卡死主线程。
+    -- 真实忍者注入器必然有 task 或 spawn/delay/wait，不走此分支；此分支仅作极端兜底。
     _task.spawn = function(fn, ...)
         if _spawn_fn then
             return _spawn_fn(fn, ...)
         end
-        -- 降级：同步执行（保证功能不丢失，只是非异步）
+        -- 极端降级：创建协程但不 resume，后台线程静默不启动，保证主流程零卡死
         local co = coroutine.create(fn)
-        local ok, err = coroutine.resume(co, ...)
-        if not ok and warn then warn("[OmniShield] task.spawn fallback error: " .. tostring(err)) end
         return co
     end
     -- task.defer(fn, ...)：延迟到下一帧执行

@@ -128,7 +128,9 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
     # src = info and info.source or ""
     src_assign = N("LocalAssign", names=[src_var], exprs=[
         N("BinOp", op="or",
-          left=N("Index", obj=name_node(info_var), key=string_node("source")),
+          left=N("BinOp", op="and",
+                 left=name_node(info_var),
+                 right=N("Index", obj=name_node(info_var), key=string_node("source"))),
           right=string_node(""))
     ])
 
@@ -314,7 +316,9 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
         N("LocalAssign", names=["sok", "info"], exprs=[_pcall(N("Paren", expr=stack_fn))]),
         N("If",
           cond=N("BinOp", op="and",
-                 left=name_node("sok"),
+                 left=N("BinOp", op="and",
+                        left=name_node("sok"),
+                        right=name_node("info")),
                  right=N("Index", obj=name_node("info"), key=string_node("what"))),
           body=[  # 仅做计数，不阻断
               N("Assign",
