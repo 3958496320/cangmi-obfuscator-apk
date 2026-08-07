@@ -339,6 +339,28 @@ local Config = {
         FakeErrorLines = true,       -- 假错误行号
     },
 
+    -- 技术 9：自修改 VM（运行时操作码映射自变异）
+    SelfModVM = {
+        Enabled = true,
+        MutateEveryN = 10,           -- 每 N 条指令旋转一次操作码映射
+        CoupledWithVM2 = true,       -- 与 VM-2 操作码表耦合（共享变异源）
+    },
+
+    -- 技术 10：影子堆栈（关键变量 XOR 加密存储，反内存 Dump）
+    ShadowStack = {
+        Enabled = true,
+        PerEntryKey = true,          -- 每条目独立随机密钥
+        DriftProtection = true,      -- 防冻结：读取时校验写入时戳
+    },
+
+    -- 技术 11：双向校验（环境反查脚本，陷阱元表闭环）
+    BidirValidation = {
+        Enabled = true,
+        TrapGlobals = true,          -- 在 _G 上布陷阱
+        InjectDecoyOnBreach = true,  -- 检测到入侵时注入误导函数
+        ReverseCheckInterval = 5,    -- 环境反查间隔(秒)
+    },
+
     -- 自检
     SelfTest = {
         AutoRun = false,             -- 启动时是否自动跑自检
@@ -351,7 +373,7 @@ local Config = {
 --======================================================================
 local OmniShield = {}
 OmniShield.Config = Config
-OmniShield._version = "1.0.0"
+OmniShield._version = "1.1.0"
 OmniShield._health = 1.0
 OmniShield._activated = false
 OmniShield._internal_clock = 0   -- 独立内部时间线
@@ -1931,6 +1953,534 @@ do
 end
 
 --======================================================================
+-- 技术 9：自修改 VM 解释器（Self-Modifying VM）
+--   v7 增量：VM 解释器在执行每 N 条指令后，主动旋转操作码映射表本身。
+--   与技术 1 的 VM-2 操作码表耦合（共享变异源），实现「动态逻辑」而非
+--   「静态逻辑 + 动态密钥」。攻击者 Dump 内存得到的 OP_MAP 每秒都在变。
+--   纯 Lua 无法改写自身源码，故采用「表驱动自修改」：映射表本身可变，
+--   逻辑等价但解码关系持续漂移。
+--======================================================================
+do
+    local SMV = {}
+    OmniShield._selfmod = SMV
+
+    -- 9.1 可变异操作码映射表（运行时持续旋转）
+    -- _active_opmap[encoded_op] = real_op_name
+    -- 这个表本身是「活的」——每执行 N 条指令就旋转一次
+    local _active_opmap = {}
+    local _opmap_version = 0       -- 变异版本号（每次旋转 +1）
+    local _mutate_counter = 0      -- 自上次变异以来的指令计数
+    local _mutation_log = {}       -- 变异历史（供完整性校验耦合）
+
+    -- 基础操作码集（与技术 1 VM-2 一致）
+    local _base_ops = {
+        "NOP", "LOAD_CONST", "ADD", "SUB", "MUL", "DIV", "MOD",
+        "JMP", "JMP_IF_ZERO", "CMP_EQ", "CMP_LT", "CMP_GT",
+        "LOAD_VAR", "STORE_VAR", "CALL", "RET",
+    }
+
+    -- 9.2 初始化映射表：用 LCG 打乱
+    local function _init_opmap(seed)
+        seed = seed or (OmniShield._vm1_counter * 2654435761 + 12345)
+        seed = seed % 4294967296
+        local order = {}
+        for i = 1, #_base_ops do order[i] = i end
+        for i = #order, 2, -1 do
+            seed = (seed * 1103515245 + 12345) % 4294967296
+            local j = (seed % i) + 1
+            order[i], order[j] = order[j], order[i]
+        end
+        _active_opmap = {}
+        for new_idx = 1, #_base_ops do
+            _active_opmap[new_idx - 1] = _base_ops[order[new_idx]]
+        end
+        _opmap_version = 1
+        _mutate_counter = 0
+    end
+
+    -- 9.3 变异：循环左移映射关系（表驱动自修改核心）
+    -- 把 OP_MAP[0] 移到末尾，所有 encoded_op → real_op 的对应关系全部改变
+    -- 但操作码集本身不变，故逻辑等价
+    local function _mutate_opmap()
+        local n = #_base_ops
+        if n == 0 then return end
+        local first = _active_opmap[0]
+        for i = 0, n - 2 do
+            _active_opmap[i] = _active_opmap[i + 1]
+        end
+        _active_opmap[n - 1] = first
+        _opmap_version = _opmap_version + 1
+        -- 记录变异历史（供技术 7 完整性校验耦合：变异必须符合此模式）
+        _mutation_log[#_mutation_log + 1] = {
+            version = _opmap_version,
+            ts = _clock(),
+            counter = OmniShield._vm2_counter,
+        }
+        -- 历史 FIFO（最多 64 条，防止内存膨胀）
+        if #_mutation_log > 64 then
+            table.remove(_mutation_log, 1)
+        end
+    end
+
+    -- 9.4 取当前映射（供 VM-2 解码使用）
+    function SMV.GetOpMap()
+        return _active_opmap
+    end
+
+    function SMV.GetVersion()
+        return _opmap_version
+    end
+
+    function SMV.GetMutationLog()
+        return _mutation_log
+    end
+
+    -- 9.5 指令执行后调用：累计计数，达到阈值则变异
+    function SMV.TickAfterInstruction()
+        if not Config.SelfModVM.Enabled then return end
+        _mutate_counter = _mutate_counter + 1
+        if _mutate_counter >= Config.SelfModVM.MutateEveryN then
+            _mutate_counter = 0
+            _mutate_opmap()
+        end
+    end
+
+    -- 9.6 初始化（由 Activate 调用）
+    function SMV.Init()
+        if not Config.SelfModVM.Enabled then return end
+        _init_opmap()
+    end
+
+    -- 9.7 自修改 VM 执行器：与技术 1 的 VM-2 共享栈语义，但用可变异映射解码
+    -- 输入：VM-1 解码后的指令流 { {op=, operand=}, ... }
+    -- 输出：执行结果
+    function SMV.Execute(vm1_output)
+        if not Config.SelfModVM.Enabled then
+            -- 降级：委托给 VM-2
+            return OmniShield._vm2.execute(vm1_output)
+        end
+        if _opmap_version == 0 then _init_opmap() end
+        local program = vm1_output
+        if type(program) ~= "table" then return nil end
+
+        -- 独立栈（与技术 10 影子堆栈解耦：这里是 VM 工作栈，影子堆栈存业务变量）
+        local stack = {}
+        local vars = {}
+        local pc = 1
+        local max_iter = #program + 100
+        local iter = 0
+        local result = nil
+
+        while pc <= #program and iter < max_iter do
+            iter = iter + 1
+            local instr = program[pc]
+            if type(instr) ~= "table" then
+                pc = pc + 1
+            else
+                -- 关键：每次解码都查 _active_opmap，而该表在持续变异
+                local op_name = _active_opmap[instr.op] or "NOP"
+                local operand = instr.operand or 0
+                OmniShield._vm2_counter = OmniShield._vm2_counter + 1
+
+                -- 蜜罐耦合
+                if OmniShield._honeypot_mode and op_name == "CALL" then
+                    result = -(operand or 0)
+                    pc = pc + 1
+                elseif op_name == "NOP" then
+                    pc = pc + 1
+                elseif op_name == "LOAD_CONST" then
+                    stack[#stack + 1] = operand
+                    pc = pc + 1
+                elseif op_name == "ADD" then
+                    local b = stack[#stack]; stack[#stack] = nil
+                    local a = stack[#stack]; stack[#stack] = nil
+                    stack[#stack + 1] = (a or 0) + (b or 0)
+                    pc = pc + 1
+                elseif op_name == "SUB" then
+                    local b = stack[#stack]; stack[#stack] = nil
+                    local a = stack[#stack]; stack[#stack] = nil
+                    stack[#stack + 1] = (a or 0) - (b or 0)
+                    pc = pc + 1
+                elseif op_name == "MUL" then
+                    local b = stack[#stack]; stack[#stack] = nil
+                    local a = stack[#stack]; stack[#stack] = nil
+                    stack[#stack + 1] = (a or 0) * (b or 0)
+                    pc = pc + 1
+                elseif op_name == "DIV" then
+                    local b = stack[#stack]; stack[#stack] = nil
+                    local a = stack[#stack]; stack[#stack] = nil
+                    stack[#stack + 1] = (b or 0) ~= 0 and (a or 0) / (b or 0) or 0
+                    pc = pc + 1
+                elseif op_name == "MOD" then
+                    local b = stack[#stack]; stack[#stack] = nil
+                    local a = stack[#stack]; stack[#stack] = nil
+                    stack[#stack + 1] = (b or 0) ~= 0 and (a or 0) % (b or 0) or 0
+                    pc = pc + 1
+                elseif op_name == "JMP" then
+                    pc = pc + operand
+                elseif op_name == "JMP_IF_ZERO" then
+                    local v = stack[#stack]; stack[#stack] = nil
+                    if (v or 0) == 0 then pc = pc + operand else pc = pc + 1 end
+                elseif op_name == "CMP_EQ" then
+                    local b = stack[#stack]; stack[#stack] = nil
+                    local a = stack[#stack]; stack[#stack] = nil
+                    stack[#stack + 1] = (a == b) and 1 or 0
+                    pc = pc + 1
+                elseif op_name == "CMP_LT" then
+                    local b = stack[#stack]; stack[#stack] = nil
+                    local a = stack[#stack]; stack[#stack] = nil
+                    stack[#stack + 1] = (a or 0) < (b or 0) and 1 or 0
+                    pc = pc + 1
+                elseif op_name == "CMP_GT" then
+                    local b = stack[#stack]; stack[#stack] = nil
+                    local a = stack[#stack]; stack[#stack] = nil
+                    stack[#stack + 1] = (a or 0) > (b or 0) and 1 or 0
+                    pc = pc + 1
+                elseif op_name == "LOAD_VAR" then
+                    stack[#stack + 1] = vars[operand]
+                    pc = pc + 1
+                elseif op_name == "STORE_VAR" then
+                    local v = stack[#stack]; stack[#stack] = nil
+                    vars[operand] = v
+                    pc = pc + 1
+                elseif op_name == "CALL" then
+                    result = stack[#stack]
+                    pc = pc + 1
+                elseif op_name == "RET" then
+                    result = stack[#stack]
+                    break
+                else
+                    pc = pc + 1
+                end
+                -- 自修改核心：每条指令执行后触发变异检查
+                SMV.TickAfterInstruction()
+            end
+        end
+        return result
+    end
+end
+
+--======================================================================
+-- 技术 10：影子堆栈（Shadow Stack）
+--   v7 增量：关键变量（瞄准坐标、血量、距离）不进 Lua 标准栈/_G/局部表，
+--   而是压入自维护的影子堆栈，存储时 XOR 加密 + 每条目独立密钥。
+--   攻击者 getgc() 遍历只能看到一堆 {encrypted_int, key_int} 数字对，
+--   无法直接读出明文。配合写入时戳，防止「冻结内存」攻击。
+--======================================================================
+do
+    local SS = {}
+    OmniShield._shadowstack = SS
+
+    -- 10.1 影子堆栈类
+    local ShadowStack = {}
+    ShadowStack.__index = ShadowStack
+
+    function SS.New()
+        local self = setmetatable({ _data = {}, _write_ts = {}, _count = 0 }, ShadowStack)
+        return self
+    end
+
+    -- 10.2 压栈：XOR 加密存储
+    -- value 必须可被 floor（数值）；非数值先转 tonumber，失败则存其字符串哈希
+    function ShadowStack:push(value)
+        local v
+        if type(value) == "number" then
+            v = math.floor(value)
+        elseif type(value) == "boolean" then
+            v = value and 1 or 0
+        else
+            -- 非数值：取其 md5 哈希的前 32 位作为整数存储
+            local h = OmniShield._md5(tostring(value))
+            v = tonumber(_ssub(h, 1, 8), 16) or 0
+        end
+        -- 归一化到 32 位无符号
+        v = v % 4294967296
+        local key
+        if Config.ShadowStack.PerEntryKey then
+            -- 每条目独立随机密钥：math.random 在部分环境受限，用 LCG 兜底
+            key = (math.random and math.random(1, 4294967295)) or
+                  ((_clock() * 1000000 + self._count * 2654435761) % 4294967296)
+            if key == 0 then key = 1 end
+        else
+            key = 0x5A827999  -- 固定密钥（降级模式）
+        end
+        local encrypted = _bxor(v, key) % 4294967296
+        self._count = self._count + 1
+        self._data[self._count] = encrypted
+        if Config.ShadowStack.PerEntryKey then
+            -- 密钥与密文分开存储，并混入条目下标，增加关联难度
+            self._data[self._count + 1000000] = key
+        else
+            self._data[self._count + 1000000] = 0x5A827999
+        end
+        -- 写入时戳（防冻结：读取时校验时戳偏差）
+        if Config.ShadowStack.DriftProtection then
+            self._write_ts[self._count] = _clock()
+        end
+    end
+
+    -- 10.3 弹栈：XOR 解密 + 时戳校验
+    function ShadowStack:pop()
+        if self._count <= 0 then return nil end
+        local encrypted = self._data[self._count]
+        local key = self._data[self._count + 1000000] or 0
+        local write_ts = self._write_ts[self._count]
+        -- 清除存储（用后即焚，防止 dump）
+        self._data[self._count] = nil
+        self._data[self._count + 1000000] = nil
+        self._write_ts[self._count] = nil
+        self._count = self._count - 1
+        if encrypted == nil then return nil end
+        local v = _bxor(encrypted, key) % 4294967296
+        -- 时戳校验：如果写入与读取间隔异常（>3600s 或 <0），说明内存被冻结/回放
+        if Config.ShadowStack.DriftProtection and write_ts then
+            local now = _clock()
+            local delta = now - write_ts
+            if delta < 0 or delta > 3600 then
+                -- 触发反调试耦合：报告异常
+                pcall(function()
+                    if OmniShield._antidebug then
+                        OmniShield._antidebug._trap_active = true
+                    end
+                end)
+                _safe_warn("影子堆栈时戳异常，可能存在内存冻结/回放攻击")
+                -- 返回扰动值（让攻击者拿到错误数据）
+                return (v + 1) % 4294967296
+            end
+        end
+        return v
+    end
+
+    -- 10.4 peek（不弹栈，仅读取）—— 用于调试/测试
+    function ShadowStack:peek(idx)
+        idx = idx or self._count
+        if idx <= 0 or idx > self._count then return nil end
+        local encrypted = self._data[idx]
+        local key = self._data[idx + 1000000] or 0
+        if encrypted == nil then return nil end
+        return _bxor(encrypted, key) % 4294967296
+    end
+
+    function ShadowStack:size()
+        return self._count
+    end
+
+    -- 10.5 批量压入/弹出（方便业务使用）
+    function ShadowStack:pushAll(values)
+        for i = 1, #values do
+            self:push(values[i])
+        end
+    end
+
+    function ShadowStack:popAll()
+        local out = {}
+        while self._count > 0 do
+            out[#out + 1] = self:pop()
+        end
+        -- 反转（pop 顺序与 push 相反）
+        local rev = {}
+        for i = #out, 1, -1 do rev[#rev + 1] = out[i] end
+        return rev
+    end
+
+    -- 10.6 全局影子堆栈实例（业务关键变量统一存这里）
+    SS._global = SS.New()
+
+    -- 对外接口
+    SS.ShadowStack = ShadowStack
+    function SS.Push(v) return SS._global:push(v) end
+    function SS.Pop() return SS._global:pop() end
+    function SS.Peek(i) return SS._global:peek(i) end
+    function SS.Size() return SS._global:size() end
+end
+
+--======================================================================
+-- 技术 11：双向校验（Bidirectional Validation）
+--   v7 增量：不仅脚本查环境（技术 3 单向），环境也通过陷阱元表反查脚本。
+--   关键函数挂在陷阱元表后，任何外部读取/写入都触发检测；检测到入侵时
+--   主动向 _G 注入误导函数（decoy），让调试器误以为还在运行，实则已跳转。
+--   与技术 3 反调试、技术 5 拟态克隆耦合：陷阱触发 → 反调试标记 → 蜜罐。
+--======================================================================
+do
+    local BV = {}
+    OmniShield._bidir = BV
+    BV._trap_tripped = false
+    BV._access_log = {}
+    BV._decoy_active = false
+    BV._reverse_thread = nil
+    BV._watched_globals = {}  -- 被监控的全局键 → 原始值
+
+    -- 11.1 陷阱处理函数：外部访问触发
+    local function _trap_handler(op, key)
+        BV._trap_tripped = true
+        BV._access_log[#BV._access_log + 1] = {
+            op = op, key = tostring(key), ts = _clock(),
+        }
+        if #BV._access_log > 128 then table.remove(BV._access_log, 1) end
+        -- 耦合反调试：标记陷阱激活
+        pcall(function()
+            if OmniShield._antidebug then
+                OmniShield._antidebug._trap_active = true
+                OmniShield._antidebug._tier1_flag = true
+            end
+            OmniShield._honeypot_mode = true
+        end)
+        _safe_warn("双向校验陷阱触发: " .. op .. " " .. tostring(key))
+        -- 检测到入侵时注入误导函数
+        if Config.BidirValidation.InjectDecoyOnBreach and not BV._decoy_active then
+            BV._InjectDecoy()
+        end
+    end
+
+    -- 11.2 陷阱元表：保护关键函数表
+    -- protected_functions[key] = real_fn；外部访问触发 __index/__newindex
+    local _protected = {}
+    local _protected_meta = {
+        __index = function(t, k)
+            -- 读取即触发（说明有人在探测）
+            _trap_handler("read", k)
+            -- 返回蜜罐函数（永远返回 false / 反向值）
+            return function() return false end
+        end,
+        __newindex = function(t, k, v)
+            -- 写入即触发（说明有人在 patch）
+            _trap_handler("write", k)
+            -- 静默接受但实际不写入真实表
+        end,
+    }
+    BV._protected = setmetatable(_protected, _protected_meta)
+
+    -- 11.3 注入误导函数到 _G（让调试器看到假的实现）
+    function BV._InjectDecoy()
+        BV._decoy_active = true
+        pcall(function()
+            -- 假 aimbot：永远返回虚假坐标
+            _G.__FAKE_AIMBOT = function()
+                return {
+                    X = math.random(-1000, 1000),
+                    Y = math.random(-1000, 1000),
+                    Z = 0,
+                }
+            end
+            -- 假 esp：永远返回空表
+            _G.__FAKE_ESP = function() return {} end
+            -- 假 health：永远返回 0（让攻击者以为脚本失效）
+            _G.__FAKE_HEALTH = function() return 0 end
+        end)
+    end
+
+    -- 11.4 在 _G 上布陷阱：监控关键全局键被外部访问
+    -- 用「影子 _G」+ 元表拦截，但不破坏正常 _G 行为
+    local _trapped_keys = {
+        aimbot = true, esp = true, aimlock = true, firecheck = true,
+        __OMNISHIELD_LOADED = false,  -- 自身不拦截
+    }
+
+    function BV.InstallGlobalTraps()
+        if not Config.BidirValidation.TrapGlobals then return end
+        -- 记录原始值，安装代理
+        for key, should_trap in pairs(_trapped_keys) do
+            if should_trap then
+                BV._watched_globals[key] = _G[key]
+                -- 不直接改 _G（会破坏正常引用），而是注册一个陷阱访问器
+                -- 真实保护：业务代码通过 BV.SecureGet/SecureSet 访问
+            end
+        end
+    end
+
+    -- 11.5 安全访问接口：业务代码必须通过这里读写关键全局
+    function BV.SecureGet(key)
+        -- 检查是否被外部篡改：对比记录的原始值
+        if BV._watched_globals[key] ~= nil then
+            if _G[key] ~= BV._watched_globals[key] then
+                -- 被外部修改了 → 触发陷阱
+                _trap_handler("external_modify", key)
+                -- 恢复原始值
+                _G[key] = BV._watched_globals[key]
+            end
+        end
+        return BV._watched_globals[key] or _G[key]
+    end
+
+    function BV.SecureSet(key, value)
+        BV._watched_globals[key] = value
+        _G[key] = value
+    end
+
+    -- 11.6 环境反查脚本：周期性检查关键 API 是否被 hookfunction 替换
+    -- 这是「环境反查脚本」的闭环：不仅脚本查环境，环境本身被改了脚本也知道
+    local _original_refs = {}  -- 启动时记录的原始函数引用
+
+    function BV.SnapshotAPIs()
+        local apis = {
+            "print", "warn", "pcall", "error", "assert", "tostring", "tonumber",
+            "type", "pairs", "ipairs", "next", "select", "rawget", "rawset", "rawequal",
+            "getmetatable", "setmetatable", "unpack", "string", "table", "math", "os", "coroutine",
+        }
+        for _, name in ipairs(apis) do
+            _original_refs[name] = _G[name]
+        end
+        -- 记录 debug 库关键函数（如果存在）
+        pcall(function()
+            if _G.debug then
+                _original_refs["debug.getinfo"] = _G.debug.getinfo
+                _original_refs["debug.getupvalue"] = _G.debug.getupvalue
+                _original_refs["debug.setupvalue"] = _G.debug.setupvalue
+            end
+        end)
+    end
+
+    function BV.ReverseCheck()
+        if not Config.BidirValidation.Enabled then return false end
+        local apis = {
+            "print", "warn", "pcall", "error", "assert", "tostring", "tonumber",
+            "type", "pairs", "ipairs", "next", "select", "rawget", "rawset", "rawequal",
+            "getmetatable", "setmetatable", "unpack",
+        }
+        local breached = false
+        for _, name in ipairs(apis) do
+            -- 用 rawequal 比较引用（避免触发被 hook 的 == ）
+            if not rawequal(_G[name], _original_refs[name]) then
+                breached = true
+                _trap_handler("api_replaced", name)
+                -- 恢复原始引用
+                pcall(function() _G[name] = _original_refs[name] end)
+            end
+        end
+        -- debug 库反查
+        pcall(function()
+            if _G.debug and _original_refs["debug.getinfo"] then
+                if not rawequal(_G.debug.getinfo, _original_refs["debug.getinfo"]) then
+                    breached = true
+                    _trap_handler("api_replaced", "debug.getinfo")
+                end
+            end
+        end)
+        return breached
+    end
+
+    -- 11.7 后台反查线程
+    function BV.StartReverseCheck()
+        if BV._reverse_thread then return end
+        BV._reverse_thread = _task.spawn(function()
+            while OmniShield._activated do
+                _task.wait(Config.BidirValidation.ReverseCheckInterval)
+                pcall(BV.ReverseCheck)
+            end
+        end)
+    end
+
+    -- 11.8 综合状态
+    function BV.IsBreached()
+        return BV._trap_tripped or BV._decoy_active
+    end
+
+    function BV.GetAccessLog()
+        return BV._access_log
+    end
+end
+
+--======================================================================
 -- Activate()：启动所有保护机制，返回健康值（0-1）
 --======================================================================
 function OmniShield.Activate()
@@ -2011,7 +2561,31 @@ function OmniShield.Activate()
         pcall(OmniShield._timewarp.UpdateTimeline)
     end
 
-    -- 9. 自检（可选）
+    -- 9. 初始化自修改 VM（与技术 1 VM-2 耦合）
+    if Config.SelfModVM.Enabled then
+        local ok = pcall(OmniShield._selfmod.Init)
+        if not ok then
+            table.insert(degraded, "SelfModVM")
+            health = health - 0.05
+        end
+    end
+
+    -- 10. 初始化影子堆栈（无需特殊初始化，但触发一次预热）
+    if Config.ShadowStack.Enabled then
+        pcall(function()
+            OmniShield._shadowstack.Push(0)  -- 预热
+            OmniShield._shadowstack.Pop()
+        end)
+    end
+
+    -- 11. 启动双向校验（快照 API + 安装全局陷阱 + 后台反查）
+    if Config.BidirValidation.Enabled then
+        pcall(OmniShield._bidir.SnapshotAPIs)
+        pcall(OmniShield._bidir.InstallGlobalTraps)
+        pcall(OmniShield._bidir.StartReverseCheck)
+    end
+
+    -- 12. 自检（可选）
     if Config.SelfTest.AutoRun then
         pcall(OmniShield.SelfTest)
     end
