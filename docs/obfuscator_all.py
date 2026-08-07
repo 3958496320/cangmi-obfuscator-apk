@@ -4780,12 +4780,31 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
 # 统一入口（供 obfuscator_core 调用，控制顺序）
 # ===========================================================================
 
+def _mark_table_field_keys(chunk: Node) -> None:
+    """标记所有 TableField 的 String key 为 _no_encrypt。
+
+    table 字段名是外部 API 契约（如 UI 库读 opts.Value/opts.Title/opts.Callback），
+    加密字段名虽运行时解密还原，但若真实注入器环境解密不稳定（Hook/缓存污染），
+    字段名变乱码，外部库读 opts.XXX 得到 nil，可能把 nil 当默认 true，
+    导致 Toggle 等控件误开。必须在 split_strings 与 encrypt_strings 之前
+    标记，两层都会跳过 _no_encrypt 的字符串。
+    """
+    def _mark(n: Node) -> None:
+        if n.type == "TableField":
+            key = n.attrs.get("key")
+            if key is not None and isinstance(key, Node) and key.type == "String":
+                key.attrs["_no_encrypt"] = True
+    walk(chunk, _mark)
+
+
 def apply_pre_encryption(chunk: Node, rng: random.Random) -> dict:
     """在第 1 层字符串加密「之前」运行的反自动化变换。
 
     包含：字符串拆分、AST 扰乱、动态 API 索引。
     返回统计信息。
     """
+    # 先标记 table 字段名不加密/不拆分，再执行 split_strings 等变换。
+    _mark_table_field_keys(chunk)
     stats = {}
     stats["split"] = split_strings(chunk, rng)
     stats["redirect"] = 0
