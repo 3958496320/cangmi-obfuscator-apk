@@ -1548,6 +1548,11 @@ def _build_decrypt_function(dec_name: str, cache_name: str) -> Node:
       参数会解密出不同明文；仅以 data 为键会导致缓存冲突（垃圾代码中恰好
       产生同 payload 不同参数的调用时，会返回错误结果）。追加 3 字节参数后，
       不同 (data, key, offset, mask) 元组必产生不同 ck，无冲突可能。
+    - 用后即焚（v4 加固）：命中缓存后立即 `cache[ck] = nil` 删除条目再返回。
+      对抗 getupvalue 抓取缓存表批量转储明文——攻击者在任意断点 getupvalue
+      缓存表，只能得到「尚未被读取过」的条目（且因 3 分裂，仅得其中 1/3），
+      无法一次性导出全部已解密字符串。重复访问同一字符串会重新解密（O(n)，
+      可接受）。正确性不变：命中即返回正确值，只是返回后清空该条目。
     """
     # string.byte(data, i)
     byte_call = call_node(
@@ -1580,7 +1585,13 @@ def _build_decrypt_function(dec_name: str, cache_name: str) -> Node:
           exprs=[index_node(name_node(cache_name), name_node("ck"))]),
         N("If",
           cond=name_node("cached"),
-          body=[N("Return", exprs=[name_node("cached")])],
+          body=[
+              # 用后即焚：命中后立即清空该缓存条目，再返回。
+              # 防止攻击者 getupvalue 缓存表一次性导出全部已解密明文。
+              N("Assign",
+                targets=[index_node(name_node(cache_name), name_node("ck"))],
+                exprs=[N("Nil")]),
+              N("Return", exprs=[name_node("cached")])],
           elifs=[], else_body=None),
         # block = (key % 4) + 6
         N("LocalAssign", names=["block"], exprs=[
@@ -1661,12 +1672,21 @@ def encrypt_strings(chunk: Node, rng: random.Random,
     gen = NameGenerator(rng)
     if dec_name:
         gen.reserve(dec_name)
-    dec_name = dec_name or gen.fresh()
-    cache_name = gen.fresh()
+    # 3 分裂解码器（v4 加固·对抗单点 Hook）：生成 3 个独立解密函数，各持独立
+    # 缓存表。字符串随机分散到 3 个函数——攻击者 Hook 任一解密函数或 getupvalue
+    # 任一缓存表，最多只能拿到约 1/3 的明文；必须同时攻破 3 个（经 L2 重命名后
+    # 名称随机、各自独立作用域）才能转储全部字符串。配合「用后即焚」缓存，断点
+    # 转储收益进一步衰减。
+    NUM_VARIANTS = 3
+    dec_names = []
+    cache_names = []
+    for _v in range(NUM_VARIANTS):
+        # 主解码器（首个）沿用调用方传入的 dec_name（供水印/loadstring 引用）
+        dn = dec_name if (dec_name and len(dec_names) == 0) else gen.fresh()
+        dec_names.append(dn)
+        cache_names.append(gen.fresh())
+    primary_dec = dec_names[0]
     reserve_names = reserve_names or set()
-
-    # 是否已注入解密函数标记
-    injected = {"v": False}
 
     def visit(node: Node) -> Node:
         # 跳过标记为不可加密的字符串（如函数声明字段名，gen_funcname 需原值）
@@ -1688,9 +1708,10 @@ def encrypt_strings(chunk: Node, rng: random.Random,
             payload_node = string_node(payload_literal)
             payload_node.attrs["_enc_payload"] = True  # 防止再次加密
             payload_node.attrs["_verbatim"] = True     # 已是完整字面量，禁止二次转义
-            # _S(payload, key, offset, mask)
+            # 随机派发到一个分裂解码器：单点 Hook 仅得 1/3 字符串
+            vi = rng.randint(0, NUM_VARIANTS - 1)
             new_node = call_node(
-                name_node(dec_name),
+                name_node(dec_names[vi]),
                 [payload_node, number_node(key),
                  number_node(offset), number_node(mask)],
             )
@@ -1700,15 +1721,18 @@ def encrypt_strings(chunk: Node, rng: random.Random,
     # 后序变换：在变换过程中，新生成的 payload 字符串不会被再次访问
     transform(chunk, visit)
 
-    # 在 Chunk 顶部插入缓存表与解密函数定义
+    # 逆序插入 3 个 (cache, dec_func) 对，保证最终顺序为：
+    #   cache0, dec0, cache1, dec1, cache2, dec2, ...其余 body
+    # 全部位于 L0 水印变量与 L8 prelude 之前，运行时调用时已定义。
     body = chunk.get("body")
-    cache_decl = N("LocalAssign", names=[cache_name],
-                   exprs=[N("Table", fields=[])])
-    dec_func = _build_decrypt_function(dec_name, cache_name)
-    body.insert(0, dec_func)
-    body.insert(0, cache_decl)
+    for vi in range(NUM_VARIANTS - 1, -1, -1):
+        dec_func = _build_decrypt_function(dec_names[vi], cache_names[vi])
+        cache_decl = N("LocalAssign", names=[cache_names[vi]],
+                       exprs=[N("Table", fields=[])])
+        body.insert(0, dec_func)
+        body.insert(0, cache_decl)
 
-    return dec_name
+    return primary_dec
 
 
 # =============================================================================
@@ -2801,11 +2825,24 @@ class _VMCompiler:
         strs_lua = "{" + ", ".join(fmt_str(s) for s in self.strs) + "}"
 
         # 程序表（跳过 prog[0] 占位）
+        # v4 加固·本函数滚动密钥 _vk：操作码（ins 首元素）预编码为
+        # variant + _vk + pc，运行时内联 `ins[1] - _vk - pc` 还原 variant。
+        # pc 即指令在 P 中的 1-based 下标；跳转目标也是 pc，故密钥与位置绑定、
+        # 跳转安全（不依赖执行历史，循环/分支重复执行同一指令时密钥恒定）。
+        # 关键：用算术 +/- 而非 xor——代码生成器会把 ~ 重写为 bit32.bxor（可 Hook），
+        # 而 +/- 是运算符，Lua 中无法 Hook。故 VM 操作码解码无可 Hook 的函数调用，
+        # 攻击者无法通过 Hook bit32.bxor/_vm_bxor 记录操作码；须逐函数逆向各自 _vk
+        #（L2 重命名后为随机局部）并静态还原 ins[1]-_vk-pc，动态 Hook 完全失效。
+        _vk = self.rng.randint(1, 0x7FFFFFFF)
         prog_lines = []
-        for ins in self.prog[1:]:
+        for _pi, ins in enumerate(self.prog[1:]):
             parts = []
-            for p in ins:
-                if isinstance(p, str):
+            _pc = _pi + 1  # 1-based，与运行时 pc 一致
+            for _idx, p in enumerate(ins):
+                if _idx == 0:
+                    # 操作码：用本函数滚动密钥预编码（variant + _vk + pc）
+                    parts.append(str(p + _vk + _pc))
+                elif isinstance(p, str):
                     parts.append(f'"{p}"')
                 elif isinstance(p, (int, float)):
                     parts.append(str(p))
@@ -2874,9 +2911,10 @@ class _VMCompiler:
         src += f'    if _VM_PROGS then table.insert(_VM_PROGS, P) end\n'
         src += f'    local pc = 1\n'
         src += f'    local _yc = 0\n'
+        src += f'    local _vk = {_vk}\n'
         src += f'    while pc <= #P do\n'
         src += f'        local ins = P[pc]\n'
-        src += f'        local op = _D(_vm_decode and _vm_decode(ins[1]) or ins[1])\n'
+        src += f'        local op = _D(ins[1] - _vk - pc)\n'
         src += f'        _yc = _yc + 1\n'
         src += f'        if _yc >= 10000 then _yc = 0; if task and task.wait then task.wait() end end\n'
         src += f'        if op == {O["LOADK"]} then\n'
@@ -4683,8 +4721,7 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
     3. 删除本验证块 → 攻击者需读懂 L1/L2/L3 重命名后的代码，成本极高。
     4. 期望值 __exp 同样经 L1 加密，攻击者无法静态搜索明文绕过。
     """
-    # 期望值：用与 L1 相同算法加密 _WATERMARK_PLAINTEXT
-    # 水印明文：默认版权水印，可由 plaintext_override 覆盖（如法律声明）
+    # 期望值：用与 L1 相同算法加密水印明文
     wm_plaintext = plaintext_override if plaintext_override is not None else _WATERMARK_PLAINTEXT
     key = rng.randint(1, 255)
     offset = rng.randint(1, 255)
@@ -4696,7 +4733,10 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
 
     exp_var = gen.fresh()
     got_var = gen.fresh()
-    ok_var = gen.fresh()
+    len_ok_var = gen.fresh()
+    diff_var = gen.fresh()
+    hg_var = gen.fresh()
+    he_var = gen.fresh()
 
     # __exp = <dec_name>(payload, k, o, m)
     exp_assign = N("LocalAssign", names=[exp_var], exprs=[
@@ -4707,21 +4747,62 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
     # __got = <wm_var>
     got_assign = N("LocalAssign", names=[got_var], exprs=[name_node(wm_var)])
 
-    # type(__got) == "string"
+    # __len_ok = (type(__got) == "string") and (#__got == #__exp)
     cond_type = _type_is(name_node(got_var), "string")
-    # #__got == #__exp
     cond_len = N("BinOp", op="==",
                  left=N("UnaryOp", op="#", operand=name_node(got_var)),
                  right=N("UnaryOp", op="#", operand=name_node(exp_var)))
-    # __got == __exp
-    cond_eq = N("BinOp", op="==",
-                left=name_node(got_var), right=name_node(exp_var))
-    # ok = cond_type and cond_len and cond_eq
-    ok_expr = N("BinOp", op="and",
-                left=N("Paren", expr=N("BinOp", op="and",
-                                       left=cond_type, right=cond_len)),
-                right=N("Paren", expr=cond_eq))
-    ok_assign = N("LocalAssign", names=[ok_var], exprs=[ok_expr])
+    len_ok_assign = N("LocalAssign", names=[len_ok_var], exprs=[
+        N("BinOp", op="and", left=cond_type, right=N("Paren", expr=cond_len))
+    ])
+
+    # v5 加固·消除明文 == 判断：字节差累积 + 滚动哈希
+    # 弱点（v4）：原 __got == __exp 是明文字符串相等比较，攻击者可在内存中
+    # 搜索该判断分支，patch 跳转条件（if not __ok → if false）即可绕过自毁。
+    # 加固（v5）：
+    # 1. 逐字节异或累积到 __diff（完全相等时 __diff == 0），消除字符串 == 比较
+    # 2. 滚动哈希 __hg/__he（位置加权异或），第二道独立校验
+    # 3. 自毁函数接收 (len_ok, diff, hg, he) 参数，内部二次校验
+    # 4. 总是调用自毁函数（去掉外层 if not __ok），攻击者无法通过 patch 单个
+    #    外层跳转绕过；必须理解并 patch 自毁函数内部判断（经 L2 重命名，名称随机）
+    diff_init = N("LocalAssign", names=[diff_var], exprs=[number_node(0)])
+    hg_init = N("LocalAssign", names=[hg_var], exprs=[number_node(0)])
+    he_init = N("LocalAssign", names=[he_var], exprs=[number_node(0)])
+
+    # 累积循环：if __len_ok then for i=1,#__got do
+    #   __diff += (byte(__got,i) ~ byte(__exp,i))
+    #   __hg = __hg ~ (byte(__got,i) + i)
+    #   __he = __he ~ (byte(__exp,i) + i)
+    # end end
+    byte_got = call_node(
+        N("Index", obj=name_node("string"), key=string_node("byte")),
+        [name_node(got_var), name_node("i")])
+    byte_exp = call_node(
+        N("Index", obj=name_node("string"), key=string_node("byte")),
+        [name_node(exp_var), name_node("i")])
+    diff_update = N("Assign", targets=[name_node(diff_var)], exprs=[
+        N("BinOp", op="+",
+          left=name_node(diff_var),
+          right=N("Paren", expr=N("BinOp", op="~",
+                                  left=byte_got, right=byte_exp)))
+    ])
+    hg_update = N("Assign", targets=[name_node(hg_var)], exprs=[
+        N("BinOp", op="~",
+          left=name_node(hg_var),
+          right=N("Paren", expr=N("BinOp", op="+",
+                                  left=byte_got, right=name_node("i"))))
+    ])
+    he_update = N("Assign", targets=[name_node(he_var)], exprs=[
+        N("BinOp", op="~",
+          left=name_node(he_var),
+          right=N("Paren", expr=N("BinOp", op="+",
+                                  left=byte_exp, right=name_node("i"))))
+    ])
+    accum_loop = N("NumericFor", var="i", start=number_node(1),
+                   limit=N("UnaryOp", op="#", operand=name_node(got_var)),
+                   step=None, body=[diff_update, hg_update, he_update])
+    accum_block = N("If", cond=name_node(len_ok_var),
+                    body=[accum_loop], elifs=[], else_body=None)
 
     # 自毁函数体
     # local info = debug and debug.getinfo and debug.getinfo(2, "S")
@@ -4795,31 +4876,47 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
                         exprs=[N("Nil")])])],
         elifs=[], else_body=None)]
 
-    # 自毁函数：pcall 包裹文件删除 + pcall 包裹清空环境 + error 终止
-    # 关键修复：原 while true do error() end 在 error() 被注入器 hook
-    # （覆盖为不抛错）时会变成真正的无限循环，导致脚本卡死。
-    # 改为单次 error() 调用：正常环境抛错终止；若 error 被 hook，
-    # 函数正常返回，脚本继续但 _G 已清空，后续调用自然失败。
-    selfdestruct_fn = N("Function", params=[], is_vararg=False, body=[
-        info_assign, src_assign,
-        N("CallStatement", expr=call_node(name_node("pcall"),
-            [N("Paren", expr=N("Function", params=[], is_vararg=False,
-                              body=selfdel_body))])),
-        N("CallStatement", expr=call_node(name_node("pcall"),
-            [N("Paren", expr=N("Function", params=[], is_vararg=False,
-                              body=clearg_body))])),
-        N("CallStatement", expr=call_node(name_node("error"),
-                [string_node("watermark broken")])),
-    ])
+    # 自毁函数：接收 (len_ok, diff, hg, he)，内部二次校验
+    # v5 关键：去掉外层 if not __ok，总是调用 __sd。
+    # __sd 内部判断 (not len_ok) or (diff ~= 0) or (hg ~= he)，
+    # 校验通过则正常返回，校验失败则自毁（文件删除 + 清空 _G + error）。
+    # 攻击者须 patch __sd 内部判断（L2 重命名后名称随机），无法靠 patch
+    # 单个外层跳转绕过。原 while true do error() 改为单次 error()，避免
+    # error 被 hook 时卡死。
+    p_len_ok = gen.fresh()
+    p_diff = gen.fresh()
+    p_hg = gen.fresh()
+    p_he = gen.fresh()
+    sd_cond = N("BinOp", op="or",
+        left=N("BinOp", op="or",
+               left=N("UnaryOp", op="not", operand=name_node(p_len_ok)),
+               right=N("BinOp", op="~=", left=name_node(p_diff), right=number_node(0))),
+        right=N("BinOp", op="~=", left=name_node(p_hg), right=name_node(p_he)))
+    selfdestruct_fn = N("Function",
+        params=[p_len_ok, p_diff, p_hg, p_he], is_vararg=False,
+        body=[N("If",
+            cond=sd_cond,
+            body=[
+                info_assign, src_assign,
+                N("CallStatement", expr=call_node(name_node("pcall"),
+                    [N("Paren", expr=N("Function", params=[], is_vararg=False,
+                                      body=selfdel_body))])),
+                N("CallStatement", expr=call_node(name_node("pcall"),
+                    [N("Paren", expr=N("Function", params=[], is_vararg=False,
+                                      body=clearg_body))])),
+                N("CallStatement", expr=call_node(name_node("error"),
+                        [string_node("watermark broken")])),
+            ],
+            elifs=[], else_body=None)])
 
-    # if not __ok then <selfdestruct_fn>() end
-    verify = N("If",
-        cond=N("UnaryOp", op="not", operand=name_node(ok_var)),
-        body=[N("CallStatement", expr=call_node(
-            N("Paren", expr=selfdestruct_fn), []))],
-        elifs=[], else_body=None)
+    # 总是调用自毁函数（传入校验参数）
+    call_sd = N("CallStatement", expr=call_node(
+        N("Paren", expr=selfdestruct_fn),
+        [name_node(len_ok_var), name_node(diff_var),
+         name_node(hg_var), name_node(he_var)]))
 
-    return N("Do", body=[exp_assign, got_assign, ok_assign, verify])
+    return N("Do", body=[exp_assign, got_assign, len_ok_assign,
+                         diff_init, hg_init, he_init, accum_block, call_sd])
 
 
 def inject_legal_comments(chunk: Node, rng: random.Random,
@@ -6426,69 +6523,22 @@ def apply_const_encrypt(chunk: Node, rng: random.Random) -> dict:
 
 
 def _generate_vm_infra() -> str:
-    """生成 VM 操作码周期重映射基础设施代码（③操作码重映射）。
+    """生成 VM 基础设施代码（③操作码加固 v4）。
 
-    注入到混淆输出开头，在所有 VM 函数之前。VM 函数通过全局变量
-    _VM_PROGS（程序注册表）和 _vm_decode（操作码解码函数）与此设施交互。
+    v4 改造：废弃「全局 _VM_XOR + 周期重映射 + 全局 _vm_decode」三件套
+    （_vm_decode / _vm_bxor 是可被动态 Hook 的单点，记录一次即得全部操作码映射）。
 
-    定时器每 600 秒（10 分钟）重映射一次操作码：重新生成 XOR 密钥，
-    重编码所有已注册程序的字节码。分析者必须持续监控映射变化。
+    新方案：每个 VM 函数拥有独立滚动密钥 _vk（局部），操作码预编码为
+    variant + _vk + pc，运行时内联 `ins[1] - _vk - pc` 还原。关键用算术 +/- 而
+    非 xor——代码生成器把 ~ 重写为 bit32.bxor（可 Hook），而 +/- 是运算符无法
+    Hook。故 VM 解码无可 Hook 的函数调用；密钥与指令位置绑定，跳转安全。攻击者
+    须逐函数逆向各自 _vk（L2 重命名后为随机局部名），动态 Hook 完全失效。
 
-    如果注入器不支持 spawn/task.wait，定时器不会启动，但 VM 仍正常工作
-    （_VM_XOR 保持 0，操作码为明文，_vm_decode 直接返回原值）。
+    此处仅保留 _VM_PROGS 注册表（VM 函数注册自身用，guarded by `if _VM_PROGS`）。
     """
     return (
-        "-- VM 操作码周期重映射（③）\n"
+        "-- VM 操作码本函数滚动密钥（③ v4 加固：无全局 _vm_decode/_vm_bxor，每函数独立 _vk，内联算术 +/- 解码）\n"
         "_VM_PROGS = {}\n"
-        "_VM_XOR = 0\n"
-        "local _pure_bxor = function(a, b)\n"
-        "    local r, p = 0, 1\n"
-        "    while a > 0 or b > 0 do\n"
-        "        local ab, bb = a % 2, b % 2\n"
-        "        if ab ~= bb then r = r + p end\n"
-        "        a = math.floor(a / 2)\n"
-        "        b = math.floor(b / 2)\n"
-        "        p = p * 2\n"
-        "    end\n"
-        "    return r\n"
-        "end\n"
-        "local _vm_bxor = (bit32 and bit32.bxor) or (bit and bit.bxor) or _pure_bxor\n"
-        "_vm_decode = function(code)\n"
-        "    if _VM_XOR == 0 then return code end\n"
-        "    return _vm_bxor(code, _VM_XOR)\n"
-        "end\n"
-        "local _vm_remap = function()\n"
-        "    local old = _VM_XOR\n"
-        "    _VM_XOR = math.random(0, 0x7FFFFFFF)\n"
-        "    if _VM_XOR == old then _VM_XOR = _VM_XOR + 1 end\n"
-        "    local new = _VM_XOR\n"
-        "    if new == 0 then return end\n"
-        "    for _, P in ipairs(_VM_PROGS) do\n"
-        "        for _, ins in ipairs(P) do\n"
-        "            if old ~= 0 then\n"
-        "                ins[1] = _vm_bxor(_vm_bxor(ins[1], old), new)\n"
-        "            else\n"
-        "                ins[1] = _vm_bxor(ins[1], new)\n"
-        "            end\n"
-        "        end\n"
-        "    end\n"
-        "end\n"
-        "if spawn and task and task.wait then\n"
-        "    spawn(function()\n"
-        "        local _last = tick()\n"
-        "        while true do\n"
-        "            pcall(function()\n"
-        "                task.wait(600)\n"
-        "                _vm_remap()\n"
-        "            end)\n"
-        "            -- 逃生：若 task.wait 未真正 yield（注入器缺陷），\n"
-        "            -- 连续两次迭代间隔极短，跳出避免死循环卡死脚本。\n"
-        "            local _now = tick()\n"
-        "            if (_now - _last) < 1 then return end\n"
-        "            _last = _now\n"
-        "        end\n"
-        "    end)\n"
-        "end\n"
     )
 
 
