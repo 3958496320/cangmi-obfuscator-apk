@@ -451,6 +451,26 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
 # 统一入口（供 obfuscator_core 调用，控制顺序）
 # ===========================================================================
 
+def _mark_table_field_keys(chunk: Node) -> None:
+    """标记 table 字段名（TableField 的 String key）为 _no_encrypt。
+
+    必须在 split_strings 之前调用。split_strings 会把长字符串（>=6 字符）
+    拆成 `..` 拼接，拆分后 TableField 的 key 不再是 String 节点，
+    encrypt_strings 里的 _mark_table_field_keys 将无法识别并保护它们。
+    典型受害者：opts.Callback（8 字符）被拆分+加密后，真实注入器环境若
+    解密不稳定，UI 库读 opts.Callback 得到 nil，部分库会把 nil 回调
+    当作默认开启，导致 Toggle 控件误开（如雷达系统进游戏即开）。
+    字段名是外部 API 契约（UI 库读 opts.Value/opts.Title/opts.Callback），
+    必须保持明文，本函数统一保护所有 TableField 的 String key。
+    """
+    def _mark(n: Node) -> None:
+        if n.type == "TableField":
+            key = n.attrs.get("key")
+            if key is not None and isinstance(key, Node) and key.type == "String":
+                key.attrs["_no_encrypt"] = True
+    walk(chunk, _mark)
+
+
 def apply_pre_encryption(chunk: Node, rng: random.Random) -> dict:
     """在第 1 层字符串加密「之前」运行的反自动化变换。
 
@@ -458,6 +478,9 @@ def apply_pre_encryption(chunk: Node, rng: random.Random) -> dict:
     返回统计信息。
     """
     stats = {}
+    # 必须先标记 table 字段名，再拆分字符串。否则长字段名（如 Callback）
+    # 会被 split_strings 拆成 `..` 拼接，之后 encrypt_strings 无法保护。
+    _mark_table_field_keys(chunk)
     stats["split"] = split_strings(chunk, rng)
     stats["redirect"] = 0
     # redirect_apis 注入解析器并改写调用

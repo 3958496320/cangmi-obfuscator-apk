@@ -20,7 +20,7 @@ from __future__ import annotations
 import random
 from typing import Optional
 
-from ast_parser import Node, N, transform
+from ast_parser import Node, N, transform, walk
 from util import (
     NameGenerator, bytes_to_lua_literal, name_node, number_node,
     string_node, call_node,
@@ -183,6 +183,18 @@ def encrypt_strings(chunk: Node, rng: random.Random,
             )
             return new_node
         return node
+
+    # 标记 table 字段名（TableField 的 String key）不加密。
+    # 字段名是外部 API 契约（如 UI 库读 opts.Value/opts.Title/opts.Callback），
+    # 加密字段名虽运行时解密还原，但若真实注入器环境解密不稳定（Hook/缓存污染），
+    # 字段名变乱码，外部库读 opts.XXX 得到 nil，可能把 nil 当默认 true，
+    # 导致 Toggle 等控件误开。字段名本就是可猜测的短字符串，不加密损失极小。
+    def _mark_table_field_keys(n: Node) -> None:
+        if n.type == "TableField":
+            key = n.attrs.get("key")
+            if key is not None and key.type == "String":
+                key.attrs["_no_encrypt"] = True
+    walk(chunk, _mark_table_field_keys)
 
     # 后序变换：在变换过程中，新生成的 payload 字符串不会被再次访问
     transform(chunk, visit)
