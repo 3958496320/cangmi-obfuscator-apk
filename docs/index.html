@@ -406,29 +406,6 @@
             flex-wrap: wrap;
             align-items: center;
         }
-        .ninja-toggle {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 10px 16px;
-            background: rgba(255, 200, 80, 0.12);
-            border: 1px solid rgba(255, 200, 80, 0.4);
-            border-radius: 12px;
-            font-size: 13px;
-            font-weight: 600;
-            color: #ffd580;
-            cursor: pointer;
-            user-select: none;
-        }
-        .ninja-toggle:hover {
-            background: rgba(255, 200, 80, 0.2);
-        }
-        .ninja-toggle input {
-            width: 16px;
-            height: 16px;
-            cursor: pointer;
-            accent-color: #ffb000;
-        }
         .btn {
             padding: 12px 20px;
             border: none;
@@ -676,9 +653,6 @@ for (let i = 0; i < 15; i++) {
                 <span>开始混淆</span>
             </button>
             <button class="btn btn-secondary" onclick="clearInput()">清空</button>
-            <label class="ninja-toggle" title="忍者注入器兼容模式：不降低任何保护层（VM/loadstring/dyninst 全开），仅对产物超长行做折行整形，帮助弱注入器更顺畅地解析大表字面量。卡顿本身是大型脚本正常现象，此模式为可选优化。">
-                <input type="checkbox" id="ninja-mode"> <span>忍者模式</span>
-            </label>
         </div>
 
         <div class="status-bar idle" id="status">
@@ -980,8 +954,7 @@ async function doObfuscate() {
     try {
         await new Promise(r => setTimeout(r, 50));
         setProgress(60);
-        const ninjaMode = document.getElementById('ninja-mode').checked;
-        const result = do_obfuscate_py(code, ninjaMode);
+        const result = do_obfuscate_py(code);
         setProgress(90);
 
         document.getElementById('output-code').value = result;
