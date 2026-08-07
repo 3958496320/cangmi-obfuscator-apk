@@ -4931,7 +4931,7 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
         if s >= e:
             continue
         frag_str = wm_plaintext[s:e]
-        frag_expected += sum(b * (fi + 7) for b in frag_str.encode("utf-8")) & 0xFFFF
+        frag_expected += sum(b * (i + 7) for i, b in enumerate(frag_str.encode("utf-8"), 1))
         # 每个碎片独立 do-block：local fs = <片段>; local fh = 0;
         # for i=1,#fs do fh = fh + (byte(fs,i) * (i+7)) end;
         # frag_acc = frag_acc + fh
@@ -5141,7 +5141,7 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
         N("Paren", expr=selfdestruct_fn),
         [name_node(len_ok_var), name_node(diff_var),
          name_node(hg_var), name_node(he_var),
-         name_node(frag_acc_var), number_node(frag_expected)]))
+         N("BinOp", op="%", left=name_node(frag_acc_var), right=number_node(65536)), number_node(frag_expected)]))
 
     return N("Do", body=[exp_assign, got_assign] + frag_blocks +
                          [len_ok_assign,
@@ -6743,20 +6743,109 @@ _DEFAULT_RESERVE: Set[str] = set(GLOBAL_LIBS)
 
 
 def apply_const_encrypt(chunk: Node, rng: random.Random) -> dict:
-    """数字常量加密（②数据表随机化）：将整数常量替换为 XOR 解密表达式。
+    """MBA 常量加密（v7 升级）：将整数常量替换为等价的纯算术表达式。
 
-    对所有整数 Number 节点（0..0x7FFFFFFF），替换为：
-        <bxor>(KEY, KEY_N)
-    其中 KEY 是随机密钥，KEY_N = KEY XOR int(value)。
-    运行时 <bxor>(KEY, KEY_N) = KEY XOR KEY_N = n，语义等价。
+    v6 弱点：所有常量共享同一个 bxor(KEY, KEY^n) 函数调用 + 单一 KEY，
+    攻击者 Hook 该函数一次即得全部原始常量（与字符串解密器单点突破同病）。
 
-    <bxor> 使用纯 Lua 逐位模拟实现，不依赖 bit32/bit 库，100% 兼容。
-    跳过标记 _no_const_encrypt 的子树（如 VM 生成的字节码，其数字是
-    操作码/操作数，不能被加密）。
+    v7 加固：移除共享函数，每个常量独立展开为纯算术表达式（+ - *），
+    无函数调用、不可 Hook、每常量形态随机不同。攻击者无法通过单点 Hook
+    批量还原常量，须逐个静态求解各表达式。
+
+    跳过标记 _no_const_encrypt 的子树（VM 字节码操作码/操作数不能加密）。
     """
-    KEY = rng.randint(1, 0x7FFFFFFF)
-    bxor_name = NameGenerator(rng).fresh()
     count = [0]
+
+    def _gen_arith_mba(n):
+        """把整数 n 转成等价的纯算术表达式（无函数调用、不可 Hook）。"""
+        # 0 特殊处理：(a - a)
+        if n == 0:
+            a = rng.randint(1, 9999)
+            return N("BinOp", op="-",
+                      left=number_node(a), right=number_node(a))
+
+        templates = []
+
+        # T0: n = (a + b) - c
+        def t0():
+            c = rng.randint(1, 9999)
+            a = rng.randint(1, 9999)
+            b = n + c - a
+            return N("BinOp", op="-",
+                      left=N("Paren", expr=N("BinOp", op="+",
+                          left=number_node(a), right=number_node(b))),
+                      right=number_node(c))
+        templates.append(t0)
+
+        # T1: n = (a * b) + r
+        def t1():
+            a = rng.randint(1, 97)
+            b = rng.randint(1, 97)
+            r = n - a * b
+            return N("BinOp", op="+",
+                      left=N("Paren", expr=N("BinOp", op="*",
+                          left=number_node(a), right=number_node(b))),
+                      right=number_node(r))
+        templates.append(t1)
+
+        # T2: n = (a - b) + c
+        def t2():
+            a = rng.randint(1, 9999)
+            b = rng.randint(1, 9999)
+            c = n - a + b
+            return N("BinOp", op="+",
+                      left=N("Paren", expr=N("BinOp", op="-",
+                          left=number_node(a), right=number_node(b))),
+                      right=number_node(c))
+        templates.append(t2)
+
+        # T3: n = ((a + b) * c) + d
+        def t3():
+            a = rng.randint(1, 50)
+            b = rng.randint(1, 50)
+            c = rng.randint(1, 20)
+            d = n - (a + b) * c
+            return N("BinOp", op="+",
+                      left=N("Paren", expr=N("BinOp", op="*",
+                          left=N("Paren", expr=N("BinOp", op="+",
+                              left=number_node(a), right=number_node(b))),
+                          right=number_node(c))),
+                      right=number_node(d))
+        templates.append(t3)
+
+        # T4: n = (a + b) - (c + d)
+        def t4():
+            a = rng.randint(1, 9999)
+            b = rng.randint(1, 9999)
+            c = rng.randint(1, 9999)
+            d = a + b - c - n
+            return N("BinOp", op="-",
+                      left=N("Paren", expr=N("BinOp", op="+",
+                          left=number_node(a), right=number_node(b))),
+                      right=N("Paren", expr=N("BinOp", op="+",
+                          left=number_node(c), right=number_node(d))))
+        templates.append(t4)
+
+        # T5: n = (a * b) - (c * d)，要求 (a*b - n) 能被 c 整除
+        def t5():
+            a = rng.randint(1, 50)
+            b = rng.randint(1, 50)
+            diff = a * b - n
+            if diff == 0:
+                return t0()
+            cands = [c for c in range(2, 50) if diff % c == 0]
+            if not cands:
+                return t0()
+            c = rng.choice(cands)
+            d = diff // c
+            return N("BinOp", op="-",
+                      left=N("Paren", expr=N("BinOp", op="*",
+                          left=number_node(a), right=number_node(b))),
+                      right=N("Paren", expr=N("BinOp", op="*",
+                          left=number_node(c), right=number_node(d))))
+        templates.append(t5)
+
+        return rng.choice(templates)()
 
     def _encrypt(node):
         if node is None:
@@ -6783,80 +6872,15 @@ def apply_const_encrypt(chunk: Node, rng: random.Random) -> dict:
                 val = float(node.get("value"))
                 if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
                     n = int(val)
-                    kn = KEY ^ n
                     count[0] += 1
-                    return N("Call",
-                             func=N("Name", name=bxor_name),
-                             args=[N("Number", value=str(KEY)),
-                                   N("Number", value=str(kn))])
+                    return _gen_arith_mba(n)
             except (ValueError, TypeError):
                 pass
         return node
 
     _encrypt(chunk)
 
-    # 插入 <bxor> 辅助函数（加密已完成，函数内数字不会被加密）
-    bxor_func = N("LocalFunction", name=bxor_name,
-                  func=N("Function", params=["a", "b"], is_vararg=False, body=[
-                      N("LocalAssign", names=["r"], exprs=[N("Number", value="0")]),
-                      N("LocalAssign", names=["p"], exprs=[N("Number", value="1")]),
-                      N("While",
-                        cond=N("BinOp", op="or",
-                               left=N("BinOp", op=">",
-                                      left=N("Name", name="a"),
-                                      right=N("Number", value="0")),
-                               right=N("BinOp", op=">",
-                                       left=N("Name", name="b"),
-                                       right=N("Number", value="0"))),
-                        body=[
-                            N("LocalAssign", names=["ab"],
-                              exprs=[N("BinOp", op="%",
-                                       left=N("Name", name="a"),
-                                       right=N("Number", value="2"))]),
-                            N("LocalAssign", names=["bb"],
-                              exprs=[N("BinOp", op="%",
-                                       left=N("Name", name="b"),
-                                       right=N("Number", value="2"))]),
-                            N("If",
-                              cond=N("BinOp", op="~=",
-                                     left=N("Name", name="ab"),
-                                     right=N("Name", name="bb")),
-                              body=[N("Assign",
-                                      targets=[N("Name", name="r")],
-                                      exprs=[N("BinOp", op="+",
-                                               left=N("Name", name="r"),
-                                               right=N("Name", name="p"))])],
-                              elifs=[], else_body=None),
-                            N("Assign",
-                              targets=[N("Name", name="a")],
-                              exprs=[N("Call",
-                                       func=N("Index",
-                                              obj=N("Name", name="math"),
-                                              key=N("String", value="floor")),
-                                       args=[N("BinOp", op="/",
-                                               left=N("Name", name="a"),
-                                               right=N("Number", value="2"))])]),
-                            N("Assign",
-                              targets=[N("Name", name="b")],
-                              exprs=[N("Call",
-                                       func=N("Index",
-                                              obj=N("Name", name="math"),
-                                              key=N("String", value="floor")),
-                                       args=[N("BinOp", op="/",
-                                               left=N("Name", name="b"),
-                                               right=N("Number", value="2"))])]),
-                            N("Assign",
-                              targets=[N("Name", name="p")],
-                              exprs=[N("BinOp", op="*",
-                                       left=N("Name", name="p"),
-                                       right=N("Number", value="2"))]),
-                        ]),
-                      N("Return", exprs=[N("Name", name="r")]),
-                  ]))
-
-    chunk.attrs["body"].insert(0, bxor_func)
-
-    return {"encrypted": count[0], "key": KEY}
+    return {"encrypted": count[0], "key": None}
 
 
 def _generate_vm_infra() -> str:
