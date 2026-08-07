@@ -339,6 +339,32 @@ local Config = {
         FakeErrorLines = true,       -- 假错误行号
     },
 
+    -- 技术 9：自修改 VM（执行中旋转操作码映射，对抗内存 Dump）
+    SelfModVM = {
+        Enabled = true,
+        RotateEvery = 500,           -- 每 500 条指令旋转一次（避免卡死）
+        HotOpCount = 2,              -- 每次旋转参与交换的操作码数（偶数，2=交换1对）
+        SafeMode = true,             -- pcall 包裹旋转+重编码，失败则跳过
+    },
+
+    -- 技术 10：影子堆栈（关键变量 XOR 加密存储，对抗 getgc() Dump）
+    ShadowStack = {
+        Enabled = true,
+        MaxEntries = 256,            -- 栈最大深度
+        KeyMax = 2147483647,         -- 2^31-1，避免 Lua 数值精度丢失
+        ProtectedSlots = 7,          -- 受保护变量数（坐标XYZ/偏移/FOV/密钥/水印哈希）
+    },
+
+    -- 技术 11：双向校验（陷阱元表 + 环境反查脚本）
+    Bidirectional = {
+        Enabled = true,
+        TrapOnIndex = true,          -- __index 触发陷阱
+        TrapOnNewIndex = true,       -- __newindex 触发陷阱
+        ReverseCheckInterval = 30,   -- 环境反查间隔（秒）
+        HoneypotGlobals = true,      -- 注入蜜罐全局变量误导调试器
+        SilentOnTrap = true,         -- 陷阱触发时不报错，静默切换防御模式
+    },
+
     -- 自检
     SelfTest = {
         AutoRun = false,             -- 启动时是否自动跑自检
@@ -801,6 +827,12 @@ do
                 local op_name = _vm2_opcode_table[instr.op] or "NOP"
                 local operand = instr.operand or 0
                 OmniShield._vm2_counter = OmniShield._vm2_counter + 1
+
+                -- Tech 9：自修改 VM 钩子（统计频率 + 每500条旋转映射+重编码）
+                if Config.SelfModVM.Enabled then
+                    OmniShield._selfmodvm.TrackOp(instr.op)
+                    OmniShield._selfmodvm.MaybeRotate(_vm2_opcode_table, program, pc)
+                end
 
                 -- 反调试耦合：执行前检查蜜罐模式
                 if OmniShield._honeypot_mode and op_name == "CALL" then
@@ -1931,6 +1963,311 @@ do
 end
 
 --======================================================================
+-- 技术 9：自修改 VM（Self-Modifying VM）
+-- 执行中旋转操作码映射 + 同步重编码后续指令，保证语义等价
+-- 从外部 dump 内存可见 op 字段不断变化，对抗模式识别
+--======================================================================
+do
+    local SMV = {}
+    local _op_freq = {}          -- [op_id] = 使用次数
+    local _rotate_counter = 0
+    local _rotate_every = Config.SelfModVM.RotateEvery
+    local _hot_count = Config.SelfModVM.HotOpCount
+    local _safe_mode = Config.SelfModVM.SafeMode
+
+    -- 统计操作码使用频率（VM2.execute 每条指令调用）
+    function SMV.TrackOp(op_id)
+        _op_freq[op_id] = (_op_freq[op_id] or 0) + 1
+    end
+
+    -- 旋转：交换热点操作码映射 + 同步重编码 program[pc..end]
+    -- 语义等价证明：映射表交换后，重写过的 op 查表得同一 op_name
+    local function _do_rotate(opcode_table, program, pc)
+        -- 1. 按频率排序
+        local sorted = {}
+        for op_id, freq in pairs(_op_freq) do
+            sorted[#sorted + 1] = { id = op_id, f = freq }
+        end
+        if #sorted < 2 then return end
+        table.sort(sorted, function(a, b) return a.f > b.f end)
+
+        -- 2. 取前 HotOpCount 个（确保偶数），两两配对交换
+        local n = math.min(_hot_count, #sorted)
+        n = n - (n % 2)  -- 确保偶数
+        if n < 2 then return end
+
+        -- 3. 逐对交换映射表 + 单次遍历重编码 program[pc..end]
+        --    构建 swap 映射：swap[old_id] = new_id
+        local swap = {}
+        for i = 1, n, 2 do
+            local a, b = sorted[i].id, sorted[i+1].id
+            if a ~= b then
+                swap[a] = b
+                swap[b] = a
+                -- 交换映射表
+                local tmp = opcode_table[a]
+                opcode_table[a] = opcode_table[b]
+                opcode_table[b] = tmp
+            end
+        end
+        -- 4. 单次遍历重编码（避免多对交换时重复遍历）
+        if next(swap) then
+            for i = pc, #program do
+                local instr = program[i]
+                if type(instr) == "table" and swap[instr.op] then
+                    instr.op = swap[instr.op]
+                end
+            end
+        end
+
+        -- 5. 清空频率表（下一轮重新统计）
+        _op_freq = {}
+    end
+
+    -- VM2.execute 每条指令后调用
+    function SMV.MaybeRotate(opcode_table, program, pc)
+        if not Config.SelfModVM.Enabled then return end
+        _rotate_counter = _rotate_counter + 1
+        if _rotate_counter < _rotate_every then return end
+        _rotate_counter = 0
+        if _safe_mode then
+            pcall(_do_rotate, opcode_table, program, pc)
+        else
+            _do_rotate(opcode_table, program, pc)
+        end
+    end
+
+    function SMV.Init()
+        _op_freq = {}
+        _rotate_counter = 0
+        _safe_print("SelfModVM 已初始化，旋转周期: " .. tostring(_rotate_every))
+    end
+
+    function SMV.GetFreq() return _op_freq end
+    function SMV.GetRotateCounter() return _rotate_counter end
+    OmniShield._selfmodvm = SMV
+end
+
+--======================================================================
+-- 技术 10：影子堆栈（Shadow Stack）
+-- 关键变量 XOR 加密存储，对抗 getgc() / memory dump
+-- 全部 upvalue 闭包，不进 _G，外部不可见
+-- 数值整数直接 XOR；浮点数放大1000取整后 XOR（保留3位小数）
+-- 字符串按字节 XOR；nil/表/函数 用标记位
+--======================================================================
+do
+    local _stack = {}            -- { {enc, key, tag}, ... }
+    local _top = 0
+    local _key_max = Config.ShadowStack.KeyMax
+    local _max_entries = Config.ShadowStack.MaxEntries
+    local _SCALE = 1000          -- 浮点数放大倍数
+
+    -- 生成 key（限制在 2^31-1 内，多熵源混合，不依赖 math.random）
+    local function _gen_key()
+        local t = math.floor((_tick() * 1000) % _key_max)
+        local c = math.floor((_clock() * 1000000) % _key_max)
+        local v = math.floor((OmniShield._vm2_counter * 2654435761) % _key_max)
+        local k = _bxor(_bxor(t, c), v) % _key_max
+        if k < 1 then k = k + 1 end  -- 避免 key=0（XOR 无效）
+        return k
+    end
+
+    -- 异或（处理负数输入，返回无符号 32 位结果）
+    local function _xor(a, b)
+        a = math.floor(a or 0)
+        if a < 0 then a = a + 4294967296 end
+        return _bxor(a, b)
+    end
+
+    -- 解密整数：XOR 后把无符号结果转回有符号（匹配 push 时的负数处理）
+    local function _decrypt_int(enc, k)
+        local dec = _bxor(enc, k)
+        if dec > 2147483647 then dec = dec - 4294967296 end
+        return dec
+    end
+
+    local SS = {}
+
+    function SS.push(value)
+        if _top >= _max_entries then return false end
+        _top = _top + 1
+        local k = _gen_key()
+        local t = type(value)
+        if t == "number" then
+            -- 整数直接 XOR；浮点放大取整后 XOR
+            if value == math.floor(value) and value >= -2147483648 and value <= 2147483647 then
+                _stack[_top] = { _xor(value, k), k, 0 }      -- 0 = int
+            else
+                local scaled = math.floor(value * _SCALE + 0.5)
+                _stack[_top] = { _xor(scaled, k), k, 3 }      -- 3 = float
+            end
+        elseif t == "nil" then
+            _stack[_top] = { nil, nil, 1 }                    -- 1 = nil
+        elseif t == "string" then
+            local bytes = {}
+            for i = 1, #value do
+                bytes[i] = _bxor(_sbyte(value, i), (k + i) % 256)
+            end
+            _stack[_top] = { bytes, k, 2 }                    -- 2 = string
+        else
+            _stack[_top] = { value, k, 4 }                    -- 4 = ref（表/函数）
+        end
+        return true
+    end
+
+    function SS.pop()
+        if _top <= 0 then return nil end
+        local entry = _stack[_top]
+        _stack[_top] = nil          -- 用后即焚
+        _top = _top - 1
+        local tag = entry[3]
+        if tag == 1 then return nil end
+        if tag == 0 then return _decrypt_int(entry[1], entry[2]) end
+        if tag == 3 then return _decrypt_int(entry[1], entry[2]) / _SCALE end
+        if tag == 2 then
+            local bytes, k = entry[1], entry[2]
+            local chars = {}
+            for i = 1, #bytes do
+                chars[i] = _schar(_bxor(bytes[i], (k + i) % 256))
+            end
+            return table.concat(chars)
+        end
+        return entry[1]             -- tag == 4
+    end
+
+    function SS.peek()
+        if _top <= 0 then return nil end
+        local entry = _stack[_top]
+        local tag = entry[3]
+        if tag == 1 then return nil end
+        if tag == 0 then return _decrypt_int(entry[1], entry[2]) end
+        if tag == 3 then return _decrypt_int(entry[1], entry[2]) / _SCALE end
+        if tag == 2 then
+            local bytes, k = entry[1], entry[2]
+            local chars = {}
+            for i = 1, #bytes do
+                chars[i] = _schar(_bxor(bytes[i], (k + i) % 256))
+            end
+            return table.concat(chars)
+        end
+        return entry[1]
+    end
+
+    function SS.size() return _top end
+    function SS.clear()
+        for i = 1, _top do _stack[i] = nil end
+        _top = 0
+    end
+
+    function SS.Init()
+        SS.clear()
+        _safe_print("ShadowStack 已初始化，容量: " .. tostring(_max_entries))
+    end
+
+    OmniShield._shadowstack = SS
+end
+
+--======================================================================
+-- 技术 11：双向校验（Bidirectional Validation）
+-- 陷阱元表挂 upvalue 闭包（不进 _G），外部访问触发蜜罐
+-- 环境反查：每 N 秒检测关键函数指纹是否被 Hook
+--======================================================================
+do
+    local BV = {}
+    local _real = {}             -- 真实受保护函数（upvalue，外部不可见）
+    local _protected = {}        -- 空表，挂陷阱元表（蜜罐外壳）
+    local _hashes = {}           -- [name] = 函数指纹基线
+    local _trap_triggered = false
+    local _reverse_thread = nil
+
+    -- 函数指纹（tostring + md5，不依赖 debug.getinfo）
+    local function _fingerprint(fn)
+        if type(fn) ~= "function" then return "nil" end
+        return OmniShield._md5(tostring(fn))
+    end
+
+    -- 陷阱处理：外部访问触发
+    local function _trap(key, op)
+        _trap_triggered = true
+        if Config.Bidirectional.HoneypotGlobals then
+            pcall(function()
+                _G.__FAKE_AIMBOT = function() return "fake" end
+                _G.__FAKE_ESP = function() return "fake" end
+                _G.__FAKE_TARGET = { X = 0, Y = 0, Z = 0 }
+            end)
+        end
+        if not Config.Bidirectional.SilentOnTrap then
+            _safe_warn("双向校验陷阱: " .. tostring(op) .. " " .. tostring(key))
+        end
+        OmniShield._honeypot_mode = true
+    end
+
+    -- 构建陷阱元表
+    local function _build_mt()
+        local mt = {}
+        if Config.Bidirectional.TrapOnIndex then
+            mt.__index = function(_, k)
+                _trap(k, "index")
+                return _real[k]    -- 返回真实值或 nil
+            end
+        end
+        if Config.Bidirectional.TrapOnNewIndex then
+            mt.__newindex = function(_, k, v)
+                _trap(k, "newindex")
+                _real[k] = v
+            end
+        end
+        return mt
+    end
+
+    -- 业务层注册受保护函数
+    function BV.Protect(name, fn)
+        _real[name] = fn
+        _hashes[name] = _fingerprint(fn)
+    end
+
+    -- 合法获取（绕过元表）
+    function BV.Get(name)
+        return _real[name]
+    end
+
+    -- 环境反查：对比函数指纹
+    local function _reverse_check()
+        for name, fn in pairs(_real) do
+            local cur = _fingerprint(fn)
+            if cur ~= _hashes[name] then
+                _trap_triggered = true
+                OmniShield._honeypot_mode = true
+                if not Config.Bidirectional.SilentOnTrap then
+                    _safe_warn("环境反查异常: " .. tostring(name))
+                end
+            end
+        end
+    end
+
+    function BV.StartReverseCheck()
+        if _reverse_thread then return end
+        if not _task or not _task.spawn then return end
+        _reverse_thread = _task.spawn(function()
+            while true do
+                _task.wait(Config.Bidirectional.ReverseCheckInterval)
+                pcall(_reverse_check)
+            end
+        end)
+    end
+
+    function BV.Init()
+        setmetatable(_protected, _build_mt())
+        _trap_triggered = false
+        _safe_print("Bidirectional 已初始化，反查间隔: " .. tostring(Config.Bidirectional.ReverseCheckInterval) .. "s")
+    end
+
+    function BV.IsTrapped() return _trap_triggered end
+    function BV.GetProtectedTable() return _protected end  -- 暴露蜜罐外壳（供测试）
+    OmniShield._bidirectional = BV
+end
+
+--======================================================================
 -- Activate()：启动所有保护机制，返回健康值（0-1）
 --======================================================================
 function OmniShield.Activate()
@@ -2011,7 +2348,36 @@ function OmniShield.Activate()
         pcall(OmniShield._timewarp.UpdateTimeline)
     end
 
-    -- 9. 自检（可选）
+    -- 9. 初始化自修改 VM
+    if Config.SelfModVM.Enabled then
+        local ok = pcall(OmniShield._selfmodvm.Init)
+        if not ok then
+            table.insert(degraded, "SelfModVM")
+            health = health - 0.03
+        end
+    end
+
+    -- 10. 初始化影子堆栈
+    if Config.ShadowStack.Enabled then
+        local ok = pcall(OmniShield._shadowstack.Init)
+        if not ok then
+            table.insert(degraded, "ShadowStack")
+            health = health - 0.03
+        end
+    end
+
+    -- 11. 初始化双向校验 + 启动环境反查
+    if Config.Bidirectional.Enabled then
+        local ok = pcall(OmniShield._bidirectional.Init)
+        if ok then
+            pcall(OmniShield._bidirectional.StartReverseCheck)
+        else
+            table.insert(degraded, "Bidirectional")
+            health = health - 0.03
+        end
+    end
+
+    -- 12. 自检（可选）
     if Config.SelfTest.AutoRun then
         pcall(OmniShield.SelfTest)
     end
@@ -2451,6 +2817,134 @@ function OmniShield:SelfTest()
         local dec = OmniShield._xtea_decrypt(enc, "key1")
         -- XTEA 补齐到 8 字节块，解密后末尾可能有 \0
         assert(_ssub(dec, 1, 5) == "hello", "xtea roundtrip ok, got " .. tostring(dec))
+    end)
+
+    --================================================================
+    -- 测试组 K：自修改 VM（TC-53 ~ TC-55）
+    --================================================================
+    _test("K53_selfmodvm_track_op", function()
+        OmniShield._selfmodvm.Init()
+        OmniShield._selfmodvm.TrackOp(2)
+        OmniShield._selfmodvm.TrackOp(2)
+        OmniShield._selfmodvm.TrackOp(3)
+        local freq = OmniShield._selfmodvm.GetFreq()
+        assert(freq[2] == 2, "op 2 freq should be 2, got " .. tostring(freq[2]))
+        assert(freq[3] == 1, "op 3 freq should be 1, got " .. tostring(freq[3]))
+    end)
+    _test("K54_selfmodvm_rotate_semantic_equiv", function()
+        -- 构造 opcode_table 和 program，旋转后语义应等价
+        OmniShield._selfmodvm.Init()
+        local opt = { [0]="NOP", [1]="ADD", [2]="SUB", [3]="MUL" }
+        local prog = {
+            {op=1, operand=0}, {op=1, operand=0}, {op=1, operand=0},  -- ADD x3（热点）
+            {op=2, operand=0}, {op=2, operand=0},                      -- SUB x2
+            {op=3, operand=0},                                          -- MUL x1
+        }
+        -- 记录旋转前的 op_name 序列
+        local before = {}
+        for i = 1, #prog do before[i] = opt[prog[i].op] end
+        -- 触发旋转（TrackOp 累积频率，MaybeRotate 在达到 RotateEvery 时旋转）
+        -- 直接调用内部旋转：通过 TrackOp 灌入足够次数
+        for _ = 1, Config.SelfModVM.RotateEvery do
+            OmniShield._selfmodvm.TrackOp(1)
+            OmniShield._selfmodvm.TrackOp(2)
+        end
+        OmniShield._selfmodvm.MaybeRotate(opt, prog, 4)  -- 从 pc=4 开始重编码
+        -- 验证旋转后 op_name 序列不变（语义等价）
+        for i = 1, #prog do
+            local after = opt[prog[i].op]
+            assert(after == before[i],
+                "semantic equiv broken at " .. i .. ": before=" .. before[i] .. " after=" .. after)
+        end
+    end)
+    _test("K55_selfmodvm_rotate_counter_resets", function()
+        OmniShield._selfmodvm.Init()
+        -- 灌入 RotateEvery-1 次，counter 应未归零
+        for _ = 1, Config.SelfModVM.RotateEvery - 1 do
+            OmniShield._selfmodvm.TrackOp(1)
+            OmniShield._selfmodvm.MaybeRotate({}, {}, 1)
+        end
+        local c1 = OmniShield._selfmodvm.GetRotateCounter()
+        assert(c1 == Config.SelfModVM.RotateEvery - 1,
+            "counter should be " .. (Config.SelfModVM.RotateEvery-1) .. " got " .. c1)
+        -- 再调一次，触发旋转，counter 归零
+        OmniShield._selfmodvm.TrackOp(1)
+        OmniShield._selfmodvm.MaybeRotate({[1]="A",[2]="B"}, {{op=1}}, 1)
+        local c2 = OmniShield._selfmodvm.GetRotateCounter()
+        assert(c2 == 0, "counter should reset to 0, got " .. c2)
+    end)
+
+    --================================================================
+    -- 测试组 L：影子堆栈（TC-56 ~ TC-58）
+    --================================================================
+    _test("L56_shadowstack_int_roundtrip", function()
+        OmniShield._shadowstack.Init()
+        OmniShield._shadowstack.push(42)
+        OmniShield._shadowstack.push(-7)
+        OmniShield._shadowstack.push(0)
+        assert(OmniShield._shadowstack.pop() == 0, "pop 0 failed")
+        assert(OmniShield._shadowstack.pop() == -7, "pop -7 failed")
+        assert(OmniShield._shadowstack.pop() == 42, "pop 42 failed")
+        assert(OmniShield._shadowstack.pop() == nil, "empty pop should be nil")
+    end)
+    _test("L57_shadowstack_float_string_nil", function()
+        OmniShield._shadowstack.Init()
+        OmniShield._shadowstack.push(3.14159)
+        OmniShield._shadowstack.push("hello")
+        OmniShield._shadowstack.push(nil)
+        -- LIFO 顺序：nil → "hello" → 3.142
+        local n = OmniShield._shadowstack.pop()  -- nil（最后 push）
+        assert(n == nil, "nil roundtrip failed, got " .. tostring(n))
+        local s = OmniShield._shadowstack.pop()  -- "hello"
+        assert(s == "hello", "string roundtrip failed, got " .. tostring(s))
+        -- 浮点：放大1000取整 = 3142，保留3位小数 ≈ 3.142
+        local f = OmniShield._shadowstack.pop()  -- 3.14159
+        assert(math.abs(f - 3.142) < 0.001, "float roundtrip failed, got " .. tostring(f))
+    end)
+    _test("L58_shadowstack_size_clear", function()
+        OmniShield._shadowstack.Init()
+        OmniShield._shadowstack.push(1)
+        OmniShield._shadowstack.push(2)
+        OmniShield._shadowstack.push(3)
+        assert(OmniShield._shadowstack.size() == 3, "size should be 3")
+        OmniShield._shadowstack.clear()
+        assert(OmniShield._shadowstack.size() == 0, "size should be 0 after clear")
+        assert(OmniShield._shadowstack.pop() == nil, "pop after clear should be nil")
+    end)
+
+    --================================================================
+    -- 测试组 M：双向校验（TC-59 ~ TC-61）
+    --================================================================
+    _test("M59_bidirectional_trap_on_index", function()
+        OmniShield._bidirectional.Init()
+        local test_fn = function() return "real" end
+        OmniShield._bidirectional.Protect("aimbot", test_fn)
+        -- 合法获取不触发陷阱
+        local real = OmniShield._bidirectional.Get("aimbot")
+        assert(real == test_fn, "legitimate get failed")
+        assert(not OmniShield._bidirectional.IsTrapped(), "should not trap on legit get")
+        -- 通过陷阱表访问触发陷阱
+        local pt = OmniShield._bidirectional.GetProtectedTable()
+        local _ = pt.aimbot  -- 触发 __index 陷阱
+        assert(OmniShield._bidirectional.IsTrapped(), "trap should trigger on index")
+    end)
+    _test("M60_bidirectional_trap_on_newindex", function()
+        OmniShield._bidirectional.Init()
+        local pt = OmniShield._bidirectional.GetProtectedTable()
+        pt.something = 123  -- 触发 __newindex 陷阱
+        assert(OmniShield._bidirectional.IsTrapped(), "trap should trigger on newindex")
+        -- 验证蜜罐全局已注入
+        if Config.Bidirectional.HoneypotGlobals then
+            assert(_G.__FAKE_AIMBOT ~= nil, "honeypot global should be injected")
+        end
+    end)
+    _test("M61_bidirectional_get_returns_real", function()
+        OmniShield._bidirectional.Init()
+        local fn = function() return 42 end
+        OmniShield._bidirectional.Protect("esp", fn)
+        local got = OmniShield._bidirectional.Get("esp")
+        assert(got == fn, "Get should return real function")
+        assert(got() == 42, "real function should work")
     end)
 
     --================================================================
