@@ -332,18 +332,38 @@ class _VMCompiler:
         return self._emit_source(params)
 
     def _emit_source(self, params: List[str]) -> str:
-        """生成解释器 Luau 源码。"""
+        """生成解释器 Luau 源码（含动态操作码映射 + JumpTable 跳转表）。
+
+        【动态操作码映射】
+        字节码里存「编译期随机物理码」（self.opcode 生成的随机数），
+        解释器启动时用运行时 seed（tick() + 内嵌盐）派生一张置换表
+        MAP[物理]→逻辑，再查 JumpTable[逻辑]=handler 分发。
+        关键：物理码在字节码里是固定的随机数，但 MAP 每次启动都不同
+        （因 tick 变化），逆向者 dump 一次源码拿到物理码后，仍需运行时
+        dump MAP 才能知道物理码对应的真实操作；且下次启动 MAP 变了，
+        上次的映射失效，无法制作通用反混淆器。
+
+        【JumpTable 跳转表】
+        把 if/elseif 链改为函数表 T[逻辑码](ins) 分发。逆向者无法在
+        固定行下断点（执行流在函数指针间跳转）。不引入自我篡改
+        （那会导致脚本自毁），仅靠动态映射+函数表即可扰乱断点。
+        """
         # 常量池表（整数常量输出为整数形式，避免 14.0 之类的浮点显示）
         def fmt_const(c):
             if isinstance(c, float) and c.is_integer():
                 return str(int(c))
             return repr(c)
         consts_lua = "{" + ", ".join(fmt_const(c) for c in self.consts) + "}"
-        # 程序表：每条指令是一个 {op, ...} 表
+
+        # 程序表：每条指令存「编译期随机物理码」+ 操作数。
+        # 物理码 = self.opcode[name]（编译期随机），固定写入字节码。
+        # 运行时 MAP[物理]=逻辑 把物理码翻译成 0/1/2/3 再查 JumpTable。
+        # 逆向者 dump 源码看到物理码（如 2,0,3,1），但不知哪个是 LOADK；
+        # 必须运行时 dump MAP，而 MAP 每次 tick 变化都不同。
         prog_lines = []
         for ins in self.prog:
             parts = []
-            for p in ins:
+            for idx, p in enumerate(ins):
                 if isinstance(p, tuple) and p and p[0] == "K":
                     parts.append(f'{{"K",{p[1]}}}')
                 elif isinstance(p, str):
@@ -357,48 +377,112 @@ class _VMCompiler:
 
         # 参数寄存器映射：params -> reg keys
         param_regs = [self._reg_of(p) for p in params]
-        # 解释器函数体
         param_str = ", ".join(params) if params else ""
 
-        # binop 分发（按编码顺序生成）
-        # bincode: op->code；反转得 code->op
+        # binop 分发（按编码顺序生成）—— 编码仍用编译期随机表
+        # d/a/b/c 是 h_binop 内的局部；R 是寄存器表的引用（实际为 r_var）
+        # 但此处生成时尚不知 r_var 名，故用占位符 __R__ 后替换
         code_to_op = {c: op for op, c in self.bincode.items()}
         op_dispatch = []
         for code in range(len(_VM_BINOPS)):
             op = code_to_op[code]
-            op_dispatch.append(f'if c=={code} then R[d]=R[a]{op}R[b] end')
+            op_dispatch.append(f'if c=={code} then __R__[d]=__R__[a]{op}__R__[b] end')
         op_disp_str = " ".join(op_dispatch)
 
-        # opcode 常量
-        O_LOADK = self.opcode["LOADK"]
-        O_MOVR = self.opcode["MOVR"]
-        O_BINOP = self.opcode["BINOP"]
-        O_RET = self.opcode["RET"]
+        # 运行时盐：每次混淆生成不同的盐值，增强 seed 不可预测性
+        salt = self.rng.randint(1, 0x7FFFFFFF)
+        # 编译期物理码（写入运行时 MAP 初始化，建立 物理->逻辑 映射）
+        P_LOADK = self.opcode["LOADK"]
+        P_MOVR = self.opcode["MOVR"]
+        P_BINOP = self.opcode["BINOP"]
+        P_RET = self.opcode["RET"]
+        # 解释器函数名 + 内部变量名（避免与用户变量冲突）
+        fn_name = self.gen.fresh()
+        map_var = self.gen.fresh()
+        seed_var = self.gen.fresh()
+        jt_var = self.gen.fresh()
+        i_var = self.gen.fresh()
+        ins_var = self.gen.fresh()
+        op_var = self.gen.fresh()
+        r_var = self.gen.fresh()
+        d_var = self.gen.fresh()
+        a_var = self.gen.fresh()
+        b_var = self.gen.fresh()
+        c_var = self.gen.fresh()
+        k_var = self.gen.fresh()
+
+        # JumpTable 的四个处理函数名
+        h_loadk = self.gen.fresh()
+        h_movr = self.gen.fresh()
+        h_binop = self.gen.fresh()
+        h_ret = self.gen.fresh()
 
         src = f'''
-local function {self.gen.fresh()}({param_str})
-    local R = {{}}
-    local C = {consts_lua}
+local function {fn_name}({param_str})
+    local {r_var} = {{}}
+    local _C = {consts_lua}
 '''
         # 参数装入寄存器
         for p, rk in zip(params, param_regs):
-            src += f'    R["{rk}"] = {p}\n'
-        src += f'    local P = {prog_lua}\n'
-        src += f'    for _i = 1, #P do\n'
-        src += f'        local ins = P[_i]\n'
-        src += f'        local op = ins[1]\n'
-        src += f'        if op == {O_LOADK} then\n'
-        src += f'            local k = ins[3]; R[ins[2]] = C[k[2] + 1]\n'
-        src += f'        elseif op == {O_MOVR} then\n'
-        src += f'            R[ins[2]] = R[ins[3]]\n'
-        src += f'        elseif op == {O_BINOP} then\n'
-        src += f'            local d, a, b, c = ins[2], ins[3], ins[4], ins[5]\n'
-        src += f'            {op_disp_str}\n'
-        src += f'        elseif op == {O_RET} then\n'
-        src += f'            return R[ins[2]]\n'
-        src += f'        end\n'
-        src += f'    end\n'
-        src += f'end\n'
+            src += f'    {r_var}["{rk}"] = {p}\n'
+        # 动态操作码映射：运行时用 tick()+盐 派生置换表
+        # 设计要点：
+        #   - 字节码存「编译期物理码」P = [P_LOADK, P_MOVR, P_BINOP, P_RET]（固定）
+        #   - 运行时生成随机置换 perm（4 元素排列，每次启动不同）
+        #   - MAP[P[i]] = perm[i]  （物理码 → 本次启动的逻辑码）
+        #   - JumpTable[perm[i]] = handler[i]  （逻辑码 → 对应 handler）
+        #   - handler[i] 按 [LOADK, MOVR, BINOP, RET] 固定顺序定义
+        #   - 执行时：logical = MAP[ins[1]]；JumpTable[logical](ins)
+        # 因 perm 每次启动随机，MAP 和 JumpTable 填充都随之变化，
+        # 逆向者 dump 一次源码拿到物理码后，仍需运行时 dump MAP 才能知道
+        # 物理码对应的真实操作；下次启动 perm 变化，映射失效。
+        src += f'''    local {seed_var} = (math.floor((tick() or 0) * 1000) ~ {salt}) % 2147483647
+    math.randomseed({seed_var})
+    local _phys = {{{P_LOADK}, {P_MOVR}, {P_BINOP}, {P_RET}}}
+    local _perm = {{0, 1, 2, 3}}
+    for _j = #_perm, 2, -1 do
+        local _q = math.random(1, _j)
+        _perm[_j], _perm[_q] = _perm[_q], _perm[_j]
+    end
+    local {map_var} = {{}}
+    {map_var}[_phys[1]] = _perm[1]
+    {map_var}[_phys[2]] = _perm[2]
+    {map_var}[_phys[3]] = _perm[3]
+    {map_var}[_phys[4]] = _perm[4]
+    local {jt_var} = {{}}
+    local function {h_loadk}(_ins)
+        local {k_var} = _ins[3]; {r_var}[_ins[2]] = _C[{k_var}[2] + 1]
+    end
+    local function {h_movr}(_ins)
+        {r_var}[_ins[2]] = {r_var}[_ins[3]]
+    end
+    local function {h_binop}(_ins)
+        local d, a, b, c = _ins[2], _ins[3], _ins[4], _ins[5]
+        {op_disp_str.replace("__R__", r_var)}
+    end
+    local function {h_ret}(_ins)
+        return {r_var}[_ins[2]]
+    end
+    -- JumpTable[逻辑码] = 处理函数。逻辑码 = _perm[i]，handler 按
+    -- [LOADK,MOVR,BINOP,RET] 顺序对应 _phys 顺序，故填 _perm[i] 槽位。
+    {jt_var}[_perm[1]] = {h_loadk}
+    {jt_var}[_perm[2]] = {h_movr}
+    {jt_var}[_perm[3]] = {h_binop}
+    {jt_var}[_perm[4]] = {h_ret}
+    local _P = {prog_lua}
+    for {i_var} = 1, #_P do
+        local {ins_var} = _P[{i_var}]
+        local {op_var} = {map_var}[{ins_var}[1]]
+        if {op_var} ~= nil then
+            local _h = {jt_var}[{op_var}]
+            if _h then
+                local _r = _h({ins_var})
+                if _r ~= nil then return _r end
+            end
+        end
+    end
+end
+'''
         # 注意：上面生成了一个 local function <name>(...) ... end
         # 调用方需替换原函数为该函数引用
         return src
