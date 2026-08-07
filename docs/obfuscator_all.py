@@ -2813,7 +2813,31 @@ class _VMCompiler:
     # ------------------------------------------------------------------
 
     def _emit_source(self, params) -> str:
-        """生成 PC 解释器 Luau 源码。"""
+        """生成 VM 解释器 Luau 源码（三层操作码防护 + JumpTable 跳转表）。
+
+        【第一层·编译期 _vk+pc 预编码】
+        操作码 ins[1] = variant + _vk + pc，运行时 ins[1] - _vk - pc 还原 variant。
+        用 +/- 运算符而非 xor——代码生成器会把 ~ 重写为 bit32.bxor（可 Hook），
+        而 +/- 是运算符，Lua 中无法 Hook。攻击者无法通过 Hook 函数记录操作码。
+
+        【第二层·变体映射 _D】
+        variant 经变体映射表 VM 得到 real_op（编译期固定，扰乱 variant↔real 关系）。
+
+        【第三层·运行时动态映射 MAP（提升·动态操作码）】
+        real_op 经运行时 perm 置换得到 logical。perm 由 tick()+盐 派生，
+        每次脚本启动都不同。逆向者 dump 一次源码拿到 _vk/VM/real_op 后，
+        仍需运行时 dump MAP 才能知道 real_op 对应的 logical；下次启动
+        perm 变化，映射失效，无法制作通用反混淆器。
+
+        【JumpTable 跳转表（提升·断点扰乱）】
+        if/elseif 链改为函数表 JT[logical](ins) 分发。逆向者无法在固定行
+        下断点（执行流在函数指针间跳转）。不引入自我篡改（那会自毁）。
+
+        跳转/返回处理：handler 通过 upvalue state（_pc/_ret/_rv）与主循环通信。
+          - JMP/CJMP/NJMP：修改 state._pc，返回 "j" 表示已跳转
+          - RET：设置 state._ret=true, state._rv=返回值表
+          - 其他：返回 nil，主循环 pc+1
+        """
         def fmt_const(c):
             if isinstance(c, float) and c.is_integer():
                 return str(int(c))
@@ -2824,23 +2848,14 @@ class _VMCompiler:
             return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
         strs_lua = "{" + ", ".join(fmt_str(s) for s in self.strs) + "}"
 
-        # 程序表（跳过 prog[0] 占位）
-        # v4 加固·本函数滚动密钥 _vk：操作码（ins 首元素）预编码为
-        # variant + _vk + pc，运行时内联 `ins[1] - _vk - pc` 还原 variant。
-        # pc 即指令在 P 中的 1-based 下标；跳转目标也是 pc，故密钥与位置绑定、
-        # 跳转安全（不依赖执行历史，循环/分支重复执行同一指令时密钥恒定）。
-        # 关键：用算术 +/- 而非 xor——代码生成器会把 ~ 重写为 bit32.bxor（可 Hook），
-        # 而 +/- 是运算符，Lua 中无法 Hook。故 VM 操作码解码无可 Hook 的函数调用，
-        # 攻击者无法通过 Hook bit32.bxor/_vm_bxor 记录操作码；须逐函数逆向各自 _vk
-        #（L2 重命名后为随机局部）并静态还原 ins[1]-_vk-pc，动态 Hook 完全失效。
+        # 程序表（跳过 prog[0] 占位）：操作码预编码为 variant + _vk + pc
         _vk = self.rng.randint(1, 0x7FFFFFFF)
         prog_lines = []
         for _pi, ins in enumerate(self.prog[1:]):
             parts = []
-            _pc = _pi + 1  # 1-based，与运行时 pc 一致
+            _pc = _pi + 1
             for _idx, p in enumerate(ins):
                 if _idx == 0:
-                    # 操作码：用本函数滚动密钥预编码（variant + _vk + pc）
                     parts.append(str(p + _vk + _pc))
                 elif isinstance(p, str):
                     parts.append(f'"{p}"')
@@ -2854,7 +2869,7 @@ class _VMCompiler:
         param_regs = [self._reg_of(p) for p in params]
         param_str = ", ".join(params) if params else ""
 
-        # binop 分发（按编码顺序）
+        # binop 分发（按编码顺序，用于 BINOP handler 内部）
         code_to_binop = {c: op for op, c in self.bincode.items()}
         bin_dispatch = []
         for code in range(len(_VM_BINOPS)):
@@ -2867,7 +2882,7 @@ class _VMCompiler:
                 bin_dispatch.append(f'if c=={code} then R[d]=R[a]{op}R[b] end')
         bin_disp_str = " ".join(bin_dispatch)
 
-        # unop 分发
+        # unop 分发（用于 UNOP handler 内部）
         code_to_unop = {c: op for op, c in self.uncode.items()}
         un_dispatch = []
         for code in range(len(_VM_UNOPS)):
@@ -2883,6 +2898,27 @@ class _VMCompiler:
         O = self.opcode
         fn_name = self.gen.fresh()
 
+        # 操作码固定顺序（与 handler 定义顺序一致）
+        _OP_ORDER = ["LOADK", "LOADSTR", "LOADBOOL", "LOADNIL", "MOVR",
+                     "BINOP", "UNOP", "RET", "CALL", "CALLV",
+                     "JMP", "CJMP", "NJMP", "GETTAB", "SETTAB",
+                     "NEWTAB", "GETUPV", "SETUPV", "GETGLOB"]
+        # 编译期 real_op 值列表（写入运行时 MAP 初始化）
+        op_vals_lua = "{" + ", ".join(str(O[n]) for n in _OP_ORDER) + "}"
+        _n_ops = len(_OP_ORDER)
+
+        # 运行时盐（每次混淆生成不同盐，增强 perm 不可预测性）
+        _salt = self.rng.randint(1, 0x7FFFFFFF)
+
+        # 内部变量名（避免与用户变量冲突）
+        map_var = self.gen.fresh()
+        jt_var = self.gen.fresh()
+        seed_var = self.gen.fresh()
+        perm_var = self.gen.fresh()
+        st_var = self.gen.fresh()   # 跳转/返回通信状态表
+        # handler 函数名
+        h_names = {n: self.gen.fresh() for n in _OP_ORDER}
+
         src = f'local function {fn_name}({param_str})\n'
         src += f'    local R = {{}}\n'
         src += f'    local C = {consts_lua}\n'
@@ -2897,10 +2933,10 @@ class _VMCompiler:
             src += f'    local G = {{}}\n'
             for i, name in enumerate(self._globals):
                 src += f'    G[{i + 1}] = {name}\n'
-        # 变体映射表（提升10）：把变体码映射回真实操作码
+        # 第二层：变体映射 _D
         var_map_items = []
         for vcode, rcode in self.variant_to_real.items():
-            if vcode != rcode:  # 只记录非平凡的映射
+            if vcode != rcode:
                 var_map_items.append(f'[{vcode}]={rcode}')
         if var_map_items:
             src += f'    local VM = {{{", ".join(var_map_items)}}}\n'
@@ -2909,69 +2945,114 @@ class _VMCompiler:
             src += f'    local function _D(c) return c end\n'
         src += f'    local P = {prog_lua}\n'
         src += f'    if _VM_PROGS then table.insert(_VM_PROGS, P) end\n'
-        src += f'    local pc = 1\n'
-        src += f'    local _yc = 0\n'
         src += f'    local _vk = {_vk}\n'
-        src += f'    while pc <= #P do\n'
-        src += f'        local ins = P[pc]\n'
-        src += f'        local op = _D(ins[1] - _vk - pc)\n'
-        src += f'        _yc = _yc + 1\n'
-        src += f'        if _yc >= 10000 then _yc = 0; if task and task.wait then task.wait() end end\n'
-        src += f'        if op == {O["LOADK"]} then\n'
-        src += f'            R[ins[2]] = C[ins[3] + 1]\n'
-        src += f'        elseif op == {O["LOADSTR"]} then\n'
-        src += f'            R[ins[2]] = S[ins[3] + 1]\n'
-        src += f'        elseif op == {O["LOADBOOL"]} then\n'
-        src += f'            R[ins[2]] = (ins[3] == 1)\n'
-        src += f'        elseif op == {O["LOADNIL"]} then\n'
-        src += f'            R[ins[2]] = nil\n'
-        src += f'        elseif op == {O["MOVR"]} then\n'
-        src += f'            R[ins[2]] = R[ins[3]]\n'
-        src += f'        elseif op == {O["BINOP"]} then\n'
-        src += f'            local d, a, b, c = ins[2], ins[3], ins[4], ins[5]\n'
-        src += f'            {bin_disp_str}\n'
-        src += f'        elseif op == {O["UNOP"]} then\n'
-        src += f'            local d, a, c = ins[2], ins[3], ins[4]\n'
-        src += f'            {un_disp_str}\n'
-        src += f'        elseif op == {O["RET"]} then\n'
-        src += f'            local n = ins[2]\n'
-        src += f'            if n == 0 then return end\n'
-        src += f'            if n == 1 then return R[ins[3]] end\n'
-        src += f'            return R[ins[3]], R[ins[4]], R[ins[5]], R[ins[6]], R[ins[7]]\n'
-        src += f'        elseif op == {O["CALL"]} then\n'
-        src += f'            local d, f, n = ins[2], ins[3], ins[4]\n'
-        src += f'            if n == 0 then R[d] = R[f]()\n'
-        src += f'            elseif n == 1 then R[d] = R[f](R[ins[5]])\n'
-        src += f'            elseif n == 2 then R[d] = R[f](R[ins[5]], R[ins[6]])\n'
-        src += f'            elseif n == 3 then R[d] = R[f](R[ins[5]], R[ins[6]], R[ins[7]])\n'
-        src += f'            else R[d] = R[f](R[ins[5]], R[ins[6]], R[ins[7]], R[ins[8]]) end\n'
-        src += f'        elseif op == {O["CALLV"]} then\n'
-        src += f'            local f, n = ins[2], ins[3]\n'
-        src += f'            if n == 0 then R[f]()\n'
-        src += f'            elseif n == 1 then R[f](R[ins[4]])\n'
-        src += f'            elseif n == 2 then R[f](R[ins[4]], R[ins[5]])\n'
-        src += f'            elseif n == 3 then R[f](R[ins[4]], R[ins[5]], R[ins[6]])\n'
-        src += f'            else R[f](R[ins[4]], R[ins[5]], R[ins[6]], R[ins[7]]) end\n'
-        src += f'        elseif op == {O["JMP"]} then\n'
-        src += f'            pc = ins[2]\n'
-        src += f'        elseif op == {O["CJMP"]} then\n'
-        src += f'            if R[ins[2]] then pc = ins[3] else pc = pc + 1 end\n'
-        src += f'        elseif op == {O["NJMP"]} then\n'
-        src += f'            if not R[ins[2]] then pc = ins[3] else pc = pc + 1 end\n'
-        src += f'        elseif op == {O["GETTAB"]} then\n'
-        src += f'            R[ins[2]] = R[ins[3]][R[ins[4]]]\n'
-        src += f'        elseif op == {O["SETTAB"]} then\n'
-        src += f'            R[ins[2]][R[ins[3]]] = R[ins[4]]\n'
-        src += f'        elseif op == {O["NEWTAB"]} then\n'
-        src += f'            R[ins[2]] = {{}}\n'
-        src += f'        elseif op == {O["GETUPV"]} then\n'
-        src += f'            R[ins[2]] = U[ins[3] + 1]\n'
-        src += f'        elseif op == {O["SETUPV"]} then\n'
-        src += f'            U[ins[2] + 1] = R[ins[3]]\n'
-        src += f'        elseif op == {O["GETGLOB"]} then\n'
-        src += f'            R[ins[2]] = G[ins[3] + 1]\n'
+        # 跳转/返回通信状态表（upvalue，handler 通过它与主循环通信）
+        src += f'    local {st_var} = {{_pc = 1, _ret = false, _rv = nil}}\n'
+        # 第三层：运行时动态操作码映射 perm（基于 tick+盐 派生）
+        # perm 是 1..N 的随机排列，每次启动 tick 不同 → perm 不同 → MAP 不同
+        # MAP[real_op] = logical，JT[logical] = handler
+        src += f'    local {seed_var} = (math.floor((tick() or 0) * 1000) ~ {_salt}) % 2147483647\n'
+        src += f'    math.randomseed({seed_var})\n'
+        src += f'    local _ov = {op_vals_lua}\n'
+        src += f'    local {perm_var} = {{}}\n'
+        src += f'    for _i = 1, {_n_ops} do {perm_var}[_i] = _i end\n'
+        src += f'    for _j = {_n_ops}, 2, -1 do\n'
+        src += f'        local _q = math.random(1, _j)\n'
+        src += f'        {perm_var}[_j], {perm_var}[_q] = {perm_var}[_q], {perm_var}[_j]\n'
+        src += f'    end\n'
+        src += f'    local {map_var} = {{}}\n'
+        src += f'    for _i = 1, {_n_ops} do {map_var}[_ov[_i]] = {perm_var}[_i] end\n'
+        # JumpTable 的 19 个 handler（按 _OP_ORDER 顺序定义）
+        # LOADK
+        src += f'    local function {h_names["LOADK"]}(_ins) R[_ins[2]] = C[_ins[3] + 1] end\n'
+        # LOADSTR
+        src += f'    local function {h_names["LOADSTR"]}(_ins) R[_ins[2]] = S[_ins[3] + 1] end\n'
+        # LOADBOOL
+        src += f'    local function {h_names["LOADBOOL"]}(_ins) R[_ins[2]] = (_ins[3] == 1) end\n'
+        # LOADNIL
+        src += f'    local function {h_names["LOADNIL"]}(_ins) R[_ins[2]] = nil end\n'
+        # MOVR
+        src += f'    local function {h_names["MOVR"]}(_ins) R[_ins[2]] = R[_ins[3]] end\n'
+        # BINOP
+        src += f'    local function {h_names["BINOP"]}(_ins) local d, a, b, c = _ins[2], _ins[3], _ins[4], _ins[5] {bin_disp_str} end\n'
+        # UNOP
+        src += f'    local function {h_names["UNOP"]}(_ins) local d, a, c = _ins[2], _ins[3], _ins[4] {un_disp_str} end\n'
+        # RET（设置 _ret/_rv，主循环检查并 return）
+        src += f'    local function {h_names["RET"]}(_ins)\n'
+        src += f'        local n = _ins[2]\n'
+        src += f'        if n == 0 then {st_var}._ret = true; {st_var}._rv = nil; return end\n'
+        src += f'        if n == 1 then {st_var}._ret = true; {st_var}._rv = R[_ins[3]]; return end\n'
+        src += f'        {st_var}._ret = true; {st_var}._rv = {{}}\n'
+        src += f'        for _k = 1, n do {st_var}._rv[_k] = R[_ins[2 + _k]] end\n'
+        src += f'    end\n'
+        # CALL
+        src += f'    local function {h_names["CALL"]}(_ins)\n'
+        src += f'        local d, f, n = _ins[2], _ins[3], _ins[4]\n'
+        src += f'        if n == 0 then R[d] = R[f]()\n'
+        src += f'        elseif n == 1 then R[d] = R[f](R[_ins[5]])\n'
+        src += f'        elseif n == 2 then R[d] = R[f](R[_ins[5]], R[_ins[6]])\n'
+        src += f'        elseif n == 3 then R[d] = R[f](R[_ins[5]], R[_ins[6]], R[_ins[7]])\n'
+        src += f'        else R[d] = R[f](R[_ins[5]], R[_ins[6]], R[_ins[7]], R[_ins[8]]) end\n'
+        src += f'    end\n'
+        # CALLV
+        src += f'    local function {h_names["CALLV"]}(_ins)\n'
+        src += f'        local f, n = _ins[2], _ins[3]\n'
+        src += f'        if n == 0 then R[f]()\n'
+        src += f'        elseif n == 1 then R[f](R[_ins[4]])\n'
+        src += f'        elseif n == 2 then R[f](R[_ins[4]], R[_ins[5]])\n'
+        src += f'        elseif n == 3 then R[f](R[_ins[4]], R[_ins[5]], R[_ins[6]])\n'
+        src += f'        else R[f](R[_ins[4]], R[_ins[5]], R[_ins[6]], R[_ins[7]]) end\n'
+        src += f'    end\n'
+        # JMP（设置 _pc，返回 "j" 表示已跳转）
+        src += f'    local function {h_names["JMP"]}(_ins) {st_var}._pc = _ins[2]; return "j" end\n'
+        # CJMP
+        src += f'    local function {h_names["CJMP"]}(_ins) if R[_ins[2]] then {st_var}._pc = _ins[3]; return "j" end end\n'
+        # NJMP
+        src += f'    local function {h_names["NJMP"]}(_ins) if not R[_ins[2]] then {st_var}._pc = _ins[3]; return "j" end end\n'
+        # GETTAB
+        src += f'    local function {h_names["GETTAB"]}(_ins) R[_ins[2]] = R[_ins[3]][R[_ins[4]]] end\n'
+        # SETTAB
+        src += f'    local function {h_names["SETTAB"]}(_ins) R[_ins[2]][R[_ins[3]]] = R[_ins[4]] end\n'
+        # NEWTAB
+        src += f'    local function {h_names["NEWTAB"]}(_ins) R[_ins[2]] = {{}} end\n'
+        # GETUPV
+        src += f'    local function {h_names["GETUPV"]}(_ins) R[_ins[2]] = U[_ins[3] + 1] end\n'
+        # SETUPV
+        src += f'    local function {h_names["SETUPV"]}(_ins) U[_ins[2] + 1] = R[_ins[3]] end\n'
+        # GETGLOB
+        src += f'    local function {h_names["GETGLOB"]}(_ins) R[_ins[2]] = G[_ins[3] + 1] end\n'
+        # JumpTable 填充：JT[perm[i]] = handler[i]（perm 每次启动随机，槽位随之变化）
+        src += f'    local {jt_var} = {{}}\n'
+        for i, n in enumerate(_OP_ORDER):
+            src += f'    {jt_var}[{perm_var}[{i + 1}]] = {h_names[n]}\n'
+        # 主循环：三层解码 + JumpTable 分发
+        src += f'    while {st_var}._pc <= #P and not {st_var}._ret do\n'
+        src += f'        local _pc = {st_var}._pc\n'
+        src += f'        local ins = P[_pc]\n'
+        src += f'        local _real = _D(ins[1] - _vk - _pc)\n'
+        src += f'        local _log = {map_var}[_real]\n'
+        src += f'        local _yc = (_pc % 10000)\n'
+        src += f'        if _yc == 0 then if task and task.wait then task.wait() end end\n'
+        src += f'        local _h = {jt_var}[_log]\n'
+        src += f'        if _h then\n'
+        src += f'            local _r = _h(ins)\n'
+        src += f'            if _r == "j" then\n'
+        src += f'                -- 已跳转，{st_var}._pc 已被 handler 设置\n'
+        src += f'            else\n'
+        src += f'                {st_var}._pc = _pc + 1\n'
+        src += f'            end\n'
+        src += f'        else\n'
+        src += f'            {st_var}._pc = _pc + 1\n'
         src += f'        end\n'
-        src += f'        if op ~= {O["JMP"]} and op ~= {O["CJMP"]} and op ~= {O["NJMP"]} then pc = pc + 1 end\n'
+        src += f'    end\n'
+        src += f'    if {st_var}._ret then\n'
+        src += f'        if {st_var}._rv == nil then return end\n'
+        src += f'        if type({st_var}._rv) == "table" then\n'
+        # 兼容 unpack：Lua 5.1 全局 unpack / 5.2+ table.unpack
+        src += f'            local _u = unpack or table.unpack\n'
+        src += f'            return _u({st_var}._rv)\n'
+        src += f'        end\n'
+        src += f'        return {st_var}._rv\n'
         src += f'    end\n'
         src += f'end\n'
         return src
