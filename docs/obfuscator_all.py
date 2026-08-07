@@ -4933,22 +4933,121 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
     # 33. request（HTTP 请求函数，执行器特有全局形式）
     req_block = _probe_global("request", "function", 33)
 
-    check_block = N("Do", body=(dbg_block_body + ge_block_body + hf_block_body
-                                 + ie_block_body + env_block_body
-                                 + gr_block_body + dr_block_body
-                                 + sh_block_body + tm_block_body
-                                 + ge0_block_body + cc_block_body
-                                 + glm_block_body + grs_block_body
-                                 + gcs_block_body + ilu_block_body
-                                 + hmm_block_body + grm_block_body
-                                 + sfe_block_body + sd_block_body
-                                 + syn_block + sync_block
-                                 + fti_block + fs_block
-                                 + gc_block + ggc_block
-                                 + guv_block + suv_block
-                                 + gr2_block + b64e_block
-                                 + ie2_block + pg_block
-                                 + upg_block + req_block))
+    # v7 检测点分散（薄弱点1增强）：
+    # 旧版所有检测塞进单个巨型 do-block，破解者定位一个 do-block 即可 patch 全部。
+    # 新版把 33 个检测块随机分成多组，每组独立 Do 节点（独立作用域），
+    # 组间插入计数器自增噪声语句，让 do-block 不相邻、位置随机。
+    # 破解者必须定位并 patch 全部分散的 do-block 才能绕过。
+    all_blocks = (dbg_block_body + ge_block_body + hf_block_body
+                  + ie_block_body + env_block_body
+                  + gr_block_body + dr_block_body
+                  + sh_block_body + tm_block_body
+                  + ge0_block_body + cc_block_body
+                  + glm_block_body + grs_block_body
+                  + gcs_block_body + ilu_block_body
+                  + hmm_block_body + grm_block_body
+                  + sfe_block_body + sd_block_body
+                  + syn_block + sync_block
+                  + fti_block + fs_block
+                  + gc_block + ggc_block
+                  + guv_block + suv_block
+                  + gr2_block + b64e_block
+                  + ie2_block + pg_block
+                  + upg_block + req_block)
+
+    # 按 If 语句边界切分成独立检测单元（每个单元 = LocalAssign + If）
+    units = []
+    i = 0
+    while i < len(all_blocks):
+        # 一个检测单元：LocalAssign + If（2 条），或单条
+        unit = [all_blocks[i]]
+        i += 1
+        if i < len(all_blocks) and all_blocks[i].type == "If":
+            unit.append(all_blocks[i])
+            i += 1
+        units.append(unit)
+
+    # 随机打散检测单元顺序（每次混淆不同，破解者无法用固定顺序定位）
+    rng.shuffle(units)
+
+    # 分成 5-8 组，每组独立 Do，组间插计数器噪声
+    n_groups = rng.randint(5, 8)
+    group_size = max(1, (len(units) + n_groups - 1) // n_groups)
+    dispersed = []
+    _disp_counter = gen.fresh()
+    dispersed.append(N("LocalAssign", names=[_disp_counter], exprs=[number_node(0)]))
+    for gi in range(0, len(units), group_size):
+        group = units[gi:gi + group_size]
+        group_body = []
+        for u in group:
+            group_body.extend(u)
+        dispersed.append(N("Do", body=group_body))
+        # 组间噪声：计数器自增（无副作用，但让 do-block 不相邻）
+        if gi + group_size < len(units):
+            dispersed.append(N("Do", body=[
+                N("Assign", targets=[name_node(_disp_counter)],
+                 exprs=[N("BinOp", op="+",
+                          left=name_node(_disp_counter),
+                          right=number_node(1))])
+            ]))
+
+    # v7 新增检测：getloadedmodules 数量异常（反混淆器注入会改变模块数）
+    glm_count_fn = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Call",
+            func=N("Name", name="getloadedmodules"), args=[])])
+    ])
+    glm_count_chk = N("Do", body=[
+        N("LocalAssign", names=["_glm_ok", "_glm_list"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=glm_count_fn)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("Name", name="_glm_ok"),
+                 right=N("BinOp", op="and",
+                         left=N("BinOp", op="~=",
+                                left=N("Call", func=N("Name", name="type"),
+                                       args=[N("Name", name="_glm_list")]),
+                                right=N("String", value="table")),
+                         right=N("BinOp", op="~=",
+                                 left=N("Name", name="_glm_list"),
+                                 right=N("Nil")))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ])
+    dispersed.append(glm_count_chk)
+
+    # v7 新增检测：tick() 连续采样差值异常（单步调试特征）
+    # 正常执行两次 tick() 差值极小（<0.001s），单步调试时差值显著放大
+    # 全 pcall 包裹，tick 不可用时静默跳过
+    tick_fn1 = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Call", func=N("Name", name="tick"), args=[])])])
+    tick_fn2 = N("Function", params=[], is_vararg=False, body=[
+        N("Return", exprs=[N("Call", func=N("Name", name="tick"), args=[])])])
+    tick_chk = N("Do", body=[
+        N("LocalAssign", names=["_tk1_ok", "_tk1"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=tick_fn1)])]),
+        N("LocalAssign", names=["_tk2_ok", "_tk2"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=tick_fn2)])]),
+        N("If",
+          cond=N("BinOp", op="and",
+                 left=N("BinOp", op="and",
+                        left=N("Name", name="_tk1_ok"),
+                        right=N("Name", name="_tk2_ok")),
+                 right=N("BinOp", op=">",
+                         left=N("BinOp", op="-",
+                                left=N("Name", name="_tk2"),
+                                right=N("Name", name="_tk1")),
+                         right=number_node(1))),
+          body=[N("Assign", targets=[N("Name", name=flag_name)],
+                  exprs=[N("True")])],
+          elifs=[], else_body=None),
+    ])
+    dispersed.append(tick_chk)
+
+    check_block = N("Do", body=dispersed)
 
     body = chunk.get("body")
     body.insert(0, check_block)
@@ -5412,14 +5511,36 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     prelude = []
 
     # 1) 全局保护标志 + 计数器表
+    #    v7 多 flag 交叉校验（薄弱点2增强）：
+    #    旧版所有检测写同一 flag，破解者 patch 单点即绕过全部检测。
+    #    新版引入 3 个独立子 flag（fa/fb/fc），各检测组写不同子 flag，
+    #    末尾交叉校验汇总到主 flag。子 flag 用指纹值（非 bool），
+    #    相互间有派生关系（fb 应等于 fa 派生），patch 任一会引发不一致。
     flag = gen.fresh()
     counter = gen.fresh()
+    fa = gen.fresh()  # 子 flag A：环境完整性组
+    fb = gen.fresh()  # 子 flag B：扩展环境组
+    fc = gen.fresh()  # 子 flag C：计数器/栈/时间组
+    # 指纹初值：各不相同，正常时三者满足派生关系
+    fa_init = rng.randint(1000, 9999)
+    fb_init = fa_init + 7        # fb 派生自 fa（+7）
+    fc_init = fa_init * 3 % 9973  # fc 派生自 fa（*3 mod 素数）
     prelude.append(N("LocalAssign", names=[flag], exprs=[N("False")]))
     prelude.append(N("LocalAssign", names=[counter],
                      exprs=[N("Table", fields=[])]))
+    prelude.append(N("LocalAssign", names=[fa], exprs=[number_node(fa_init)]))
+    prelude.append(N("LocalAssign", names=[fb], exprs=[number_node(fb_init)]))
+    prelude.append(N("LocalAssign", names=[fc], exprs=[number_node(fc_init)]))
 
-    # 2) 环境完整性检查（pcall 包裹）
-    def env_check(global_name: str, expected_type: str):
+    # 子 flag 篡改辅助：检测到异常时把子 flag 设为"污染值"（与初值不同）
+    def _taint(sub_flag_var: str):
+        """返回把子 flag 设为污染值的 Assign 节点。"""
+        return N("Assign", targets=[name_node(sub_flag_var)],
+                 exprs=[number_node(rng.randint(10000, 99999))])
+
+    # 2) 环境完整性检查（pcall 包裹）→ 写子 flag A
+    def env_check(global_name: str, expected_type: str, target=None):
+        tgt = target or flag
         # local ok, v = pcall(function() return <global_name> end)
         fn = N("Function", params=[], is_vararg=False, body=[
             N("Return", exprs=[name_node(global_name)])
@@ -5431,15 +5552,15 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                      left=name_node("ok"),
                      right=N("UnaryOp", op="not",
                              operand=_type_is(name_node("v"), expected_type))),
-              body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+              body=[_taint(tgt)],
               elifs=[], else_body=None),
         ]
         return N("Do", body=chk)
 
     env_block = N("Do", body=[
-        env_check("game", "userdata"),
-        env_check("workspace", "userdata"),
-        env_check("print", "function"),
+        env_check("game", "userdata", target=fa),
+        env_check("workspace", "userdata", target=fa),
+        env_check("print", "function", target=fa),
     ])
     prelude.append(env_block)
     stats["checks"] += 3
@@ -5452,27 +5573,28 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     #      提升11：再叠 13 项（assert/error/pcall/xpcall/select/next/
     #      rawget/rawset/rawequal/tonumber/math/os/coroutine），
     #      覆盖 Lua 标准库全部关键全局，环境篡改无所遁形。
+    # 扩展环境分两组写不同子 flag（避免 fb 成为新单点）
     ext_env_block = N("Do", body=[
-        env_check("type", "function"),
-        env_check("tostring", "function"),
-        env_check("pairs", "function"),
-        env_check("ipairs", "function"),
-        env_check("string", "table"),
-        env_check("table", "table"),
-        # 提升11 新增 13 项
-        env_check("assert", "function"),
-        env_check("error", "function"),
-        env_check("pcall", "function"),
-        env_check("xpcall", "function"),
-        env_check("select", "function"),
-        env_check("next", "function"),
-        env_check("rawget", "function"),
-        env_check("rawset", "function"),
-        env_check("rawequal", "function"),
-        env_check("tonumber", "function"),
-        env_check("math", "table"),
-        env_check("os", "table"),
-        env_check("coroutine", "table"),
+        env_check("type", "function", target=fb),
+        env_check("tostring", "function", target=fb),
+        env_check("pairs", "function", target=fb),
+        env_check("ipairs", "function", target=fb),
+        env_check("string", "table", target=fb),
+        env_check("table", "table", target=fb),
+        env_check("assert", "function", target=fb),
+        env_check("error", "function", target=fb),
+        env_check("pcall", "function", target=fb),
+        env_check("xpcall", "function", target=fb),
+        # 第二组写 fc
+        env_check("select", "function", target=fc),
+        env_check("next", "function", target=fc),
+        env_check("rawget", "function", target=fc),
+        env_check("rawset", "function", target=fc),
+        env_check("rawequal", "function", target=fc),
+        env_check("tonumber", "function", target=fc),
+        env_check("math", "table", target=fc),
+        env_check("os", "table", target=fc),
+        env_check("coroutine", "table", target=fc),
     ])
     prelude.append(ext_env_block)
     stats["checks"] += 19
@@ -5543,7 +5665,7 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     prelude.append(stack_chk)
     stats["checks"] += 1
 
-    # 7) 时间炸弹（可选）
+    # 7) 时间炸弹（可选）→ 写 fc
     if expire_ts is not None:
         tb_fn = N("Function", params=[], is_vararg=False, body=[
             N("Return", exprs=[N("Call",
@@ -5563,7 +5685,7 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                                            left=name_node("now"),
                                            right=number_node(0))),
                              right=number_node(int(expire_ts)))),
-              body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+              body=[_taint(fc)],
               elifs=[], else_body=None),
         ]))
         stats["checks"] += 1
@@ -5610,8 +5732,40 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
         cp_cond = N("BinOp", op="or", left=cp_cond, right=c)
     prelude.append(N("Do", body=[
         N("If", cond=cp_cond,
+          body=[_taint(fc)],
+          elifs=[], else_body=None),
+    ]))
+    stats["checks"] += 1
+
+    # 8.65) 多 flag 交叉校验汇总（薄弱点2增强核心）
+    #       校验 fa/fb/fc 三者是否仍满足派生关系：
+    #         fb == fa + 7   且   fc == (fa * 3) % 9973
+    #       任一子 flag 被污染（篡改）→ 派生关系破裂 → 主 flag = true（触发自毁/误导）
+    #       破解者必须同时 patch 三个子 flag 且保持派生关系一致，否则必被捕获。
+    #       用 ~= 检测（不等即异常），全 pcall 安全。
+    xcheck_fn = N("Function", params=[], is_vararg=False, body=[
+        N("LocalAssign", names=["_xa"], exprs=[name_node(fa)]),
+        N("LocalAssign", names=["_xb"], exprs=[name_node(fb)]),
+        N("LocalAssign", names=["_xc"], exprs=[name_node(fc)]),
+        N("If",
+          cond=N("BinOp", op="or",
+                 left=N("BinOp", op="~=",
+                        left=name_node("_xb"),
+                        right=N("BinOp", op="+",
+                                left=name_node("_xa"),
+                                right=number_node(7))),
+                 right=N("BinOp", op="~=",
+                         left=name_node("_xc"),
+                         right=N("BinOp", op="%",
+                                 left=N("BinOp", op="*",
+                                        left=name_node("_xa"),
+                                        right=number_node(3)),
+                                 right=number_node(9973)))),
           body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
           elifs=[], else_body=None),
+    ])
+    prelude.append(N("Do", body=[
+        N("LocalAssign", names=["_xok"], exprs=[_pcall(N("Paren", expr=xcheck_fn))]),
     ]))
     stats["checks"] += 1
 
@@ -5636,7 +5790,7 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                   exprs=[name_node("sv")])]),
     ]
 
-    # 定时校验函数体
+    # 定时校验函数体（环境类检测污染 fa，交叉校验下次汇总到 flag）
     verify_body = [
         # 1. 重跑环境检查：game 是否仍为 userdata（运行时 hook 检测）
         N("Do", body=[
@@ -5650,13 +5804,10 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                      left=name_node("tok"),
                      right=N("UnaryOp", op="not",
                              operand=_type_is(name_node("tv"), "userdata"))),
-              body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+              body=[_taint(fa)],
               elifs=[], else_body=None),
         ]),
         # v6 增量7：扩展周期性校验点——检测关键全局函数是否被 Hook 替换。
-        # print/type/pcall/string.byte 在正常运行中类型固定（function），
-        # 若被注入器 Hook 替换为非 function（如 table/proxy），说明环境被篡改。
-        # 不替换为空函数（避免破坏语义），仅设 flag 标记，由后续误导逻辑利用。
         N("Do", body=[
             N("LocalAssign", names=["_vk1", "_vv1"],
               exprs=[_pcall(N("Paren", expr=N("Function",
@@ -5670,7 +5821,7 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                              left=N("Call", func=N("Name", name="type"),
                                     args=[name_node("_vv1")]),
                              right=N("String", value="function"))),
-              body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+              body=[_taint(fa)],
               elifs=[], else_body=None),
         ]),
         N("Do", body=[
@@ -5686,7 +5837,7 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                              left=N("Call", func=N("Name", name="type"),
                                     args=[name_node("_vv2")]),
                              right=N("String", value="function"))),
-              body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
+              body=[_taint(fa)],
               elifs=[], else_body=None),
         ]),
         # 2. flag 被外部重置为 false 则恢复为 true（自动恢复）
@@ -6314,30 +6465,49 @@ def _pcall(expr: Node) -> Node:
 
 def _build_time_probe(gen: NameGenerator, rng: random.Random,
                       flag_name: str) -> Node:
-    """构造时间差异常探测块。
+    """构造时间差异常探测块（v7 多窗口滑动检测增强）。
+
+    旧版单次时间差 > 阈值即触发，破解者多跑几次比对即可识别诱饵。
+    新版记录最近 N 次采样到滑动窗口表，连续 M 次超阈值才触发 flag，
+    单次慢（GC/机器抖动）不误报，持续慢（单步调试）必触发。
 
     逻辑：
         local t1 = os.clock()        -- pcall 包裹
-        -- （此处由调用方插入若干真实语句，制造可测时间差）
+        -- 小循环制造可测时间差
         local t2 = os.clock()        -- pcall 包裹
-        if t1 and t2 and (t2 - t1) > <threshold> then
-            <flag_name> = true        -- 触发诱导
+        if t1 and t2 and (t2-t1) > threshold then
+            window[#window+1] = 1   -- 记一次慢
+            window.n = (window.n or 0) + 1
+        else
+            window[#window+1] = 0   -- 记一次正常
+            window.n = (window.n or 0) + 1
         end
-
-    阈值取较大值（如 0.5s），避免正常慢机器误报。
+        -- 滑动窗口：仅看最近 W 次，若其中慢次数 >= M 则 flag=true
+        if window.n >= W then
+            local slow = 0
+            for i = max(1, #window-W+1), #window do slow = slow + (window[i]==1 and 1 or 0) end
+            if slow >= M then <flag_name> = true end
+        end
     """
     t1ok = gen.fresh()
     t1 = gen.fresh()
     t2ok = gen.fresh()
     t2 = gen.fresh()
+    window = gen.fresh()
     threshold = rng.uniform(0.3, 1.5)  # 秒
+    W = rng.randint(3, 5)  # 滑动窗口大小
+    M = rng.randint(2, 3)  # 触发阈值（连续 M 次慢才触发）
     clock_fn = N("Function", params=[], is_vararg=False, body=[
         N("Return", exprs=[call_node(
             index_node(name_node("os"), string_node("clock")), [])])
     ])
-    # pcall 返回 (ok, val)：第一个是布尔 ok，第二个是 os.clock() 的值
-    # 故声明顺序为 [ok, val]，后续算术用 val（即 t1/t2）
+    slow_idx = gen.fresh()
+    slow_cnt = gen.fresh()
+    win_len = gen.fresh()
+    start_idx = gen.fresh()
     return N("Do", body=[
+        # 滑动窗口表初始化（首次进入时为空表）
+        N("LocalAssign", names=[window], exprs=[N("Table", fields=[])]),
         N("LocalAssign", names=[t1ok, t1], exprs=[
             _pcall(N("Paren", expr=clock_fn))
         ]),
@@ -6352,6 +6522,7 @@ def _build_time_probe(gen: NameGenerator, rng: random.Random,
                     index_node(name_node("os"), string_node("clock")), [])])
             ])))
         ]),
+        # 记录本次采样：慢(1)/正常(0) 追加到窗口表
         N("If",
           cond=N("BinOp", op="and",
                  left=N("BinOp", op="and",
@@ -6366,8 +6537,58 @@ def _build_time_probe(gen: NameGenerator, rng: random.Random,
                                         left=name_node(t2),
                                         right=name_node(t1))),
                                  right=number_node(round(threshold, 4))))),
-          body=[N("Assign", targets=[name_node(flag_name)],
-                  exprs=[N("True")])],
+          body=[N("Assign",
+                  targets=[N("Index", obj=name_node(window),
+                             key=N("BinOp", op="+",
+                                   left=N("UnaryOp", op="#",
+                                          operand=name_node(window)),
+                                   right=number_node(1)))],
+                  exprs=[number_node(1)])],
+          elifs=[],
+          else_body=[N("Assign",
+                  targets=[N("Index", obj=name_node(window),
+                             key=N("BinOp", op="+",
+                                   left=N("UnaryOp", op="#",
+                                          operand=name_node(window)),
+                                   right=number_node(1)))],
+                  exprs=[number_node(0)])]),
+        # 滑动窗口判定：窗口满 W 次后，统计最近 W 次的慢次数
+        N("LocalAssign", names=[win_len], exprs=[
+            N("UnaryOp", op="#", operand=name_node(window))]),
+        N("If",
+          cond=N("BinOp", op=">=",
+                 left=name_node(win_len),
+                 right=number_node(W)),
+          body=[N("Do", body=[
+              N("LocalAssign", names=[slow_cnt], exprs=[number_node(0)]),
+              N("LocalAssign", names=[start_idx], exprs=[
+                  N("BinOp", op="+",
+                    left=N("BinOp", op="-",
+                           left=name_node(win_len),
+                           right=number_node(W)),
+                    right=number_node(1))]),
+              N("NumericFor", var=slow_idx,
+                start=name_node(start_idx),
+                limit=name_node(win_len),
+                step=None,
+                body=[N("If",
+                  cond=N("BinOp", op="==",
+                         left=N("Index", obj=name_node(window),
+                                key=name_node(slow_idx)),
+                         right=number_node(1)),
+                  body=[N("Assign", targets=[name_node(slow_cnt)],
+                          exprs=[N("BinOp", op="+",
+                                   left=name_node(slow_cnt),
+                                   right=number_node(1))])],
+                  elifs=[], else_body=None)]),
+              N("If",
+                cond=N("BinOp", op=">=",
+                       left=name_node(slow_cnt),
+                       right=number_node(M)),
+                body=[N("Assign", targets=[name_node(flag_name)],
+                        exprs=[N("True")])],
+                elifs=[], else_body=None),
+          ])],
           elifs=[], else_body=None),
     ])
 
