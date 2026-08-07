@@ -830,8 +830,8 @@ do
 
                 -- Tech 9：自修改 VM 钩子（统计频率 + 每500条旋转映射+重编码）
                 if Config.SelfModVM.Enabled then
-                    OmniShield._selfmodvm.TrackOp(instr.op)
-                    OmniShield._selfmodvm.MaybeRotate(_vm2_opcode_table, program, pc)
+                    pcall(OmniShield._selfmodvm.TrackOp, instr.op)
+                    pcall(OmniShield._selfmodvm.MaybeRotate, _vm2_opcode_table, program, pc)
                 end
 
                 -- 反调试耦合：执行前检查蜜罐模式
@@ -2001,7 +2001,8 @@ do
         local swap = {}
         for i = 1, n, 2 do
             local a, b = sorted[i].id, sorted[i+1].id
-            if a ~= b then
+            -- 防护：a/b 必须都在 opcode_table 中存在才交换
+            if a ~= b and opcode_table[a] ~= nil and opcode_table[b] ~= nil then
                 swap[a] = b
                 swap[b] = a
                 -- 交换映射表
@@ -2011,10 +2012,12 @@ do
             end
         end
         -- 4. 单次遍历重编码（避免多对交换时重复遍历）
-        if next(swap) then
-            for i = pc, #program do
+        --    防护：pc 可能越界，用 math.max 限制
+        if next(swap) and pc <= #program then
+            local end_idx = #program
+            for i = pc, end_idx do
                 local instr = program[i]
-                if type(instr) == "table" and swap[instr.op] then
+                if type(instr) == "table" and instr.op ~= nil and swap[instr.op] then
                     instr.op = swap[instr.op]
                 end
             end
@@ -2104,11 +2107,18 @@ do
         elseif t == "nil" then
             _stack[_top] = { nil, nil, 1 }                    -- 1 = nil
         elseif t == "string" then
-            local bytes = {}
-            for i = 1, #value do
-                bytes[i] = _bxor(_sbyte(value, i), (k + i) % 256)
+            -- 限制字符串长度（防止超长字符串逐字节加密卡死）
+            local len = #value
+            if len > 4096 then
+                -- 超长字符串降级为引用存储（牺牲安全性换性能）
+                _stack[_top] = { value, k, 4 }                -- 4 = ref
+            else
+                local bytes = {}
+                for i = 1, len do
+                    bytes[i] = _bxor(_sbyte(value, i), (k + i) % 256)
+                end
+                _stack[_top] = { bytes, k, 2 }                -- 2 = string
             end
-            _stack[_top] = { bytes, k, 2 }                    -- 2 = string
         else
             _stack[_top] = { value, k, 4 }                    -- 4 = ref（表/函数）
         end
@@ -2186,8 +2196,11 @@ do
         return OmniShield._md5(tostring(fn))
     end
 
-    -- 陷阱处理：外部访问触发
+    -- 陷阱处理：外部访问触发（_in_trap 防递归）
+    local _in_trap = false
     local function _trap(key, op)
+        if _in_trap then return end  -- 防止元方法递归
+        _in_trap = true
         _trap_triggered = true
         if Config.Bidirectional.HoneypotGlobals then
             pcall(function()
@@ -2200,6 +2213,7 @@ do
             _safe_warn("双向校验陷阱: " .. tostring(op) .. " " .. tostring(key))
         end
         OmniShield._honeypot_mode = true
+        _in_trap = false
     end
 
     -- 构建陷阱元表
