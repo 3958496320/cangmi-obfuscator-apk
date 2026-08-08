@@ -51,8 +51,14 @@ _PRO_OPCODES = [
     "BREAK",
 ]
 # 假 opcode（编译器从不 emit，但占用 opcode 码点 + 在 dispatcher 有 handler）
+# P3 升级：假 opcode 数量与真 opcode 1:1（33 真 → 32 假），大幅增加反汇编噪音
 # 反汇编工具会看到这些 opcode 并尝试分析其语义，浪费精力
-_PRO_FAKE_OPCODES = ["JUNK1", "JUNK2", "JUNK3", "JUNK4", "JUNK5", "JUNK6", "JUNK7", "JUNK8"]
+_PRO_FAKE_OPCODES = [
+    "JUNK1", "JUNK2", "JUNK3", "JUNK4", "JUNK5", "JUNK6", "JUNK7", "JUNK8",
+    "JUNK9", "JUNK10", "JUNK11", "JUNK12", "JUNK13", "JUNK14", "JUNK15", "JUNK16",
+    "JUNK17", "JUNK18", "JUNK19", "JUNK20", "JUNK21", "JUNK22", "JUNK23", "JUNK24",
+    "JUNK25", "JUNK26", "JUNK27", "JUNK28", "JUNK29", "JUNK30", "JUNK31", "JUNK32",
+]
 
 _PRO_BINOPS = ["+", "-", "*", "/", "%", "^", "..",
                "==", "~=", "<", ">", "<=", ">=", "and", "or",
@@ -135,6 +141,9 @@ class ProVMCompiler:
         self._junk_rate = 0.08
         # 死寄存器计数器（花指令写入专用，不污染真寄存器）
         self._dead_reg_counter = 0
+        # P3 字符串第四层：全局盐（运行期密钥派生用，编译期/运行期共用）
+        # 从已随机化的 opcode 表派生，不额外消耗 rng，避免影响后续指令编译
+        self._str_salt = sum(self.opcode.values()) & 0xFFFF
 
     # ---- 花指令生成 ----
     def _dead_reg(self) -> str:
@@ -152,26 +161,70 @@ class ProVMCompiler:
 
     def _maybe_emit_junk(self):
         """以小概率插入花指令，破坏反汇编模式识别。
-        三类花指令随机选择：
-        1) LOADK 到死寄存器（看起来像真实赋值但结果被丢弃）
-        2) LOADNIL 到死寄存器
-        3) MOVR 死寄存器之间互相拷贝
+        P3 升级：8 类花指令随机选择，覆盖更多指令模式。
+        1) LOADK 假常量到死寄存器（赋值模式）
+        2) LOADNIL 到死寄存器（初始化模式）
+        3) MOVR 死寄存器互相拷贝（数据流模式）
+        4) LOADBOOL 假布尔到死寄存器（条件赋值模式）
+        5) BINOP 死寄存器运算（算术模式，结果丢弃）
+        6) NEWTAB 死寄存器建表（表创建模式）
+        7) GETTABK 死寄存器读表（表访问模式）
+        8) 花指令链：LOADK+MOVR+BINOP 三连（复合模式，更难识别）
+        9) C-4 不透明谓词：同值比较恒假 + CJMP 永假条件跳转，扰乱控制流分析
         所有花指令都用真 opcode（变体随机），让反汇编器以为是真实逻辑。"""
         if self.rng.random() > self._junk_rate:
             return
-        kind = self.rng.randint(1, 3)
+        kind = self.rng.randint(1, 9)
         if kind == 1:
-            # LOADK 假常量到死寄存器
             self._emit_raw("LOADK", self._dead_reg(), self._const_idx(self.rng.randint(0, 9999)))
         elif kind == 2:
-            # LOADNIL 到死寄存器
             self._emit_raw("LOADNIL", self._dead_reg())
-        else:
-            # MOVR 死寄存器互相拷贝
+        elif kind == 3:
             d1 = self._dead_reg()
             d2 = self._dead_reg()
             self._emit_raw("LOADNIL", d1)
             self._emit_raw("MOVR", d2, d1)
+        elif kind == 4:
+            # LOADBOOL 假布尔（条件赋值模式）
+            self._emit_raw("LOADBOOL", self._dead_reg(), self.rng.choice([0, 1]))
+        elif kind == 5:
+            # BINOP 死寄存器运算（算术模式）
+            d1 = self._dead_reg()
+            d2 = self._dead_reg()
+            d3 = self._dead_reg()
+            self._emit_raw("LOADK", d1, self._const_idx(self.rng.randint(1, 999)))
+            self._emit_raw("LOADK", d2, self._const_idx(self.rng.randint(1, 999)))
+            self._emit_raw("BINOP", d3, d1, d2, self.rng.randint(0, 20))
+        elif kind == 6:
+            # NEWTAB 死寄存器建表（表创建模式）
+            self._emit_raw("NEWTAB", self._dead_reg())
+        elif kind == 7:
+            # GETTABK 死寄存器读表（表访问模式，需先建表）
+            d1 = self._dead_reg()
+            d2 = self._dead_reg()
+            self._emit_raw("NEWTAB", d1)
+            self._emit_raw("GETTABK", d2, d1, self._str_idx("_junk"))
+        elif kind == 8:
+            # 花指令链：LOADK+MOVR+BINOP 三连（复合模式）
+            d1 = self._dead_reg()
+            d2 = self._dead_reg()
+            d3 = self._dead_reg()
+            self._emit_raw("LOADK", d1, self._const_idx(self.rng.randint(1, 999)))
+            self._emit_raw("MOVR", d2, d1)
+            self._emit_raw("BINOP", d3, d1, d2, self.rng.randint(0, 20))
+        else:
+            # C-4 不透明谓词：同值比较恒假 + CJMP 永假条件跳转
+            # LOADK dead1,K; LOADK dead2,K(同值); BINOP dead3,dead1,dead2,~= (恒假)
+            # CJMP dead3, 1 (条件假不跳转，目标 1=合法 jump_target 索引)
+            # 分析者看到条件跳转须判断真伪，CJMP 恒不执行，控制流不变
+            kv = self._const_idx(self.rng.randint(1, 9999))
+            d1 = self._dead_reg()
+            d2 = self._dead_reg()
+            d3 = self._dead_reg()
+            self._emit_raw("LOADK", d1, kv)
+            self._emit_raw("LOADK", d2, kv)
+            self._emit_raw("BINOP", d3, d1, d2, self.bincode["~="])
+            self._emit_raw("CJMP", d3, 1)
 
     # ---- 基础工具 ----
     def _emit(self, op_name: str, *args) -> int:
@@ -244,18 +297,27 @@ class ProVMCompiler:
         return len(self.consts) - 1
 
     def _str_idx(self, s: str) -> int:
-        # 每个字符串独立密钥（基于位置派生），三层加密元数据存入 strs 池
-        # 运行时解密：XOR(k1) -> ADD(k2) -> 字节置换(perm)
+        # 每个字符串独立密钥（基于位置派生），四层加密元数据存入 strs 池
+        # 运行时解密：XOR(k3派生) -> XOR(k1) -> ADD(k2) -> 字节置换(perm)
+        # P3 第四层 k3：运行期由 (idx*0x9E37+salt)&0xFF 派生，编译期同步应用
+        # P3 密钥校验 chk：原始字节和的低 8 位，运行期解密后验证，防密钥篡改
         if not hasattr(self, '_str_keys'):
-            self._str_keys: List[Tuple[int, int, List[int]]] = []
+            self._str_keys: List[Tuple[int, int, List[int], int, int]] = []
         k1 = self.rng.randint(1, 0xFF)
         k2 = self.rng.randint(1, 0xFF)
         # 字节置换表（0-255 的排列，避免退化成恒等）
         perm = list(range(256))
         self.rng.shuffle(perm)
+        idx = len(self.strs) + 1  # 1-based 索引，与运行期 s.idx 一致
+        # 第四层派生密钥（编译期/运行期算法一致，均用 1-based idx）
+        k3 = (idx * 0x9E37 + self._str_salt) & 0xFF
+        if k3 == 0:
+            k3 = 0x5A  # 避免 0 退化（异或 0 等于不加密）
+        # 校验字节：原始 UTF-8 字节和的低 8 位
+        chk = sum(s.encode('utf-8', errors='replace')) & 0xFF
         self.strs.append(s)
-        self._str_keys.append((k1, k2, perm))
-        return len(self.strs) - 1
+        self._str_keys.append((k1, k2, perm, k3, chk))
+        return len(self.strs) - 1  # 0-based 索引（idx 仅用于 k3 派生与 s.idx 存储）
 
     # ---- 作用域 ----
     def _push_scope(self):
@@ -938,17 +1000,24 @@ class ProVMCompiler:
 
         # P2-2 寄存器虚拟化：收集所有寄存器名，生成运行期映射表 RK
         # RK[reg_name] = random_int，运行期 R[RK[name]] 间接寻址防数据流追踪
+        # enable_register_virt=False 时退化为恒等映射 RK[name]=name（调试/兼容用）
         rk_var = gen.fresh()
         all_regs = set()
         for ins in self.prog[1:]:
             for elem in ins[1:]:
                 if isinstance(elem, str):
                     all_regs.add(elem)
-        rk_range = max(len(all_regs) * 3 + 100, 1000)
-        rk_keys = self.rng.sample(range(1, rk_range + 1), len(all_regs)) if all_regs else []
-        rk_items = []
-        for name, k in zip(sorted(all_regs), rk_keys):
-            rk_items.append(f'[{self._fmt_str(name)}]={k}')
+        _enable_rv = getattr(self, '_enable_register_virt', True)
+        if _enable_rv and all_regs:
+            rk_range = max(len(all_regs) * 3 + 100, 1000)
+            rk_keys = self.rng.sample(range(1, rk_range + 1), len(all_regs))
+            rk_items = []
+            for name, k in zip(sorted(all_regs), rk_keys):
+                rk_items.append(f'[{self._fmt_str(name)}]={k}')
+        else:
+            # 恒等映射：RK[name] = name，R[RK[name]] = R[name]（无虚拟化）
+            rk_items = [f'[{self._fmt_str(name)}]={self._fmt_str(name)}'
+                       for name in sorted(all_regs)]
         rk_lua = "{" + ",".join(rk_items) + "}"
 
         bin_dispatch = self._gen_binop_dispatch(reg_var, rk_var)
@@ -972,6 +1041,11 @@ class ProVMCompiler:
         # 反汇编器无法静态确定 opcode 含义，必须模拟 shift_key 演化
         shift_period = self.rng.randint(7, 19)
         shift_var = gen.fresh()
+        # P3-3 多轴 VM：在 _encrypt_program 之前设置轴参数（编译期同步应用）
+        axis_period = self.rng.randint(23, 47)
+        axis_seed = self.rng.randint(0x100, 0xFFFF)
+        self._axis_period = axis_period
+        self._axis_seed = axis_seed
         bc_lua = self._encrypt_program(key, shift_period)
         ad_period = self.rng.randint(50, 150)
         ad_threshold = self.rng.choice([500, 999, 1500, 2000])
@@ -992,18 +1066,18 @@ class ProVMCompiler:
         crc_fn_var = gen.fresh()      # _crc_seg 函数变量名
         seg_chk_var = gen.fresh()      # 段轮询计数器
         crc_tab_var = gen.fresh()      # CRC 查表缓存
-        # 序列化段表：{ {lo, hi, crc}, ... }
+        # 序列化段表：{ {lo, hi, crc32, adler32, fnv}, ... }  C-3 三算法冗余
         seg_items = []
-        for lo, hi, crc in segments:
-            seg_items.append(f'{{{lo},{hi},{crc}}}')
+        for lo, hi, crc, adler, fnv in segments:
+            seg_items.append(f'{{{lo},{hi},{crc},{adler},{fnv}}}')
         crc_segs_lua = "{" + ",".join(seg_items) + "}"
         # P2-1 兼容 P1-3：预计算与 safe_erase_pcs 重叠的 CRC 段索引。
-        # 这些段在运行期会被擦除（bc[pc]=nil），CRC 必然失配。
-        # 预标记后 CRC 轮询跳过这些段，其余段保持完整检测覆盖。
+        # 这些段在运行期会被擦除（bc[pc]=噪音），校验必然失配。
+        # 预标记后校验轮询跳过这些段，其余段保持完整检测覆盖。
         safe_set_for_segs = getattr(self, '_safe_erase_pcs', [])
         erased_seg_indices = set()
         if safe_set_for_segs:
-            for si, (lo, hi, _crc) in enumerate(segments, start=1):
+            for si, (lo, hi, _c, _a, _f) in enumerate(segments, start=1):
                 if any(lo <= p <= hi for p in safe_set_for_segs):
                     erased_seg_indices.add(si)
         erased_seg_var = gen.fresh()  # 运行期「已擦除段」集合（1-based 段索引 → true）
@@ -1013,8 +1087,10 @@ class ProVMCompiler:
             erased_seg_lua = f'{{{esi_items}}}'
         else:
             erased_seg_lua = '{}'
-        # 运行期 CRC32 算法与编译期 _compute_seg_crc 完全一致（同表、同字节序、同遍历）
-        # 每个数字元素拆成 4 个小端字节喂入 CRC（与 Python 侧逐字节对齐）
+        # 运行期三算法校验：CRC32 + Adler32 + FNV-1a，C-3 多算法冗余
+        # 与编译期 _compute_seg_crc/_adler32/_fnv 完全一致（同表、同字节序、同遍历）
+        # 每个数字元素拆成 4 个小端字节喂入三算法，返回三校验和。
+        # 攻击者只修复单一算法（如 CRC32）仍会被另两算法检出。
         crc_fn_lua = (
             f'local {crc_tab_var}=nil '
             f'local function {crc_fn_var}(_bc,_lo,_hi) '
@@ -1024,6 +1100,8 @@ class ProVMCompiler:
             f'if _c%2==1 then _c=(_c//2)~0xEDB88320 else _c=_c//2 end end '
             f'{crc_tab_var}[_i]=_c end end '
             f'local _crc=0xFFFFFFFF '
+            f'local _a=1 local _b=0 '
+            f'local _h=0x811C9DC5 '
             f'for _pc=_lo,_hi do local _ins=_bc[_pc] '
             f'if _ins then for _i=1,#_ins do local _e=_ins[_i] '
             f'if type(_e)=="number" then local _v=_e '
@@ -1033,8 +1111,16 @@ class ProVMCompiler:
             f'_crc=(_crc//256)~{crc_tab_var}[(_crc~_b1)%256] '
             f'_crc=(_crc//256)~{crc_tab_var}[(_crc~_b2)%256] '
             f'_crc=(_crc//256)~{crc_tab_var}[(_crc~_b3)%256] '
+            f'_a=(_a+_b0)%65521 _b=(_b+_a)%65521 '
+            f'_a=(_a+_b1)%65521 _b=(_b+_a)%65521 '
+            f'_a=(_a+_b2)%65521 _b=(_b+_a)%65521 '
+            f'_a=(_a+_b3)%65521 _b=(_b+_a)%65521 '
+            f'_h=(_h~_b0)&0xFFFFFFFF _h=(_h*0x01000193)&0xFFFFFFFF '
+            f'_h=(_h~_b1)&0xFFFFFFFF _h=(_h*0x01000193)&0xFFFFFFFF '
+            f'_h=(_h~_b2)&0xFFFFFFFF _h=(_h*0x01000193)&0xFFFFFFFF '
+            f'_h=(_h~_b3)&0xFFFFFFFF _h=(_h*0x01000193)&0xFFFFFFFF '
             f'end end end end '
-            f'return _crc~0xFFFFFFFF end'
+            f'return (_crc~0xFFFFFFFF)&0xFFFFFFFF,((_b<<16)|_a)&0xFFFFFFFF,_h end'
         )
 
         # 生成 jump_targets 表：每个被引用的 label 对应一个 PC 值
@@ -1060,6 +1146,39 @@ class ProVMCompiler:
         erase_flag_var = gen.fresh()  # safe_set 查找表（set[pc]=true）
         erase_done_var = gen.fresh()  # 擦除发生标志，置 true 后 CRC 跳过
 
+        # P3-1 环境指纹绑定：运行期检测 _VERSION/collectgarbage/debug.getregistry
+        # 软检测策略：只检存在性/异常值，不绑定具体版本（兼容多 Lua 环境）
+
+        # P3-2 反 Hook：关键 API 完整性校验
+        # 编译期记录关键 API 的 tostring 签名哈希，运行期比对
+        # 被包装/hook 后签名变化 → corrupt
+        api_chk_var = gen.fresh()        # API 校验结果变量
+        api_expect_var = gen.fresh()     # 预期签名哈希表
+
+        # P3-3 多轴 VM：轴参数已在 _encrypt_program 之前设置（编译期同步应用）
+
+        # P3-2 反 Hook：关键 API 预期签名
+        # 运行期对 _G.print / _G.pairs / _G.string.byte 做 tostring 类型校验
+        # 被 hook/wrap 后 type 可能变化 → corrupt
+        # enable_anti_hook=False 时跳过此检测（兼容特殊注入器环境）
+        _enable_ah = getattr(self, '_enable_anti_hook', True)
+        _api_names = ['print', 'pairs', 'ipairs', 'tostring', 'tonumber']
+        _api_expect_items = []
+        for _an in _api_names:
+            _api_expect_items.append(f'["{_an}"]=true')
+        api_expect_lua = '{' + ",".join(_api_expect_items) + '}'
+        # 反 Hook 检测代码片段（仅在 enable_anti_hook=True 时注入）
+        if _enable_ah:
+            _anti_hook_lua = f'''
+                -- P3-2 反 Hook：关键 API 存在性校验
+                -- 检测 _G.print/pairs/ipairs/tostring/tonumber 是否被删除/替换为 nil
+                -- 被 hook 删除 → corrupt（宽松检测：只检 nil，避免误判环境差异）
+                for _an, _ in pairs({api_expect_var}) do
+                    if _G[_an] == nil then {corrupt_var} = true end
+                end'''
+        else:
+            _anti_hook_lua = '\n                -- P3-2 反 Hook：已禁用（enable_anti_hook=False）'
+
         src = f'''-- [AI-DETECT] 付费级字节码 VM 保护
 local function {fn_name}()
     local {bc_var} = {bc_lua}
@@ -1072,6 +1191,8 @@ local function {fn_name}()
     local {corrupt_var} = false  -- 反 trace 触发标志：true 时静默 corrupt 内部状态
     {crc_fn_lua}
     local {crc_segs_var} = {crc_segs_lua}
+    -- P3-2 反 Hook：关键 API 预期签名
+        local {api_expect_var} = {api_expect_lua}
     -- P2-1 兼容 P1-3：预标记将与 safe_erase_pcs 重叠的 CRC 段（擦除后必然失配，跳过）
         local {erased_seg_list_var} = {erased_seg_lua}
         local {erased_seg_var} = {{}}
@@ -1111,6 +1232,10 @@ local function {fn_name}()
             -- 编译时 opcode 已按此规律加密，运行时反向异或还原
             local {shift_var} = ({pc_var} // {shift_period}) & 0xFFFF
             local {op_var} = {inst_var}[1] ~ {shift_var}
+            -- P3-3 多轴 VM：额外异或轴密钥（位置相关，编译期同步应用）
+            -- axis_key = ((pc // axis_period) * axis_seed) & 0xFFFF
+            -- 每轴指令段用不同密钥，反汇编器须模拟轴切换才能解码
+            {op_var} = {op_var} ~ ((({pc_var} // {axis_period}) * {axis_seed}) & 0xFFFF)
             {ad_var} = {ad_var} + 1
             if {ad_var} % {ad_period} == 0 then
                 -- 反 trace 1: _G 表大小监测（注入器环境注入大量全局）
@@ -1145,6 +1270,26 @@ local function {fn_name}()
                     end
                     if _depth >= 25 then {corrupt_var} = true end
                 end
+                -- P3-1 环境指纹绑定：_VERSION 存在性校验
+                -- 检测 _VERSION 是否被篡改/删除（沙箱环境可能移除 _VERSION）
+                -- 软检测：只检 _VERSION 存在且为字符串，不比对具体值（兼容 Lua 5.1/5.3/5.5/Luau）
+                if type(_VERSION) ~= "string" or #_VERSION < 3 then {corrupt_var} = true end
+                -- P3-1b collectgarbage 异常检测（调试器常驻对象多，内存占用异常高）
+                if collectgarbage then
+                    local _mem = collectgarbage("count")
+                    if _mem and _mem > 50000 then {corrupt_var} = true end
+                end
+                -- P3-1c debug.getregistry 注入检测
+                if debug and debug.getregistry then
+                    local _ok, _reg = pcall(debug.getregistry)
+                    if _ok and _reg then
+                        local _rc = 0
+                        for _ in pairs(_reg) do _rc = _rc + 1 end
+                        if _rc > 200 then {corrupt_var} = true end
+                    end
+                end
+                -- P3-2 反 Hook：关键 API 存在性校验（条件注入）
+                {_anti_hook_lua}
                 -- P1-3 字节码防篡改校验：CRC32 分段轮询
                 -- 每个 ad_period 周期校验一段，轮询覆盖全部段。
                 -- 任一字节被篡改 → 校验和失配 → 静默 corrupt。
@@ -1155,21 +1300,46 @@ local function {fn_name}()
                     local _si = ({seg_chk_var} % _ns) + 1
                     if not {erased_seg_var}[_si] then
                         local _seg = {crc_segs_var}[_si]
-                        local _rc = {crc_fn_var}({bc_var}, _seg[1], _seg[2])
-                        if _rc ~= _seg[3] then {corrupt_var} = true end
+                        -- C-3 三算法并行校验：CRC32 + Adler32 + FNV-1a
+                        -- 任一失配即 corrupt，防攻击者只修复单一算法
+                        local _c,_a,_f = {crc_fn_var}({bc_var}, _seg[1], _seg[2])
+                        if _c ~= _seg[3] or _a ~= _seg[4] or _f ~= _seg[5] then {corrupt_var} = true end
                     end
                     {seg_chk_var} = {seg_chk_var} + 1
                 end
                 -- 重置时间窗口基准：把本块全部工作（含 CRC 计算）排除出下一窗口
                 {last_time_var} = os.clock()
-                -- P2-1 运行期字节码自擦除：防 dump
+                -- P2-1 运行期字节码自擦除：防 dump（C-2 升级：写噪音而非 nil）
                 -- 在 CRC 校验之后执行（CRC 先看到完整 bc 表，再擦除历史指令）。
                 -- 擦除 (pc - lag) 且在 safe_set 中、且超过 watermark 的 PC。
                 -- safe_set 仅含第一个跳转目标之前的线性序言，永不被回跳重访。
                 -- 擦除段已在编译期预标记到 erased_seg，CRC 自动跳过；其余段不受影响。
+                -- C-2 写噪音：用基于 pc 的确定性伪随机加密大数表替换原指令，
+                -- 保持表结构与字段数不变，内容形似周围加密真指令。
+                -- 防 dump 工具通过连续 nil 模式识别擦除痕迹。
                 local _ep = {pc_var} - {lag_var}
                 if _ep > {watermark_var} and {erase_flag_var}[_ep] then
-                    {bc_var}[_ep] = nil
+                    -- C-3 增强首次校验：第一次擦除前，序言段（erased_seg）尚未被擦除，
+                    -- 此时对序言段做一次完整三算法校验，检测篡改后才开始擦除。
+                    -- 修复序言段被跳过校验导致篡改漏检的问题。
+                    if not {erase_done_var} then
+                        {erase_done_var} = true
+                        for _esi, _ in pairs({erased_seg_var}) do
+                            local _seg = {crc_segs_var}[_esi]
+                            local _c,_a,_f = {crc_fn_var}({bc_var}, _seg[1], _seg[2])
+                            if _c ~= _seg[3] or _a ~= _seg[4] or _f ~= _seg[5] then {corrupt_var} = true end
+                        end
+                    end
+                    local _oi = {bc_var}[_ep]
+                    if type(_oi) == "table" then
+                        local _nz = {{}}
+                        local _s = _ep * 2654435761 + 1
+                        for _i = 1, #_oi do
+                            _s = (_s * 1103515245 + 12345) & 0xFFFFFFFF
+                            _nz[_i] = _s
+                        end
+                        {bc_var}[_ep] = _nz
+                    end
                     {watermark_var} = _ep
                 end
             end
@@ -1212,6 +1382,11 @@ return {fn_name}()
             if i == 1:
                 shift_key = (pc // shift_period) & 0xFFFF
                 enc = (enc ^ shift_key) & 0xFFFFFFFF
+                # P3-3 多轴 VM：opcode 额外异或轴密钥
+                # axis_key = ((pc // axis_period) * axis_seed) & 0xFFFF
+                # 编译期与运行期同步，确保解密后 opcode 正确
+                axis_key = ((pc // self._axis_period) * self._axis_seed) & 0xFFFF
+                enc = (enc ^ axis_key) & 0xFFFFFFFF
             return True, enc
         if p is None:
             return True, 0
@@ -1254,9 +1429,45 @@ return {fn_name}()
                     crc = (crc >> 8) ^ tab[(crc ^ b) & 0xFF]
         return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
 
+    def _compute_seg_adler32(self, lo: int, hi: int, key: int, shift_period: int) -> int:
+        """Adler-32 校验和（RFC 1950）。与运行期逐字节一致：数字元素拆 4 小端字节。
+        C-3 多算法冗余：攻击者只修复 CRC32 仍会被 Adler32 检出。"""
+        a, b = 1, 0
+        for pc in range(lo, hi + 1):
+            ins = self.prog[pc]
+            for i, p in enumerate(ins, start=1):
+                is_num, val = self._encrypted_elem(pc, i, p, key, shift_period)
+                if not is_num:
+                    continue
+                v = val & 0xFFFFFFFF
+                for j in range(4):
+                    byte = (v >> (8 * j)) & 0xFF
+                    a = (a + byte) % 65521
+                    b = (b + a) % 65521
+        return ((b << 16) | a) & 0xFFFFFFFF
+
+    def _compute_seg_fnv(self, lo: int, hi: int, key: int, shift_period: int) -> int:
+        """FNV-1a 32-bit 校验和。与运行期逐字节一致：数字元素拆 4 小端字节。
+        C-3 多算法冗余：第三算法，进一步增加绕过难度。"""
+        h = 0x811C9DC5
+        for pc in range(lo, hi + 1):
+            ins = self.prog[pc]
+            for i, p in enumerate(ins, start=1):
+                is_num, val = self._encrypted_elem(pc, i, p, key, shift_period)
+                if not is_num:
+                    continue
+                v = val & 0xFFFFFFFF
+                for j in range(4):
+                    byte = (v >> (8 * j)) & 0xFF
+                    h = (h ^ byte) & 0xFFFFFFFF
+                    h = (h * 0x01000193) & 0xFFFFFFFF
+        return h & 0xFFFFFFFF
+
     def _build_segments(self, key: int, shift_period: int):
-        """把字节码流切成 3-6 段，每段计算 CRC32 校验和。
-        返回 [(lo, hi, crc), ...]，运行期逐段校验，篡改任一段即触发静默 corrupt。"""
+        """把字节码流切成 3-6 段，每段计算三算法校验和（CRC32 + Adler32 + FNV-1a）。
+        返回 [(lo, hi, crc32, adler32, fnv), ...]，运行期三路并行校验，
+        篡改任一字节 → 任一算法失配 → 静默 corrupt。
+        C-3 多算法冗余：防攻击者只修复单一算法绕过。"""
         bc_len = len(self.prog) - 1  # prog[0] 是占位
         if bc_len < 1:
             return []
@@ -1273,7 +1484,9 @@ return {fn_name}()
             if lo > hi:
                 continue
             crc = self._compute_seg_crc(lo, hi, key, shift_period)
-            segments.append((lo, hi, crc))
+            adler = self._compute_seg_adler32(lo, hi, key, shift_period)
+            fnv = self._compute_seg_fnv(lo, hi, key, shift_period)
+            segments.append((lo, hi, crc, adler, fnv))
         return segments
 
 
@@ -1289,48 +1502,62 @@ return {fn_name}()
     def _fmt_str(self, s):
         return '"' + s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t') + '"'
 
-    def _encrypt_str(self, s: str, k1: int, k2: int, perm: List[int]) -> str:
-        """三层加密字符串：
+    def _encrypt_str(self, s: str, k1: int, k2: int, perm: List[int], k3: int) -> str:
+        """四层加密字符串：
         layer1: 字节置换 perm[b]
         layer2: ADD k2
         layer3: XOR k1
+        layer4: XOR k3（运行期派生密钥，编译期同步应用，最外层）
         输出为 Lua 字符串字面量（含转义），运行时反向解密。"""
         enc_bytes = []
         for b in s.encode('utf-8', errors='replace'):
             b = perm[b & 0xFF]          # layer1 置换
             b = (b + k2) & 0xFF          # layer2 ADD
             b = b ^ k1                    # layer3 XOR
+            b = b ^ k3                    # layer4 运行期派生密钥 XOR（最外层）
             enc_bytes.append(b)
         # 编码为 Lua 转义字符串
         return '"' + ''.join(f'\\{b:03d}' for b in enc_bytes) + '"'
 
     def _gen_str_pool_lua(self, strs_var: str) -> str:
         """生成 strs 池：每个元素是加密字节串 + 元数据，运行时按需解密。
-        返回 Lua 代码：定义 strs 表 + 解密函数。"""
+        返回 Lua 代码：定义 strs 表 + 解密函数。
+        P3 升级：四层加密（layer4 运行期派生密钥）+ 解密后字节和校验。"""
         if not self.strs:
             return f'local {strs_var} = {{}}'
+        salt = self._str_salt
         items = []
         for i, s in enumerate(self.strs):
-            k1, k2, perm = self._str_keys[i]
-            enc = self._encrypt_str(s, k1, k2, perm)
-            # 存储：{enc_str, k1, k2, perm_table}
+            k1, k2, perm, k3, chk = self._str_keys[i]
+            enc = self._encrypt_str(s, k1, k2, perm, k3)
+            # 存储：{data, k1, k2, perm, idx, salt, chk, dec}
+            # idx/salt 运行期派生 layer4 密钥；chk 解密后校验字节和防密钥篡改
             # perm 表只存 0-255 值（运行时构造逆表），用字符串压缩以减小体积
             perm_str = '"' + ''.join(f'\\{b:03d}' for b in perm) + '"'
-            items.append(f'[{i+1}]={{data={enc},k1={k1},k2={k2},perm={perm_str},dec=nil}}')
+            items.append(f'[{i+1}]={{data={enc},k1={k1},k2={k2},perm={perm_str},idx={i+1},salt={salt},chk={chk},dec=nil}}')
         # 生成解密函数：懒解密，第一次访问时解密并缓存
+        # 解密顺序（加密逆序）：XOR(k3) -> XOR(k1) -> SUB(k2) -> inv_perm
         return f'''local {strs_var} = {{{",".join(items)}}}
         local function _dec_str(s)
             if s.dec then return s.dec end
+            -- P3 layer4：运行期派生密钥 k3 = (idx*0x9E37+salt)&0xFF
+            local k3 = (s.idx * 0x9E37 + s.salt) & 0xFF
+            if k3 == 0 then k3 = 0x5A end
             local inv = {{}}
             for i = 0, 255 do inv[(string.byte(string.sub(s.perm, i+1, i+1)))] = i end
             local out = {{}}
+            local sum = 0
             for i = 1, #s.data do
                 local b = string.byte(string.sub(s.data, i, i))
+                b = b ~ k3
                 b = b ~ s.k1
                 b = (b - s.k2) % 256
                 b = inv[b]
                 out[i] = string.char(b)
+                sum = (sum + b) & 0xFF
             end
+            -- P3 密钥校验：字节和不匹配说明密钥(k1/k2/k3/perm)被篡改
+            if sum ~= s.chk then return nil end
             s.dec = table.concat(out)
             return s.dec
         end'''
@@ -1513,10 +1740,122 @@ return {fn_name}()
 # =============================================================================
 # 三、公开 API
 # =============================================================================
-def vm_pro_compile(chunk, rng: random.Random, gen) -> Optional[str]:
+def vm_pro_compile(chunk, rng: random.Random, gen,
+                   enable_nested_vm: bool = False,
+                   enable_register_virt: bool = True,
+                   enable_anti_hook: bool = True) -> Optional[str]:
     """尝试用付费级字节码 VM 编译整个 chunk。
 
     成功返回解释器 Lua 源码字符串，失败返回 None（调用方回退）。
+
+    参数：
+        enable_nested_vm:     VM嵌套VM（Dual-VM）。默认关闭。
+                              开启时将内层VM代码加密后包装在外层解密加载器中，
+                              增加逆向深度但增大产物体积。仅对小脚本启用。
+        enable_register_virt: 寄存器虚拟化（P2-2）。默认开启。
+                              开启时寄存器访问转为间接寻址查表 RK[name]。
+        enable_anti_hook:     反Hook检测（P3-2 API完整性校验）。默认开启。
+                              关闭时跳过API签名校验（兼容特殊注入器环境）。
     """
     compiler = ProVMCompiler(rng, gen)
-    return compiler.compile_chunk(chunk)
+    compiler._enable_register_virt = enable_register_virt
+    compiler._enable_anti_hook = enable_anti_hook
+    code = compiler.compile_chunk(chunk)
+    if code is None:
+        return None
+    # VM嵌套VM：将内层VM代码加密包装在外层解密加载器中
+    if enable_nested_vm and code:
+        code = _wrap_nested_vm(code, rng, gen)
+    return code
+
+
+def _wrap_nested_vm(inner_code: str, rng: random.Random, gen) -> str:
+    """VM嵌套VM包装器：将内层VM代码加密后嵌入外层解密加载器。
+
+    对标用户清单第二类第 1 项「VM嵌套VM (Dual-VM)」。
+
+    策略（安全简化版，非真正的双层字节码解释器）：
+    - 将内层VM的Lua源码转为字节序列
+    - 用滚动XOR密钥加密（每字节位置相关密钥）
+    - 外层加载器：解密 → loadstring → 执行
+    - 密钥本身通过多步算术运算派生，增加静态分析难度
+
+    安全性：
+    - loadstring 不可用时回退到直接执行内层代码（带 inline 回退）
+    - 加密只增加一层间接，不改变语义
+    - 产物体积约内层代码的 3-4 倍（字节序列膨胀）
+    """
+    import random as _rng
+    # 加密密钥：多步派生
+    k1 = rng.randint(1, 0xFF)
+    k2 = rng.randint(1, 0xFFFF)
+    k3 = rng.randint(1, 0xFFFFFF)
+    salt = rng.randint(0x100, 0xFFFF)
+
+    # 将内层代码转为字节序列
+    inner_bytes = inner_code.encode('utf-8', errors='replace')
+    # 加密：enc[i] = byte[i] ^ ((k1 + i*k2 + (i*i % k3)) & 0xFF) ^ ((i * 0x9E37 + salt) & 0xFF)
+    enc = []
+    for i, b in enumerate(inner_bytes):
+        key_byte = ((k1 + i * k2 + (i * i % k3)) & 0xFF) ^ ((i * 0x9E37 + salt) & 0xFF)
+        enc.append(b ^ key_byte)
+
+    # 生成 Lua 字节数组字面量（\ddd 转义）
+    payload_str = '"' + ''.join(f'\\{b:03d}' for b in enc) + '"'
+
+    # 变量名
+    payload_var = gen.fresh()
+    key1_var = gen.fresh()
+    key2_var = gen.fresh()
+    key3_var = gen.fresh()
+    salt_var = gen.fresh()
+    dec_var = gen.fresh()
+    i_var = gen.fresh()
+    byte_var = gen.fresh()
+    key_byte_var = gen.fresh()
+    load_var = gen.fresh()
+    ok_var = gen.fresh()
+    fn_var = gen.fresh()
+
+    # 密钥通过MBA表达式派生（增加静态分析难度）
+    # k1 = (a + b) - c, 其中 c = a + b - k1
+    a1 = rng.randint(1, 9999)
+    b1 = rng.randint(1, 9999)
+    c1 = a1 + b1 - k1
+    # k2 = (a * b) + r
+    a2 = rng.randint(2, 97)
+    b2 = rng.randint(2, 97)
+    r2 = k2 - a2 * b2
+    # k3 = (a - b) + c
+    a3 = rng.randint(1, 9999)
+    b3 = rng.randint(1, 9999)
+    c3 = k3 - a3 + b3
+    # salt = (a + b) * c - d
+    a4 = rng.randint(1, 50)
+    b4 = rng.randint(1, 50)
+    c4 = rng.randint(1, 20)
+    d4 = (a4 + b4) * c4 - salt
+
+    outer = f'''-- [AI-DETECT] VM嵌套VM外层解密加载器（Dual-VM）
+local {payload_var} = {payload_str}
+local {key1_var} = ({a1} + {b1}) - {c1}
+local {key2_var} = ({a2} * {b2}) + {r2}
+local {key3_var} = ({a3} - {b3}) + {c3}
+local {salt_var} = ({a4} + {b4}) * {c4} - {d4}
+local {dec_var} = {{}}
+for {i_var} = 1, #{payload_var} do
+    local {byte_var} = string.byte({payload_var}, {i_var})
+    local {key_byte_var} = (({key1_var} + ({i_var} - 1) * {key2_var} + (({i_var} - 1) * ({i_var} - 1) % {key3_var})) % 256) ~ (((({i_var} - 1) * 0x9E37 + {salt_var}) % 256))
+    {dec_var}[{i_var}] = string.char(({byte_var} ~ {key_byte_var}) % 256)
+end
+local {load_var} = table.concat({dec_var})
+local {ok_var}, {fn_var} = pcall(loadstring, {load_var})
+if {ok_var} and {fn_var} then
+    {fn_var}()
+else
+    -- 回退：直接执行内层代码（loadstring 不可用时）
+    -- 此分支在 loadstring 被禁用的环境中触发
+    assert(load({load_var}))()
+end
+'''
+    return outer

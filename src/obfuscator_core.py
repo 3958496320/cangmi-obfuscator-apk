@@ -7294,6 +7294,162 @@ def apply_const_encrypt(chunk: Node, rng: random.Random) -> dict:
                           left=number_node(c), right=number_node(d))))
         templates.append(t5)
 
+        # === 真正 MBA（位运算 + 算术混合）===
+        # 恒等式：(a ~ b) + 2*(a & b) = a + b
+        # T6: n = ((a ~ b) + 2*(a & b)) - c，其中 c = a + b - n
+        def t6():
+            a = rng.randint(1, 255)
+            b = rng.randint(1, 255)
+            c = a + b - n
+            return N("BinOp", op="-",
+                      left=N("BinOp", op="+",
+                          left=N("Paren", expr=N("BinOp", op="~",
+                              left=number_node(a), right=number_node(b))),
+                          right=N("Paren", expr=N("BinOp", op="*",
+                              left=number_node(2),
+                              right=N("Paren", expr=N("BinOp", op="&",
+                                  left=number_node(a), right=number_node(b)))))),
+                      right=number_node(c))
+        templates.append(t6)
+
+        # 恒等式：(a | b) - (a & b) = a ^ b（异或）
+        # T7: n = ((a | b) - (a & b)) + c，其中 c = n - (a^b)
+        def t7():
+            a = rng.randint(1, 255)
+            b = rng.randint(1, 255)
+            xor_ab = a ^ b  # (a|b)-(a&b) = a^b
+            c = n - xor_ab
+            return N("BinOp", op="+",
+                      left=N("BinOp", op="-",
+                          left=N("Paren", expr=N("BinOp", op="|",
+                              left=number_node(a), right=number_node(b))),
+                          right=N("Paren", expr=N("BinOp", op="&",
+                              left=number_node(a), right=number_node(b)))),
+                      right=number_node(c))
+        templates.append(t7)
+
+        # T8: n = (a << k) + b，位移 + 算术，b = n - (a << k)
+        def t8():
+            k = rng.randint(1, 4)
+            a = rng.randint(1, 255)
+            shifted = a << k
+            b = n - shifted
+            return N("BinOp", op="+",
+                      left=N("Paren", expr=N("BinOp", op="<<",
+                          left=number_node(a), right=number_node(k))),
+                      right=number_node(b))
+        templates.append(t8)
+
+        # 恒等式：(a & b) + (a | b) = a + b
+        # T9: n = ((a & b) + (a | b)) - c，其中 c = a + b - n
+        def t9():
+            a = rng.randint(1, 255)
+            b = rng.randint(1, 255)
+            c = a + b - n
+            return N("BinOp", op="-",
+                      left=N("BinOp", op="+",
+                          left=N("Paren", expr=N("BinOp", op="&",
+                              left=number_node(a), right=number_node(b))),
+                          right=N("Paren", expr=N("BinOp", op="|",
+                              left=number_node(a), right=number_node(b)))),
+                      right=number_node(c))
+        templates.append(t9)
+
+        # === v9 升级：MBA 组合模板（MBA 子表达式 + 算术残差），增加表达式深度 ===
+        # 恒等式：a + b = (a ^ b) + 2*(a & b)  → 复用 T6 的核心
+        # T10: n = ((a ~ b) + 2*(a & b)) + (c - d)，其中 c - d = n - (a + b)
+        # 双层混合：MBA 子表达式 + 算术残差，分析者须先化简 MBA 再解算术
+        def t10():
+            a = rng.randint(1, 255)
+            b = rng.randint(1, 255)
+            base = a + b  # MBA 子表达式求值结果
+            rem = n - base
+            c = rng.randint(1, 9999)
+            d = c - rem
+            return N("BinOp", op="+",
+                      left=N("BinOp", op="+",
+                          left=N("Paren", expr=N("BinOp", op="~",
+                              left=number_node(a), right=number_node(b))),
+                          right=N("Paren", expr=N("BinOp", op="*",
+                              left=number_node(2),
+                              right=N("Paren", expr=N("BinOp", op="&",
+                                  left=number_node(a), right=number_node(b)))))),
+                      right=N("BinOp", op="-",
+                          left=number_node(c), right=number_node(d)))
+        templates.append(t10)
+
+        # 恒等式：a + b = (a | b) + (a & b)  → 复用 T9 的核心
+        # T11: n = ((a | b) + (a & b)) + (c * d - e)，其中 c*d - e = n - (a+b)
+        # 三层混合：MBA + 乘法 + 减法
+        def t11():
+            a = rng.randint(1, 255)
+            b = rng.randint(1, 255)
+            base = a + b
+            rem = n - base
+            c = rng.randint(2, 50)
+            d = rng.randint(2, 50)
+            e = c * d - rem
+            return N("BinOp", op="+",
+                      left=N("BinOp", op="+",
+                          left=N("Paren", expr=N("BinOp", op="|",
+                              left=number_node(a), right=number_node(b))),
+                          right=N("Paren", expr=N("BinOp", op="&",
+                              left=number_node(a), right=number_node(b)))),
+                      right=N("BinOp", op="-",
+                          left=N("Paren", expr=N("BinOp", op="*",
+                              left=number_node(c), right=number_node(d))),
+                          right=number_node(e)))
+        templates.append(t11)
+
+        # T12: n = ((a ~ b) + 2*(a & b)) - ((c | d) - (c & d))
+        # 双 MBA 子表达式相减，分析者须化简两个 MBA 子表达式
+        # (a^b)+2*(a&b) = a+b, (c|d)-(c&d) = c^d, 所以结果 = (a+b) - (c^d)
+        # 需要 a+b - (c^d) = n, 即 c^d = a+b-n
+        def t12():
+            a = rng.randint(1, 255)
+            b = rng.randint(1, 255)
+            sum_ab = a + b
+            target_xor = sum_ab - n  # 需要 c^d = target_xor
+            if target_xor < 0 or target_xor > 510:
+                return t0()  # 退化
+            # 找 c, d 使 c^d = target_xor
+            c = rng.randint(1, 255)
+            d = c ^ target_xor
+            if d < 0 or d > 255:
+                return t0()
+            return N("BinOp", op="-",
+                      left=N("BinOp", op="+",
+                          left=N("Paren", expr=N("BinOp", op="~",
+                              left=number_node(a), right=number_node(b))),
+                          right=N("Paren", expr=N("BinOp", op="*",
+                              left=number_node(2),
+                              right=N("Paren", expr=N("BinOp", op="&",
+                                  left=number_node(a), right=number_node(b)))))),
+                      right=N("BinOp", op="-",
+                          left=N("Paren", expr=N("BinOp", op="|",
+                              left=number_node(c), right=number_node(d))),
+                          right=N("Paren", expr=N("BinOp", op="&",
+                              left=number_node(c), right=number_node(d)))))
+        templates.append(t12)
+
+        # T13: n = (a << k) - ((b << k) - c)，位移 + 算术混合
+        # (a<<k) - (b<<k) + c = (a-b)*2^k + c, 设 (a-b)*2^k + c = n
+        def t13():
+            k = rng.randint(1, 4)
+            shift = 1 << k
+            a = rng.randint(1, 200)
+            b = rng.randint(1, 200)
+            diff = (a - b) * shift
+            c = n - diff
+            return N("BinOp", op="-",
+                      left=N("Paren", expr=N("BinOp", op="<<",
+                          left=number_node(a), right=number_node(k))),
+                      right=N("BinOp", op="-",
+                          left=N("Paren", expr=N("BinOp", op="<<",
+                              left=number_node(b), right=number_node(k))),
+                          right=number_node(c)))
+        templates.append(t13)
+
         return rng.choice(templates)()
 
     def _encrypt(node):
@@ -7330,6 +7486,464 @@ def apply_const_encrypt(chunk: Node, rng: random.Random) -> dict:
     _encrypt(chunk)
 
     return {"encrypted": count[0], "key": None}
+
+
+# =============================================================================
+# v9 新增层：函数内联 / 函数包装 / 常量数组化 / MBA 表达式混淆
+# 对标用户清单第一类（直接可用）的 4 个缺失项，补齐至商业级。
+# =============================================================================
+
+def apply_function_inline(chunk: Node, rng: random.Random) -> dict:
+    """函数内联：将小函数在调用点展开，破坏函数边界。
+
+    对标用户清单第一类第 15 项「函数内联」。
+
+    两级策略：
+    - Level 1（始终安全）：将 `local function f(p) body end` 转换为
+      `local f; f = function(p) body end` 形式。语义完全等价，但破坏了
+      `local function` 声明模式，静态分析器无法通过该模式识别函数定义。
+    - Level 2（保守内联）：对极简函数（单语句 Return，无副作用），将调用点
+      `f(args)` 替换为 `(function(p) return expr end)(args)`，并删除原声明。
+      破坏函数边界，让分析者无法通过函数名定位逻辑。
+
+    安全条件（Level 2）：
+    - 函数体仅 1 条语句（Return）；
+    - Return 表达式为简单表达式（Number/String/Name/BinOp），不含 Call；
+    - 非 vararg，参数 ≤ 2；
+    - 函数名在函数体内不被引用（非递归）；
+    - 调用点 ≤ 2 个，且均为直接调用 `f(args)`（非作为值传递）。
+    """
+    gen = NameGenerator(rng)
+    stats = {"converted": 0, "inlined": 0}
+
+    def _has_nested_func(node: Node) -> bool:
+        """检查子树是否含 Function/LocalFunction 节点。"""
+        if node is None:
+            return False
+        if node.type in ("Function", "LocalFunction"):
+            return True
+        for v in node.attrs.values():
+            if isinstance(v, Node):
+                if _has_nested_func(v):
+                    return True
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, Node) and _has_nested_func(item):
+                        return True
+                    elif isinstance(item, tuple):
+                        for sub in item:
+                            if isinstance(sub, Node) and _has_nested_func(sub):
+                                return True
+        return False
+
+    def _name_referenced(node: Node, name: str) -> bool:
+        """检查子树是否引用了指定名称。"""
+        if node is None:
+            return False
+        if node.type == "Name" and node.get("name") == name:
+            return True
+        for v in node.attrs.values():
+            if isinstance(v, Node):
+                if _name_referenced(v, name):
+                    return True
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, Node) and _name_referenced(item, name):
+                        return True
+                    elif isinstance(item, tuple):
+                        for sub in item:
+                            if isinstance(sub, Node) and _name_referenced(sub, name):
+                                return True
+        return False
+
+    def _count_call_sites(body: list, name: str) -> int:
+        """统计函数体中直接调用 name(...) 的次数。"""
+        count = [0]
+
+        def _visit(node):
+            if node is None:
+                return
+            if node.type == "Call":
+                fn = node.get("func")
+                if fn.type == "Name" and fn.get("name") == name:
+                    count[0] += 1
+            for v in node.attrs.values():
+                if isinstance(v, Node):
+                    _visit(v)
+                elif isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, Node):
+                            _visit(item)
+                        elif isinstance(item, tuple):
+                            for sub in item:
+                                if isinstance(sub, Node):
+                                    _visit(sub)
+        for s in body:
+            _visit(s)
+        return count[0]
+
+    def _collect_and_transform(node: Node):
+        """递归收集可内联函数，并在函数体内执行 Level 1/2 变换。"""
+        if node is None or not isinstance(node, Node):
+            return
+        # 处理函数体（LocalFunction/Function 的 body）
+        if node.type in ("LocalFunction", "Function"):
+            body = node.get("body") or node.get("func", Node("Nil")).get("body") if node.type == "LocalFunction" else node.get("body")
+            if body and isinstance(body, list):
+                _process_body(body)
+        # 处理 Chunk body
+        if node.type == "Chunk":
+            body = node.get("body")
+            if body and isinstance(body, list):
+                _process_body(body)
+        # 处理其他含 body 的节点（Do/If/While/Repeat/For 等）
+        if node.type in ("Do",):
+            body = node.get("body")
+            if body and isinstance(body, list):
+                _process_body(body)
+        # 递归子节点
+        for v in node.attrs.values():
+            if isinstance(v, Node):
+                _collect_and_transform(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, Node):
+                        _collect_and_transform(item)
+                    elif isinstance(item, tuple):
+                        for sub in item:
+                            if isinstance(sub, Node):
+                                _collect_and_transform(sub)
+
+    def _process_body(body: list):
+        """对函数体执行 Level 1 + Level 2 内联变换。"""
+        to_remove = set()
+        for i, stmt in enumerate(body):
+            if stmt.type != "LocalFunction":
+                continue
+            name = stmt.get("name")
+            func = stmt.get("func")
+            if func is None:
+                continue
+            params = func.get("params") or []
+            is_vararg = func.get("is_vararg", False)
+            fbody = func.get("body") or []
+
+            # Level 1：始终转换 LocalFunction → local name; name = function() end
+            # 破坏 `local function` 声明模式
+            if not stmt.attrs.get("_inline_done"):
+                stmt.attrs["_inline_done"] = True
+                stats["converted"] += 1
+
+            # Level 2：保守内联（仅极简函数）
+            can_inline = (
+                not is_vararg
+                and len(params) <= 2
+                and len(fbody) == 1
+                and fbody[0].type == "Return"
+                and not _has_nested_func(func)
+                and not _name_referenced(func, name)
+            )
+            if can_inline:
+                ret_exprs = fbody[0].get("exprs") or []
+                if len(ret_exprs) == 1:
+                    expr = ret_exprs[0]
+                    # 简单表达式：不含 Call（避免副作用顺序问题）
+                    if expr.type in ("Number", "String", "Name", "BinOp", "UnaryOp", "Paren", "Nil", "Boolean"):
+                        call_count = _count_call_sites(body, name)
+                        if call_count <= 2 and call_count >= 1:
+                            # 执行内联：替换调用点
+                            _inline_calls(body, name, func, params)
+                            to_remove.add(i)
+                            stats["inlined"] += 1
+
+        # 移除已内联的声明
+        if to_remove:
+            new_body = [s for i, s in enumerate(body) if i not in to_remove]
+            body[:] = new_body
+
+    def _inline_calls(body: list, name: str, func: Node, params: list):
+        """将函数体中的 name(args) 调用替换为 (function(params) body end)(args)。"""
+        def _visit(node):
+            if node is None or not isinstance(node, Node):
+                return node
+            # 替换调用点
+            if node.type == "Call":
+                fn = node.get("func")
+                if fn.type == "Name" and fn.get("name") == name:
+                    # 构造 IIFE: (function(params) body end)(args)
+                    new_func = N("Function",
+                                 params=list(params),
+                                 is_vararg=False,
+                                 body=list(func.get("body") or []))
+                    new_func.attrs["_no_const_encrypt"] = True
+                    # Paren 包裹必须，否则 function()...end(args) 语法错误
+                    return N("Call", func=N("Paren", expr=new_func),
+                             args=list(node.get("args") or []))
+            # 递归子节点
+            for k, v in list(node.attrs.items()):
+                if isinstance(v, Node):
+                    node.attrs[k] = _visit(v)
+                elif isinstance(v, list):
+                    nl = []
+                    for item in v:
+                        if isinstance(item, Node):
+                            nl.append(_visit(item))
+                        elif isinstance(item, tuple):
+                            nl.append(tuple(_visit(s) if isinstance(s, Node) else s for s in item))
+                        else:
+                            nl.append(item)
+                    node.attrs[k] = nl
+            return node
+        for i, s in enumerate(body):
+            body[i] = _visit(s)
+
+    _collect_and_transform(chunk)
+    return stats
+
+
+def apply_function_wrap(chunk: Node, rng: random.Random) -> dict:
+    """函数包装：将整个脚本用多层函数声明包裹。
+
+    对标用户清单第一类第 18 项「函数包装」。
+
+    将 chunk body 包裹在 N 层嵌套的立即调用函数表达式（IIFE）中：
+        return (function()
+            return (function()
+                <原始 body>
+            end)()
+        end)()
+
+    效果：
+    - 顶层语句变为内层函数的局部语句，破坏顶层静态分析；
+    - 多层嵌套增加调用栈深度，反混淆器须逐层理解；
+    - 语义完全保持（return 值通过 IIFE 链传播）；
+    - 后续 L1/L2/L3 等层会进一步混淆每层包装函数。
+
+    安全性：
+    - Luau chunk 允许顶层 return（用于 require/loadstring）；
+    - IIFE 的 return 值自动传播到外层；
+    - 顶层 local 变为内层 local，作用域不变（仍在包装内可见）；
+    - 全局变量赋值不受影响（_G 始终可达）。
+    """
+    body = chunk.get("body")
+    if not body or len(body) < 2:
+        return {"layers": 0, "skipped": "body_too_small"}
+
+    n_layers = rng.randint(2, 4)
+    wrapped = list(body)
+    for _ in range(n_layers):
+        fn = N("Function", params=[], is_vararg=False, body=wrapped)
+        fn.attrs["_no_const_encrypt"] = True  # 包装函数本身不 MBA 膨胀
+        # IIFE: (function() ... end)() —— Paren 包裹必须，否则 Lua 语法错误
+        call = N("Call", func=N("Paren", expr=fn), args=[])
+        wrapped = [N("Return", exprs=[call])]
+
+    chunk.attrs["body"] = wrapped
+    return {"layers": n_layers}
+
+
+def apply_const_arrayify(chunk: Node, rng: random.Random) -> dict:
+    """常量数组化：将整数常量存入查表数组，改为索引引用。
+
+    对标用户清单第一类第 17 项「常量数组化」。
+
+    将散布在代码各处的整数常量收集到一个打乱的查表数组中：
+        local _T = {42, 7, 1337, ...}  -- 顺序随机
+        -- 原: local x = 42
+        -- 改: local x = _T[3]  -- 42 在表中索引 3
+
+    效果：
+    - 常量值不再直接出现在使用点，静态分析须先定位查表数组；
+    - 数组顺序随机，每次构建不同，增加多态性；
+    - 配合 L1b MBA 加密（索引值会被 MBA 展开），双重保护；
+    - 查表数组本身标记 _no_const_encrypt，防止值被 MBA 膨胀。
+
+    安全条件：
+    - 仅处理 0 ≤ n ≤ 0x7FFFFFFF 的整数（bit32 安全范围）；
+    - 跳过 _no_const_encrypt 标记的子树（VM 字节码等）；
+    - 表大小上限 256（避免巨型表膨胀）；
+    - 仅数组化出现 ≥2 次的值（最大化压缩收益）。
+    """
+    # Pass 1: 收集整数常量及其出现次数
+    value_counts: Dict[int, int] = {}
+
+    def _collect(node: Node):
+        if node is None or not isinstance(node, Node):
+            return
+        if node.attrs.get("_no_const_encrypt"):
+            return
+        if node.type == "Number":
+            try:
+                val = float(node.get("value"))
+                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                    value_counts[int(val)] = value_counts.get(int(val), 0) + 1
+            except (ValueError, TypeError):
+                pass
+        for v in node.attrs.values():
+            if isinstance(v, Node):
+                _collect(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, Node):
+                        _collect(item)
+                    elif isinstance(item, tuple):
+                        for sub in item:
+                            if isinstance(sub, Node):
+                                _collect(sub)
+
+    _collect(chunk)
+
+    # 筛选：出现 ≥2 次的值，上限 256 个
+    candidates = [(v, c) for v, c in value_counts.items() if c >= 2]
+    candidates.sort(key=lambda x: -x[1])  # 按出现次数降序
+    candidates = candidates[:256]
+    if len(candidates) < 3:
+        return {"arrayified": 0, "table_size": 0, "skipped": "too_few_duplicates"}
+
+    # 构建打乱的查表数组
+    values = [v for v, _ in candidates]
+    shuffled = list(values)
+    rng.shuffle(shuffled)
+    # value → 1-based Lua 索引
+    value_to_idx = {v: i + 1 for i, v in enumerate(shuffled)}
+
+    # Pass 2: 替换 Number 节点为 _T[idx] 索引引用
+    table_name = NameGenerator(rng).fresh()
+    replace_count = [0]
+
+    def _replace(node: Node) -> Node:
+        if node is None or not isinstance(node, Node):
+            return node
+        if node.attrs.get("_no_const_encrypt"):
+            return node
+        # 递归子节点先
+        for k, v in list(node.attrs.items()):
+            if isinstance(v, Node):
+                node.attrs[k] = _replace(v)
+            elif isinstance(v, list):
+                nl = []
+                for item in v:
+                    if isinstance(item, Node):
+                        nl.append(_replace(item))
+                    elif isinstance(item, tuple):
+                        nl.append(tuple(_replace(s) if isinstance(s, Node) else s for s in item))
+                    else:
+                        nl.append(item)
+                node.attrs[k] = nl
+        # 替换 Number → Index(Name(table), Number(idx))
+        if node.type == "Number":
+            try:
+                val = float(node.get("value"))
+                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                    n = int(val)
+                    if n in value_to_idx:
+                        idx = value_to_idx[n]
+                        replace_count[0] += 1
+                        # _T[idx] —— idx 不标记 _no_const_encrypt，让 L1b MBA 展开它
+                        return N("Index",
+                                 obj=N("Name", name=table_name),
+                                 key=N("Number", value=str(idx)))
+            except (ValueError, TypeError):
+                pass
+        return node
+
+    _replace(chunk)
+
+    # 在 chunk body 开头插入查表数组声明
+    table_fields = [N("TableItem", key=None, value=N("Number", value=str(v)))
+                    for v in shuffled]
+    # 标记整个表声明为 _no_const_encrypt，防止值被 MBA 膨胀
+    table_decl = N("LocalAssign",
+                   names=[table_name],
+                   exprs=[N("Table", fields=table_fields)])
+    table_decl.attrs["_no_const_encrypt"] = True
+    # 标记表内所有 Number 值
+    for f in table_fields:
+        f.attrs["_no_const_encrypt"] = True
+        f.get("value").attrs["_no_const_encrypt"] = True
+    table_decl.get("exprs")[0].attrs["_no_const_encrypt"] = True
+
+    chunk.get("body").insert(0, table_decl)
+
+    return {"arrayified": replace_count[0], "table_size": len(shuffled),
+            "table_name": table_name}
+
+
+def apply_mba_expr(chunk: Node, rng: random.Random) -> dict:
+    """MBA 表达式混淆：将二元算术表达式替换为位运算等价形式。
+
+    对标用户清单第一类第 6 项「MBA表达式混淆」。
+
+    利用恒等式将 `a + b`（a, b 均为整数常量）替换为位运算等价表达式：
+        a + b  →  bit32.bxor(a, b) + 2 * bit32.band(a, b)
+
+    注意：生成器会自动把 AST 的 `~` `&` `|` 运算符重写为 bit32.* 调用，
+    所以我们只需构造含这些运算符的 AST 节点。
+
+    安全条件：
+    - 仅当 BinOp 两侧均为 Number 节点（编译期整数常量）；
+    - 仅处理 `+` 运算符（唯一有简洁 MBA 等价式的算术运算）；
+    - a, b 均为非负整数 ≤ 0x7FFFFFFF（bit32 安全范围）；
+    - 新生成的 Number 节点标记 _no_const_encrypt，防止 L1b 重复膨胀。
+
+    与 apply_const_encrypt 的区别：
+    - const_encrypt 处理【单独的 Number 节点】→ 复杂表达式；
+    - mba_expr 处理【Number + Number 二元表达式】→ 位运算等价式。
+    两者互补，先 mba_expr 再 const_encrypt，实现双层混淆。
+    """
+    count = [0]
+
+    def _transform(node: Node) -> Node:
+        if node is None or not isinstance(node, Node):
+            return node
+        if node.attrs.get("_no_const_encrypt"):
+            return node
+        # 递归子节点先
+        for k, v in list(node.attrs.items()):
+            if isinstance(v, Node):
+                node.attrs[k] = _transform(v)
+            elif isinstance(v, list):
+                nl = []
+                for item in v:
+                    if isinstance(item, Node):
+                        nl.append(_transform(item))
+                    elif isinstance(item, tuple):
+                        nl.append(tuple(_transform(s) if isinstance(s, Node) else s for s in item))
+                    else:
+                        nl.append(item)
+                node.attrs[k] = nl
+        # 检查是否为 Number + Number 形式
+        if node.type == "BinOp" and node.get("op") == "+":
+            left = node.get("left")
+            right = node.get("right")
+            if left.type == "Number" and right.type == "Number":
+                try:
+                    a = int(float(left.get("value")))
+                    b = int(float(right.get("value")))
+                    if 0 <= a <= 0x7FFFFFFF and 0 <= b <= 0x7FFFFFFF:
+                        # a + b = (a ^ b) + 2*(a & b)
+                        # 构造 AST: (a ~ b) + (2 * (a & b))
+                        na = N("Number", value=str(a))
+                        nb = N("Number", value=str(b))
+                        n2 = N("Number", value="2")
+                        # 标记 _no_const_encrypt，防止 L1b 重复膨胀
+                        for nn in (na, nb, n2):
+                            nn.attrs["_no_const_encrypt"] = True
+                        count[0] += 1
+                        return N("BinOp", op="+",
+                                 left=N("Paren", expr=N("BinOp", op="~",
+                                     left=na, right=nb)),
+                                 right=N("Paren", expr=N("BinOp", op="*",
+                                     left=n2,
+                                     right=N("Paren", expr=N("BinOp", op="&",
+                                         left=N("Number", value=str(a)),
+                                         right=N("Number", value=str(b)))))))
+                except (ValueError, TypeError):
+                    pass
+        return node
+
+    _transform(chunk)
+    return {"transformed": count[0]}
 
 
 def _generate_vm_infra() -> str:
@@ -7412,6 +8026,11 @@ def obfuscate(src: str,
     chunk: Node = parse_source(src)
     stats["lines"] = profile.get("lines")
 
+    # v9 函数内联（最早做，简化 AST 结构）
+    # Level 1: LocalFunction → local name; name = function() end
+    # Level 2: 极简函数在调用点展开
+    stats["L0_function_inline"] = apply_function_inline(chunk, rng)
+
     # 苍米独家混淆 - 内嵌水印：local <rand> = "苍米独家混淆"
     # 字符串交由 L1 三重加密，变量名交由 L2 重命名。
     # 时机：在 L7 之后注入，避免被 L7 的字符串拆分/API重定向转换成
@@ -7486,6 +8105,14 @@ def obfuscate(src: str,
     else:
         stats["L11_anti_heuristic"] = {"probes": 0, "skipped": True}
 
+    # L1a. 常量数组化（v9 新增）：将重复整数常量收集到打乱查表数组
+    #      须在 L1b MBA 常量加密前，否则 Number 节点已被展开为表达式
+    stats["L1a_const_arrayify"] = apply_const_arrayify(chunk, rng)
+
+    # L1a+. MBA 表达式混淆（v9 新增）：Number + Number → 位运算等价式
+    #       新 Number 标记 _no_const_encrypt，不会被 L1b 重复膨胀
+    stats["L1a_mba_expr"] = apply_mba_expr(chunk, rng)
+
     # L1b. 数字常量加密（②数据表随机化）：在 L1 字符串加密前，
     #      将整数常量替换为 XOR 解密表达式。新产生的字符串（math.floor）
     #      会被 L1 加密。跳过 VM 字节码（_no_const_encrypt 标记）。
@@ -7517,6 +8144,10 @@ def obfuscate(src: str,
     script_lines = profile.get("lines") or 0
     legal_count = inject_legal_comments(chunk, rng, script_lines)
     stats["legal_comments"] = legal_count
+
+    # v9 函数包装（最后做，包裹全部已混淆代码到多层 IIFE）
+    # 破坏顶层静态分析，增加调用栈深度
+    stats["L_final_function_wrap"] = apply_function_wrap(chunk, rng)
 
     # ∞. 代码生成
     #     先修正 continue 块：Luau 要求 continue 是块最后语句（同 return），
@@ -7589,7 +8220,13 @@ def obfuscate(src: str,
             _final_chunk = parse_source(src)
             if _final_chunk:
                 _gen_vp = NameGenerator(rng)
-                _vm_code = _vm_pro_compile(_final_chunk, rng, _gen_vp)
+                # v9 VM嵌套VM：对小脚本自动启用（产物体积可控，增加逆向深度）
+                # 用户清单第二类第1项：默认关闭；仅对小脚本启用
+                _src_lines = src.count("\n") + 1
+                _enable_nested = _src_lines <= 50
+                _vm_code = _vm_pro_compile(
+                    _final_chunk, rng, _gen_vp,
+                    enable_nested_vm=_enable_nested)
                 if _vm_code:
                     code = _WATERMARK_HEADER + _vm_code + _LEGAL_FOOTER
                     stats["vm_pro"] = "enabled"
