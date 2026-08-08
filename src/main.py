@@ -14,7 +14,6 @@ Ultimate Ninja Obfuscator 命令行入口。
     python main.py input.lua -o output.lua --disable-anti-heuristic --disable-adaptive
     python main.py input.lua -o output.lua --force-profile medium
     python main.py input.lua -o output.lua --disable-loadstring
-    python main.py input.lua -o output.lua --disable-vm
 
 支持的开关（第 9~12 层均可单独关闭，满足技术红线）：
     --disable-dyninst          关闭第 9 层（动态指令替换）
@@ -22,7 +21,6 @@ Ultimate Ninja Obfuscator 命令行入口。
     --disable-anti-heuristic   关闭第 11 层（反启发式探测）
     --disable-adaptive         关闭第 12 层自适应（强制全开）
     --disable-loadstring       关闭第 8 层的 loadstring（其余保护保留）
-    --disable-vm               关闭第 3 层的 VM 编译（弱注入器推荐）
 """
 
 from __future__ import annotations
@@ -66,8 +64,6 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="关闭第 12 层自适应（强制全开）")
     p.add_argument("--disable-loadstring", action="store_true",
                    help="关闭第 8 层的 loadstring（其余保护保留）")
-    p.add_argument("--disable-vm", action="store_true",
-                   help="关闭第 3 层的 VM 编译（弱注入器推荐）")
     p.add_argument("--force-profile", choices=["small", "medium", "large"],
                    default=None, help="强制档位（调试用）")
     return p
@@ -98,7 +94,6 @@ def main(argv=None) -> int:
             disable_adaptive=args.disable_adaptive,
             force_profile=args.force_profile,
             disable_loadstring=args.disable_loadstring,
-            disable_vm=args.disable_vm,
         )
     except Exception as e:
         sys.stderr.write(f"[error] 混淆失败: {e}\n")
