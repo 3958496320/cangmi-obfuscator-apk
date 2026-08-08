@@ -49,6 +49,75 @@ _WATERMARK_HEADER = (
 )
 _WATERMARK_STRING = "苍米独家混淆"
 
+# bit32 纯 Lua 回退（防御性编程）
+# 代码生成器把 ~ & | >> << 重写为 bit32.bxor/band/bor/rshift/lshift。
+# 此处在脚本最开头注入 bit32 回退：若 bit32 不存在或函数缺失，用纯 Lua
+# 算术实现补全。仅在实际缺失时生效，原生 bit32 存在时零开销（短路返回）。
+_BIT32_FALLBACK = """-- bit32 纯 Lua 回退（防御性编程，缺失时才生效）
+do
+  local _bxor = (bit32 and bit32.bxor) or (bit and bit.bxor)
+  local _band = (bit32 and bit32.band) or (bit and bit.band)
+  local _bor  = (bit32 and bit32.bor)  or (bit and bit.bor)
+  local _bnot = (bit32 and bit32.bnot) or (bit and bit.bnot)
+  local _lsh  = (bit32 and bit32.lshift) or (bit and bit.lshift)
+  local _rsh  = (bit32 and bit32.rshift) or (bit and bit.rshift)
+  if not (_bxor and _band and _bor and _bnot and _lsh and _rsh) then
+    local function _mk(opfn)
+      return function(a, b)
+        a = math.floor(a or 0); b = math.floor(b or 0)
+        if a < 0 then a = a + 4294967296 end
+        if b < 0 then b = b + 4294967296 end
+        local r, p = 0, 1
+        for _ = 1, 32 do
+          local ab, bb = a % 2, b % 2
+          if opfn(ab, bb) then r = r + p end
+          a, b, p = (a - ab) / 2, (b - bb) / 2, p * 2
+        end
+        return r
+      end
+    end
+    if not bit32 then bit32 = {} end
+    bit32.bxor = _bxor or _mk(function(a, b) return a ~= b end)
+    bit32.band = _band or _mk(function(a, b) return a == 1 and b == 1 end)
+    bit32.bor  = _bor  or _mk(function(a, b) return a == 1 or b == 1 end)
+    bit32.bnot = _bnot or function(a)
+      a = math.floor(a or 0)
+      if a < 0 then a = a + 4294967296 end
+      local r, p = 0, 1
+      for _ = 1, 32 do
+        if a % 2 == 0 then r = r + p end
+        a, p = (a - a % 2) / 2, p * 2
+      end
+      return r
+    end
+    bit32.lshift = _lsh or function(a, n)
+      a = math.floor(a or 0); n = math.floor(n or 0)
+      if a < 0 then a = a + 4294967296 end
+      if n <= 0 then
+        if n == 0 then return a end
+        return bit32.rshift(a, -n)
+      end
+      local r = a
+      for _ = 1, n do r = (r * 2) % 4294967296 end
+      return r
+    end
+    bit32.rshift = _rsh or function(a, n)
+      a = math.floor(a or 0); n = math.floor(n or 0)
+      if a < 0 then a = a + 4294967296 end
+      if n <= 0 then
+        if n == 0 then return a end
+        return bit32.lshift(a, -n)
+      end
+      local r = a
+      for _ = 1, n do r = math.floor(r / 2) end
+      return r
+    end
+    bit32.arshift = bit32.arshift or bit32.rshift
+    bit32.btest = bit32.btest or function(a, b) return bit32.band(a, b) ~= 0 end
+  end
+end
+"""
+
 # 各层
 from string_encryptor import encrypt_strings
 from renamer import rename
@@ -255,6 +324,10 @@ def obfuscate(src: str,
     code = generate_code(chunk)
     # 苍米独家混淆 - 头部版权水印（内嵌加密串已在代码中，双重防删除）
     code = _WATERMARK_HEADER + code
+    # bit32 纯 Lua 回退注入到最开头（版权水印之后、所有代码之前）
+    #   代码生成器把 ~ & | >> << 重写为 bit32.bxor/band/bor/rshift/lshift，
+    #   此回退保证 bit32 在缺失环境下仍可用（防御性编程，零开销短路）。
+    code = _WATERMARK_HEADER + _BIT32_FALLBACK + code[len(_WATERMARK_HEADER):]
     stats["output_chars"] = len(code)
 
     # 调试报告

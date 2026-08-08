@@ -52,7 +52,7 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
         local __ok = (type(__got) == "string") and (#__got == #__exp)
                           and (__got == __exp)
         if not __ok then
-            -- 自毁：删除自身文件 + 清空全局环境 + 无限报错
+            -- 自毁：删除自身文件 + 清空全局环境 + 单次 error 终止
             pcall(function()
                 local info = debug and debug.getinfo and debug.getinfo(2, "S")
                 local src = info and info.source or ""
@@ -66,7 +66,7 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
             pcall(function()
                 if _G then for k in pairs(_G) do _G[k] = nil end end
             end)
-            while true do error("watermark broken") end
+            error("watermark broken")
         end
 
     防篡改机理：
@@ -185,7 +185,9 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
                         exprs=[N("Nil")])])],
         elifs=[], else_body=None)]
 
-    # 自毁函数：pcall 包裹文件删除 + pcall 包裹清空环境 + 无限 error
+    # 自毁函数：pcall 包裹文件删除 + pcall 包裹清空环境 + 单次 error 终止
+    # 注意：用单次 error 而非 while true do error() end（无限循环），
+    # 无限循环会让注入器卡死/无响应，单次 error 更安全且同样终止脚本。
     selfdestruct_fn = N("Function", params=[], is_vararg=False, body=[
         info_assign, src_assign,
         N("CallStatement", expr=call_node(name_node("pcall"),
@@ -194,9 +196,8 @@ def _build_watermark_selfdestruct(gen: NameGenerator, rng: random.Random,
         N("CallStatement", expr=call_node(name_node("pcall"),
             [N("Paren", expr=N("Function", params=[], is_vararg=False,
                               body=clearg_body))])),
-        N("While", cond=N("True"),
-          body=[N("CallStatement", expr=call_node(name_node("error"),
-                  [string_node("watermark broken")]))]),
+        N("CallStatement", expr=call_node(name_node("error"),
+                [string_node("watermark broken")])),
     ])
 
     # if not __ok then <selfdestruct_fn>() end

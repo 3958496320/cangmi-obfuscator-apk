@@ -61,7 +61,8 @@ def _build_decrypt_function(dec_name: str, cache_name: str) -> Node:
 
     说明：
     - 使用 string.byte / string.char / table.concat，纯标准库，全注入器兼容。
-    - 位运算 `~` 在 Luau 中为按位异或，所有目标注入器均支持。
+    - 位运算 `~` 在代码生成阶段被重写为 `bit32.bxor`（见 ast_parser.gen_expr），
+      bit32 在 Roblox/Luau/忍者注入器中全局可用；另有纯 Lua 回退保证兼容性。
     - 缓存表 <cache> 闭包捕获，避免重复解密同一字符串。
     - 关键：缓存键 ck = data .. string.char(key, offset, mask)，包含全部四个
       参数。因为每个字符串拥有独立的 key/offset/mask，同一 payload 搭配不同

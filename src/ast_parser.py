@@ -1087,15 +1087,30 @@ class CodeGenerator:
         if t == "Table":
             return self.gen_table(node)
         if t == "BinOp":
+            op = node.get("op")
+            # Luau/Roblox 不支持原生位运算符（~ >> << & |），
+            # 必须用 bit32 库。这是 100% 稳定运行的关键。
+            # bit32 在 Roblox/Luau/忍者注入器中全局可用。
+            _BIT32_FN = {
+                "~": "bxor", ">>": "rshift", "<<": "lshift",
+                "&": "band", "|": "bor",
+            }
+            if op in _BIT32_FN:
+                left = self.gen_expr(node.get("left"))
+                right = self.gen_expr(node.get("right"))
+                return f"bit32.{_BIT32_FN[op]}({left}, {right})"
             left = self.gen_expr(node.get("left"))
             right = self.gen_expr(node.get("right"))
-            op = node.get("op")
             # 对字符串连接与某些运算符加括号保护优先级
             left = self.wrap_if_needed(node.get("left"), left, op, True)
             right = self.wrap_if_needed(node.get("right"), right, op, False)
             return f"{left} {op} {right}"
         if t == "UnaryOp":
             op = node.get("op")
+            # 一元 ~ (按位非) 同样转 bit32.bnot
+            if op == "~":
+                operand = self.gen_expr(node.get("operand"))
+                return f"bit32.bnot({operand})"
             operand = self.gen_expr(node.get("operand"))
             if node.get("operand").type in ("BinOp",):
                 operand = f"({operand})"
