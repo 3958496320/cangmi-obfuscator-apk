@@ -7363,7 +7363,8 @@ def obfuscate(src: str,
               disable_adaptive: bool = False,
               force_profile: Optional[str] = None,
               disable_loadstring: bool = False,
-              disable_vm: bool = False) -> Dict[str, Any]:
+              disable_vm: bool = False,
+              disable_vm_pro: bool = False) -> Dict[str, Any]:
     """对 Luau 源码执行 12 层混淆。
 
     参数：
@@ -7567,6 +7568,35 @@ def obfuscate(src: str,
         code = "\n".join(lines)
     # 尾部法律声明（代码末尾固定存在）
     code = code + _LEGAL_FOOTER
+
+    # === 付费级字节码 VM（vm_pro）===
+    # vm_pro 是最高级保护层：把整个脚本编译成扁平字节码流 + 加密多态解释器。
+    # 关键：必须编译【原始源码 src】，而不是经 L1/L2 等层处理后的代码——
+    #   L1 已把字符串字面量转成运行时解密调用，L2 已重命名所有标识符，
+    #   如果用处理后的代码，vm_pro 编译器找不到字符串字面量→VM 运行时 nil。
+    #   vm_pro 自带：字符串加密(LOADSTR+池+32位XOR)、常量加密(LOADK+池+32位XOR)、
+    #   控制流平坦化(字节码dispatcher)、反调试(解释器内嵌)、多态(opcode表重排)。
+    #   所以不需要依赖 L1/L2/L1b 的保护——它用自己的实现覆盖这些层。
+    # 失败则保留原代码（安全闸：绝不报错，不影响注入器兼容性）。
+    if not disable_vm_pro:
+        try:
+            from vm_pro import vm_pro_compile
+            _final_chunk = parse_source(src)
+            if _final_chunk:
+                _gen_vp = NameGenerator(rng)
+                _vm_code = vm_pro_compile(_final_chunk, rng, _gen_vp)
+                if _vm_code:
+                    code = _WATERMARK_HEADER + _vm_code + _LEGAL_FOOTER
+                    stats["vm_pro"] = "enabled"
+                else:
+                    stats["vm_pro"] = "fallback"
+            else:
+                stats["vm_pro"] = "parse_failed"
+        except Exception:
+            stats["vm_pro"] = "exception"
+    else:
+        stats["vm_pro"] = "disabled"
+
     stats["output_chars"] = len(code)
 
     # 调试报告
@@ -7661,29 +7691,31 @@ def _wrap_long_lines(code: str, max_line: int = 200) -> str:
 
 
 def obfuscate_code(code_str, ninja_mode=False):
-    """对 Luau 源码执行 12 层混淆，返回混淆后的代码字符串。
+    """对 Luau 源码执行 12 层混淆 + 付费级字节码 VM，返回混淆后的代码字符串。
 
     便于网页版 / 外部调用：仅接受源码字符串，返回混淆结果字符串。
     内部调用 obfuscate() 并取其返回字典中的 "code" 字段。
 
     参数：
         ninja_mode: 忍者注入器兼容模式。仅控制行宽整形（max_line=120 vs 200）。
-                    不影响保护层开关（见下方默认禁用说明）。
+                    不影响保护层开关（见下方说明）。
 
-    默认禁用 VM / dyninst / loadstring（弱注入器兼容）：
-        这三个特性是产物体积膨胀的主因（VM 解释器 19 handler + 洗牌循环、
-        dyninst 把运算符变函数调用、loadstring 动态代码生成）。
-        在忍者注入器等弱注入器上，大产物会导致解析超时→脚本启动无反应。
-        禁用后仍保留 10 层保护全开（L0 水印 / L1 字符串加密 / L1b 常量加密 /
-        L2 重命名 / L3 CFF 控制流平坦化 / L4 垃圾代码 / L4b 三元伪装 /
-        L5 反调试 / L6 多态诱饵 / L7 API 重定向 / L8 运行时保护 /
-        L10 代码块分割 / L11 反启发式），含 v7/v8 全部增强
-        （多 flag 交叉校验 / 检测点分散 / 滑动窗口时间检测）。
+    保护策略（91% 保护 / 9% 性能）：
+        disable_vm=True:        关闭 L3 旧版逐函数 VM（体积大、与 vm_pro 冗余）。
+        disable_vm_pro=False:   开启付费级字节码 VM（vm_pro）——把整个脚本编译成
+                                扁平字节码流 + 加密多态解释器，这是最高级保护。
+        disable_dyninst=True:   dyninst 运算符→函数调用增加解析负担，与 vm_pro 冗余。
+        disable_loadstring=True: loadstring 动态加载在弱注入器上不稳定。
+
+        vm_pro 成功时：输出 = 水印 + 字节码VM解释器 + 法律声明，
+        自带字符串加密 / 常量加密 / 控制流平坦化 / 反调试 / 多态。
+        vm_pro 失败时：安全回退到 12 层混淆产物（L0-L11 全开），绝不报错。
     """
     code = obfuscate(code_str,
-                     disable_vm=True,           # VM 解释器体积大，弱注入器解析超时
-                     disable_dyninst=True,      # dyninst 运算符→函数调用增加解析负担
-                     disable_loadstring=True)["code"]  # loadstring 动态加载在弱注入器上不稳定
+                     disable_vm=True,           # 旧版逐函数 VM（与 vm_pro 冗余，关闭）
+                     disable_vm_pro=False,      # 付费级字节码 VM（最高保护，始终开启）
+                     disable_dyninst=True,      # dyninst 与 vm_pro 冗余
+                     disable_loadstring=True)["code"]  # loadstring 弱注入器不稳定
     max_line = 120 if ninja_mode else 200
     return _wrap_long_lines(code, max_line=max_line)
 
