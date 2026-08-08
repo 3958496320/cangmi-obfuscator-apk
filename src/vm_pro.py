@@ -213,6 +213,23 @@ class ProVMCompiler:
         for prog_idx, func_id in self._closure_patches:
             target = self._labels.get(func_id, 1)
             self.prog[prog_idx][2] = target
+        # P2-1 运行期字节码自擦除：计算 safe_erase_set
+        # 擦除策略：只擦「线性序言段」——即第一个跳转目标之前的 PC。
+        # 这些 PC 是循环/分支之前的一次性初始化代码，执行完永不再回访，
+        # 擦掉不影响任何控制流（含嵌套循环：内层循环体 PC 都 > 外层 min(jt)，受保护）。
+        # 边界：safe_erase_pcs = { p | 1 <= p < min(jump_target_pcs) }
+        #   - min(jt) 是第一个跳转目标（最早循环/分支入口），其前都是序言
+        #   - CLOSURE 入口单独保护（_run 可被多次调用，其后的指令也保留）
+        # 无跳转目标（纯线性脚本）时全部 PC 可擦。
+        bc_len = len(self.prog) - 1
+        jt_pcs = [self._labels.get(l, 1) for l in self._used_labels]
+        for _, func_id in self._closure_patches:
+            jt_pcs.append(self._labels.get(func_id, 1))
+        if jt_pcs:
+            first_jt = min(jt_pcs)
+            self._safe_erase_pcs = [p for p in range(1, first_jt) if p >= 1]
+        else:
+            self._safe_erase_pcs = list(range(1, bc_len + 1))
 
     def _reg_of(self, name: str) -> str:
         if name not in self._reg:
@@ -919,13 +936,36 @@ class ProVMCompiler:
         consts_lua = "{" + ",".join(self._fmt_const(c) for c in self.consts) + "}"
         strs_lua = self._gen_str_pool_lua(strs_var)
 
-        bin_dispatch = self._gen_binop_dispatch(reg_var)
-        un_dispatch = self._gen_unop_dispatch(reg_var)
+        # P2-2 寄存器虚拟化：收集所有寄存器名，生成运行期映射表 RK
+        # RK[reg_name] = random_int，运行期 R[RK[name]] 间接寻址防数据流追踪
+        rk_var = gen.fresh()
+        all_regs = set()
+        for ins in self.prog[1:]:
+            for elem in ins[1:]:
+                if isinstance(elem, str):
+                    all_regs.add(elem)
+        rk_range = max(len(all_regs) * 3 + 100, 1000)
+        rk_keys = self.rng.sample(range(1, rk_range + 1), len(all_regs)) if all_regs else []
+        rk_items = []
+        for name, k in zip(sorted(all_regs), rk_keys):
+            rk_items.append(f'[{self._fmt_str(name)}]={k}')
+        rk_lua = "{" + ",".join(rk_items) + "}"
+
+        bin_dispatch = self._gen_binop_dispatch(reg_var, rk_var)
+        un_dispatch = self._gen_unop_dispatch(reg_var, rk_var)
         # P1-2 控制流平坦化：跳转目标间接表
         jt_var = gen.fresh()  # jump_targets 表变量名
-        handler_chain = self._gen_handler_chain(
+        # P2-3 解释器分片嵌套：敏感 opcode 走独立 secure dispatcher
+        secure_candidates = ["CALL", "CALLV", "RET", "CLOSURE",
+                             "GETGLOB", "SETGLOB", "GETUV", "SETUV"]
+        secure_opnames = [op for op in secure_candidates if op in self.opcode]
+        main_chain, secure_chain, secure_codes = self._gen_handler_chain(
             op_var, reg_var, consts_var, strs_var, pc_var, inst_var,
-            bin_dispatch, un_dispatch, run_var, rets_var, va_var, uv_var, jt_var)
+            bin_dispatch, un_dispatch, run_var, rets_var, va_var, uv_var,
+            jt_var, rk_var, secure_opnames)
+        sec_var = gen.fresh()  # secure opcode 查找表变量名
+        sec_items = ",".join(f'[{c}]=true' for c in secure_codes)
+        sec_lua = "{" + sec_items + "}"
 
         # 自修改 dispatcher：opcode 字段额外异或 shift_key
         # shift_key = (pc // shift_period) & 0xFFFF，每 shift_period 条指令变化一次
@@ -957,6 +997,22 @@ class ProVMCompiler:
         for lo, hi, crc in segments:
             seg_items.append(f'{{{lo},{hi},{crc}}}')
         crc_segs_lua = "{" + ",".join(seg_items) + "}"
+        # P2-1 兼容 P1-3：预计算与 safe_erase_pcs 重叠的 CRC 段索引。
+        # 这些段在运行期会被擦除（bc[pc]=nil），CRC 必然失配。
+        # 预标记后 CRC 轮询跳过这些段，其余段保持完整检测覆盖。
+        safe_set_for_segs = getattr(self, '_safe_erase_pcs', [])
+        erased_seg_indices = set()
+        if safe_set_for_segs:
+            for si, (lo, hi, _crc) in enumerate(segments, start=1):
+                if any(lo <= p <= hi for p in safe_set_for_segs):
+                    erased_seg_indices.add(si)
+        erased_seg_var = gen.fresh()  # 运行期「已擦除段」集合（1-based 段索引 → true）
+        erased_seg_list_var = gen.fresh()  # 临时：已擦除段索引列表
+        if erased_seg_indices:
+            esi_items = ",".join(str(i) for i in sorted(erased_seg_indices))
+            erased_seg_lua = f'{{{esi_items}}}'
+        else:
+            erased_seg_lua = '{}'
         # 运行期 CRC32 算法与编译期 _compute_seg_crc 完全一致（同表、同字节序、同遍历）
         # 每个数字元素拆成 4 个小端字节喂入 CRC（与 Python 侧逐字节对齐）
         crc_fn_lua = (
@@ -988,17 +1044,44 @@ class ProVMCompiler:
             jt_items.append(f'[{i+1}]={target_pc}')
         jt_lua = "{" + ",".join(jt_items) + "}"
 
+        # P2-1 运行期字节码自擦除：safe_erase_set
+        # 运行期维护 erased_watermark，每步把 (pc - lag) 且在 safe_set 中、
+        # 且超过 watermark 的 PC 置 nil（bc[pc]=nil → 下次访问 break）。
+        # safe_set 已在 _patch_all 排除所有 jump_targets/CLOSURE 入口，回跳安全。
+        safe_set = getattr(self, '_safe_erase_pcs', [])
+        safe_set_var = gen.fresh()
+        watermark_var = gen.fresh()
+        lag_var = self.rng.randint(5, 15)
+        if safe_set:
+            ss_items = ",".join(str(p) for p in safe_set)
+            safe_set_lua = f'{{{ss_items}}}'
+        else:
+            safe_set_lua = '{}'
+        erase_flag_var = gen.fresh()  # safe_set 查找表（set[pc]=true）
+        erase_done_var = gen.fresh()  # 擦除发生标志，置 true 后 CRC 跳过
+
         src = f'''-- [AI-DETECT] 付费级字节码 VM 保护
 local function {fn_name}()
     local {bc_var} = {bc_lua}
     local {key_var} = {key}
     local {consts_var} = {consts_lua}
     local {jt_var} = {jt_lua}
+    local {rk_var} = {rk_lua}  -- P2-2 寄存器虚拟化映射表
+    local {sec_var} = {sec_lua}  -- P2-3 secure opcode 查找表
     {strs_lua}
     local {corrupt_var} = false  -- 反 trace 触发标志：true 时静默 corrupt 内部状态
     {crc_fn_lua}
     local {crc_segs_var} = {crc_segs_lua}
-    local function {run_var}({pc_var}_start, {uv_var}, ...)
+    -- P2-1 兼容 P1-3：预标记将与 safe_erase_pcs 重叠的 CRC 段（擦除后必然失配，跳过）
+        local {erased_seg_list_var} = {erased_seg_lua}
+        local {erased_seg_var} = {{}}
+        for _i = 1, #{erased_seg_list_var} do {erased_seg_var}[{erased_seg_list_var}[_i]] = true end
+    -- P2-1 自擦除：safe_erase_set（已排除 jump_targets/CLOSURE 入口，回跳安全）
+        local {safe_set_var} = {safe_set_lua}
+        local {erase_flag_var} = {{}}
+        for _i = 1, #{safe_set_var} do {erase_flag_var}[{safe_set_var}[_i]] = true end
+        local {erase_done_var} = false  -- 保留兼容（不再永久跳过 CRC，改用 erased_seg 精细跳过）
+        local function {run_var}({pc_var}_start, {uv_var}, ...)
         if {uv_var} == nil then {uv_var} = {{}} end
         local {va_var} = {{...}}
         local {pc_var} = {pc_var}_start
@@ -1008,6 +1091,7 @@ local function {fn_name}()
         local {bc_len_var} = #{bc_var}
         local {last_time_var} = os.clock()
         local {seg_chk_var} = 0
+        local {watermark_var} = 0  -- P2-1 自擦除水位线（已擦除到的最高 PC）
         while {pc_var} <= {bc_len_var} do
             local {raw_var} = {bc_var}[{pc_var}]
             if not {raw_var} then break end
@@ -1064,16 +1148,30 @@ local function {fn_name}()
                 -- P1-3 字节码防篡改校验：CRC32 分段轮询
                 -- 每个 ad_period 周期校验一段，轮询覆盖全部段。
                 -- 任一字节被篡改 → 校验和失配 → 静默 corrupt。
+                -- P2-1 兼容：跳过与 safe_erase_pcs 重叠的段（已预标记 erased_seg），
+                -- 其余段保持完整 CRC 检测覆盖。
                 local _ns = #{crc_segs_var}
                 if _ns > 0 then
                     local _si = ({seg_chk_var} % _ns) + 1
-                    local _seg = {crc_segs_var}[_si]
-                    local _rc = {crc_fn_var}({bc_var}, _seg[1], _seg[2])
-                    if _rc ~= _seg[3] then {corrupt_var} = true end
+                    if not {erased_seg_var}[_si] then
+                        local _seg = {crc_segs_var}[_si]
+                        local _rc = {crc_fn_var}({bc_var}, _seg[1], _seg[2])
+                        if _rc ~= _seg[3] then {corrupt_var} = true end
+                    end
                     {seg_chk_var} = {seg_chk_var} + 1
                 end
                 -- 重置时间窗口基准：把本块全部工作（含 CRC 计算）排除出下一窗口
                 {last_time_var} = os.clock()
+                -- P2-1 运行期字节码自擦除：防 dump
+                -- 在 CRC 校验之后执行（CRC 先看到完整 bc 表，再擦除历史指令）。
+                -- 擦除 (pc - lag) 且在 safe_set 中、且超过 watermark 的 PC。
+                -- safe_set 仅含第一个跳转目标之前的线性序言，永不被回跳重访。
+                -- 擦除段已在编译期预标记到 erased_seg，CRC 自动跳过；其余段不受影响。
+                local _ep = {pc_var} - {lag_var}
+                if _ep > {watermark_var} and {erase_flag_var}[_ep] then
+                    {bc_var}[_ep] = nil
+                    {watermark_var} = _ep
+                end
             end
             -- corrupt 触发：静默破坏内部状态（不报错，让结果错乱，比直接崩更难排查）
             if {corrupt_var} then
@@ -1083,7 +1181,12 @@ local function {fn_name}()
             end
             -- jump_flag：跳转指令设置后，跳过 pc+1（因为已设绝对目标）
             local _jmp = false
-            {handler_chain}
+            -- P2-3 分片嵌套：secure opcode 走独立 dispatcher 链
+            if {sec_var}[{op_var}] then
+                {secure_chain}
+            else
+                {main_chain}
+            end
             if not _jmp then {pc_var} = {pc_var} + 1 end
         end
     end
@@ -1232,174 +1335,177 @@ return {fn_name}()
             return s.dec
         end'''
 
-    def _gen_binop_dispatch(self, reg_var) -> str:
+    def _gen_binop_dispatch(self, reg_var, rk_var) -> str:
+        # P2-2 寄存器虚拟化：R[d] → R[RK[d]]，间接寻址防数据流追踪
         R = reg_var
+        RK = rk_var
         code_to_op = {c: op for op, c in self.bincode.items()}
         parts = []
         for code in range(len(_PRO_BINOPS)):
             op = code_to_op[code]
             if op == "and":
-                parts.append(f'if c=={code} then {R}[d]={R}[a] and {R}[b] end')
+                parts.append(f'if c=={code} then {R}[{RK}[d]]={R}[{RK}[a]] and {R}[{RK}[b]] end')
             elif op == "or":
-                parts.append(f'if c=={code} then {R}[d]={R}[a] or {R}[b] end')
+                parts.append(f'if c=={code} then {R}[{RK}[d]]={R}[{RK}[a]] or {R}[{RK}[b]] end')
             else:
-                parts.append(f'if c=={code} then {R}[d]={R}[a]{op}{R}[b] end')
+                parts.append(f'if c=={code} then {R}[{RK}[d]]={R}[{RK}[a]]{op}{R}[{RK}[b]] end')
         return " ".join(parts)
 
-    def _gen_unop_dispatch(self, reg_var) -> str:
+    def _gen_unop_dispatch(self, reg_var, rk_var) -> str:
+        # P2-2 寄存器虚拟化：R[d] → R[RK[d]]
         R = reg_var
+        RK = rk_var
         code_to_op = {c: op for op, c in self.uncode.items()}
         parts = []
         for code in range(len(_PRO_UNOPS)):
             op = code_to_op[code]
             if op == "-":
-                parts.append(f'if c=={code} then {R}[d]=-{R}[a] end')
+                parts.append(f'if c=={code} then {R}[{RK}[d]]=-{R}[{RK}[a]] end')
             elif op == "not":
-                parts.append(f'if c=={code} then {R}[d]=not {R}[a] end')
+                parts.append(f'if c=={code} then {R}[{RK}[d]]=not {R}[{RK}[a]] end')
             elif op == "#":
-                parts.append(f'if c=={code} then {R}[d]=#{R}[a] end')
+                parts.append(f'if c=={code} then {R}[{RK}[d]]=#{R}[{RK}[a]] end')
         return " ".join(parts)
 
     def _gen_handler_chain(self, op_var, reg_var, consts_var, strs_var,
                            pc_var, inst_var, bin_dispatch, un_dispatch,
-                           run_var, rets_var, va_var, uv_var, jt_var) -> str:
-        op_order = list(self.opcode.keys())
-        self.rng.shuffle(op_order)
-        handlers = []
-        for op_name in op_order:
-            variants = self.opcode_variants[op_name]
-            h = self._gen_handler(op_name, reg_var, consts_var,
-                                  strs_var, pc_var, inst_var, bin_dispatch, un_dispatch,
-                                  run_var, rets_var, va_var, uv_var, jt_var)
-            handlers.append((variants, h))
-        handlers.sort(key=lambda x: x[0][0])
-        parts = []
-        for i, (variants, h) in enumerate(handlers):
-            conds = " or ".join(f"{op_var}=={v}" for v in variants)
-            if i == 0:
-                parts.append(f'if {conds} then\n{h}')
-            else:
-                parts.append(f'elseif {conds} then\n{h}')
-        parts.append('end')
-        return "\n".join(parts)
+                           run_var, rets_var, va_var, uv_var, jt_var, rk_var,
+                           secure_opnames):
+        # P2-3 解释器分片嵌套：主 dispatcher + 安全 dispatcher 双链
+        # 敏感 opcode（CALL/CLOSURE/RET/全局访问等）路由到 secure dispatcher，
+        # 其余走 main dispatcher。两条链各自独立随机化 handler 顺序，
+        # 分析者必须先理解分类机制，再分别分析两条链。
+        def _build_chain(op_names):
+            order = list(op_names)
+            self.rng.shuffle(order)
+            handlers = []
+            for op_name in order:
+                variants = self.opcode_variants[op_name]
+                h = self._gen_handler(op_name, reg_var, consts_var,
+                                      strs_var, pc_var, inst_var, bin_dispatch, un_dispatch,
+                                      run_var, rets_var, va_var, uv_var, jt_var, rk_var)
+                handlers.append((variants, h))
+            handlers.sort(key=lambda x: x[0][0])
+            parts = []
+            for i, (variants, h) in enumerate(handlers):
+                conds = " or ".join(f"{op_var}=={v}" for v in variants)
+                if i == 0:
+                    parts.append(f'if {conds} then\n{h}')
+                else:
+                    parts.append(f'elseif {conds} then\n{h}')
+            parts.append('end')
+            return "\n".join(parts)
+
+        main_names = [op for op in self.opcode.keys() if op not in secure_opnames]
+        main_chain = _build_chain(main_names)
+        secure_chain = _build_chain(secure_opnames)
+        # 收集 secure opcode 的所有变体码（运行期 op 可能是任一变体码）
+        secure_codes = set()
+        for op_name in secure_opnames:
+            if op_name in self.opcode_variants:
+                for v in self.opcode_variants[op_name]:
+                    secure_codes.add(v)
+        return main_chain, secure_chain, secure_codes
 
     def _gen_handler(self, op_name, R, C, S, pc_var, I, bin_d, un_d,
-                     RUN, RETS, VA, UV, JT) -> str:
+                     RUN, RETS, VA, UV, JT, RK) -> str:
+        # P2-2 寄存器虚拟化：所有寄存器访问 R[name] → R[RK[name]]
+        # RK 是运行期映射表：寄存器名(字符串) → 随机物理键(整数)
+        # 非寄存器字段（常量索引/字符串索引/跳转索引/计数器）保持不变
         # 假 opcode（JUNK1-8）：dispatcher 里有 handler，看起来像真实逻辑
-        # 但执行无害操作（写入死寄存器或读取后丢弃），反汇编器无法分辨真假
-        # 每个 JUNK 用不同的伪操作模式，增加分析难度
         if op_name.startswith("JUNK"):
-            junk_kind = int(op_name[4:])  # JUNK1 -> 1
+            junk_kind = int(op_name[4:])
             if junk_kind == 1:
-                # 假算术：看起来像 BINOP 但结果丢弃
-                return f'local _j={R}[{I}[2]]+{R}[{I}[3]]'
+                return f'local _j={R}[{RK}[{I}[2]]]+{R}[{RK}[{I}[3]]]'
             elif junk_kind == 2:
-                # 假表访问：看起来像 GETTAB 但结果丢弃
-                return f'local _j={R}[{I}[2]][{I}[3]]'
+                return f'local _j={R}[{RK}[{I}[2]]][{I}[3]]'
             elif junk_kind == 3:
-                # 假比较：看起来像条件判断但无副作用
-                return f'if {R}[{I}[2]] then local _j=1 end'
+                return f'if {R}[{RK}[{I}[2]]] then local _j=1 end'
             elif junk_kind == 4:
-                # 假字符串操作：看起来像字符串拼接
-                return f'local _j=tostring({R}[{I}[2]])..tostring({R}[{I}[3]])'
+                return f'local _j=tostring({R}[{RK}[{I}[2]]])..tostring({R}[{RK}[{I}[3]]])'
             elif junk_kind == 5:
-                # 假循环计数：看起来像 for 循环初始化
                 return f'local _j=#{{}} for _k=1,3 do _j=_j+1 end'
             elif junk_kind == 6:
-                # 假全局读取：看起来像 GETGLOB 但丢弃
                 return f'local _j=_G[{I}[2]]'
             elif junk_kind == 7:
-                # 假数学运算：看起来像数学计算
-                return f'local _j=math.floor({R}[{I}[2]])'
+                return f'local _j=math.floor({R}[{RK}[{I}[2]]])'
             else:
-                # JUNK8: 假闭包创建：看起来像 CLOSURE 但丢弃
                 return f'local _j=function() end'
         if op_name == "LOADK":
-            return f'{R}[{I}[2]]={C}[{I}[3]+1]'
+            return f'{R}[{RK}[{I}[2]]]={C}[{I}[3]+1]'
         elif op_name == "LOADSTR":
-            # 三层加密字符串：懒解密（第一次访问解密，缓存）
-            return f'{R}[{I}[2]]=_dec_str({S}[{I}[3]+1])'
+            return f'{R}[{RK}[{I}[2]]]=_dec_str({S}[{I}[3]+1])'
         elif op_name == "LOADBOOL":
-            return f'{R}[{I}[2]]=({I}[3]~=0)'
+            return f'{R}[{RK}[{I}[2]]]=({I}[3]~=0)'
         elif op_name == "LOADNIL":
-            return f'{R}[{I}[2]]=nil'
+            return f'{R}[{RK}[{I}[2]]]=nil'
         elif op_name == "MOVR":
-            return f'{R}[{I}[2]]={R}[{I}[3]]'
+            return f'{R}[{RK}[{I}[2]]]={R}[{RK}[{I}[3]]]'
         elif op_name == "BINOP":
             return f'local d,a,b,c={I}[2],{I}[3],{I}[4],{I}[5] {bin_d}'
         elif op_name == "UNOP":
             return f'local d,a,c={I}[2],{I}[3],{I}[4] {un_d}'
         elif op_name == "JMP":
-            # P1-2 控制流平坦化：跳转目标间接化
-            # I[2] 是 jump_targets 表的索引（1-based），运行时查找真实 PC
             return f'{pc_var}={JT}[{I}[2]] _jmp=true'
         elif op_name == "CJMP":
-            return f'if {R}[{I}[2]] then {pc_var}={JT}[{I}[3]] _jmp=true end'
+            return f'if {R}[{RK}[{I}[2]]] then {pc_var}={JT}[{I}[3]] _jmp=true end'
         elif op_name == "NJMP":
-            return f'if not {R}[{I}[2]] then {pc_var}={JT}[{I}[3]] _jmp=true end'
+            return f'if not {R}[{RK}[{I}[2]]] then {pc_var}={JT}[{I}[3]] _jmp=true end'
         elif op_name == "CALL":
-            return (f'local _fn={R}[{I}[3]] local _args={{}} '
-                    f'for _ai=1,{I}[4] do _args[_ai]={R}[{I}[4+_ai]] end '
+            return (f'local _fn={R}[{RK}[{I}[3]]] local _args={{}} '
+                    f'for _ai=1,{I}[4] do _args[_ai]={R}[{RK}[{I}[4+_ai]]] end '
                     f'{RETS}=table.pack(_fn(table.unpack(_args))) '
-                    f'{R}[{I}[2]]={RETS}[1]')
+                    f'{R}[{RK}[{I}[2]]]={RETS}[1]')
         elif op_name == "CALLV":
-            return (f'local _obj={R}[{I}[3]] local _m=_dec_str({S}[{I}[4]+1]) '
+            return (f'local _obj={R}[{RK}[{I}[3]]] local _m=_dec_str({S}[{I}[4]+1]) '
                     f'local _args={{}} '
-                    f'for _ai=1,{I}[5] do _args[_ai]={R}[{I}[5+_ai]] end '
+                    f'for _ai=1,{I}[5] do _args[_ai]={R}[{RK}[{I}[5+_ai]]] end '
                     f'local _fn=_obj[_m] '
                     f'{RETS}=table.pack(_fn(_obj,table.unpack(_args))) '
-                    f'{R}[{I}[2]]={RETS}[1]')
+                    f'{R}[{RK}[{I}[2]]]={RETS}[1]')
         elif op_name == "RET":
             return (f'if {I}[3] and {I}[3]>0 then '
-                    f'local _rv={{}} for _ri=1,{I}[3] do _rv[_ri]={R}[{I}[3+_ri]] end '
+                    f'local _rv={{}} for _ri=1,{I}[3] do _rv[_ri]={R}[{RK}[{I}[3+_ri]]] end '
                     f'return table.unpack(_rv) end '
                     f'return')
         elif op_name == "CLOSURE":
-            # 合并外层 _uv 和本层捕获变量表 R[I[4]]，创建独立闭包 upvalue 副本。
-            # 这样每次 CLOSURE 都有自己的 _uv 副本（不共享外层 _uv），
-            # 解决 makeAdder(5)/makeAdder(10) 共享 n 的问题。
             return (f'local _uvc={{}} '
                     f'for _k,_v in pairs({UV}) do _uvc[_k]=_v end '
-                    f'for _k,_v in pairs({R}[{I}[4]]) do _uvc[_k]=_v end '
-                    f'{R}[{I}[2]]=function(...) return {RUN}({I}[3],_uvc,...) end')
+                    f'for _k,_v in pairs({R}[{RK}[{I}[4]]]) do _uvc[_k]=_v end '
+                    f'{R}[{RK}[{I}[2]]]=function(...) return {RUN}({I}[3],_uvc,...) end')
         elif op_name == "PARAMS":
-            return f'for _pi=1,{I}[2] do {R}[{I}[2+_pi]]={VA}[_pi] end'
+            return f'for _pi=1,{I}[2] do {R}[{RK}[{I}[2+_pi]]]={VA}[_pi] end'
         elif op_name == "GETRET":
-            return f'{R}[{I}[2]]={RETS}[{I}[3]]'
+            return f'{R}[{RK}[{I}[2]]]={RETS}[{I}[3]]'
         elif op_name == "NEWTAB":
-            return f'{R}[{I}[2]]={{}}'
+            return f'{R}[{RK}[{I}[2]]]={{}}'
         elif op_name == "GETTAB":
-            return f'{R}[{I}[2]]={R}[{I}[3]][{R}[{I}[4]]]'
+            return f'{R}[{RK}[{I}[2]]]={R}[{RK}[{I}[3]]][{R}[{RK}[{I}[4]]]]'
         elif op_name == "SETTAB":
-            return f'{R}[{I}[2]][{R}[{I}[3]]]={R}[{I}[4]]'
+            return f'{R}[{RK}[{I}[2]]][{R}[{RK}[{I}[3]]]]={R}[{RK}[{I}[4]]]'
         elif op_name == "GETTABK":
-            return f'{R}[{I}[2]]={R}[{I}[3]][_dec_str({S}[{I}[4]+1])]'
+            return f'{R}[{RK}[{I}[2]]]={R}[{RK}[{I}[3]]][_dec_str({S}[{I}[4]+1])]'
         elif op_name == "SETTABK":
-            return f'{R}[{I}[2]][_dec_str({S}[{I}[3]+1])]={R}[{I}[4]]'
+            return f'{R}[{RK}[{I}[2]]][_dec_str({S}[{I}[3]+1])]={R}[{RK}[{I}[4]]]'
         elif op_name == "GETGLOB":
-            return f'{R}[{I}[2]]=_G[_dec_str({S}[{I}[3]+1])]'
+            return f'{R}[{RK}[{I}[2]]]=_G[_dec_str({S}[{I}[3]+1])]'
         elif op_name == "SETGLOB":
-            return f'_G[_dec_str({S}[{I}[2]+1])]={R}[{I}[3]]'
+            return f'_G[_dec_str({S}[{I}[2]+1])]={R}[{RK}[{I}[3]]]'
         elif op_name == "GETUV":
-            # 从闭包 upvalue 表读取捕获变量
-            return f'{R}[{I}[2]]={UV}[_dec_str({S}[{I}[3]+1])]'
+            return f'{R}[{RK}[{I}[2]]]={UV}[_dec_str({S}[{I}[3]+1])]'
         elif op_name == "SETUV":
-            # 写入闭包 upvalue 表（捕获变量）
-            return f'{UV}[_dec_str({S}[{I}[2]+1])]={R}[{I}[3]]'
+            return f'{UV}[_dec_str({S}[{I}[2]+1])]={R}[{RK}[{I}[3]]]'
         elif op_name == "FORPREP":
-            # I[6] 是 jump_targets 索引（1-based），跳到循环结束
-            return (f'{R}[{I}[2]]={R}[{I}[3]] '
-                    f'if ({R}[{I}[5]]>0 and {R}[{I}[3]]>{R}[{I}[4]]) '
-                    f'or ({R}[{I}[5]]<0 and {R}[{I}[3]]<{R}[{I}[4]]) '
+            return (f'{R}[{RK}[{I}[2]]]={R}[{RK}[{I}[3]]] '
+                    f'if ({R}[{RK}[{I}[5]]]>0 and {R}[{RK}[{I}[3]]]>{R}[{RK}[{I}[4]]] ) '
+                    f'or ({R}[{RK}[{I}[5]]]<0 and {R}[{RK}[{I}[3]]]<{R}[{RK}[{I}[4]]] ) '
                     f'then {pc_var}={JT}[{I}[6]] _jmp=true end')
         elif op_name == "FORLOOP":
-            # I[5] 是 jump_targets 索引（1-based），跳回循环开始
-            return (f'{R}[{I}[2]]={R}[{I}[2]]+{R}[{I}[4]] '
-                    f'if ({R}[{I}[4]]>0 and {R}[{I}[2]]<={R}[{I}[3]]) '
-                    f'or ({R}[{I}[4]]<0 and {R}[{I}[2]]>={R}[{I}[3]]) '
+            return (f'{R}[{RK}[{I}[2]]]={R}[{RK}[{I}[2]]]+{R}[{RK}[{I}[4]]] '
+                    f'if ({R}[{RK}[{I}[4]]]>0 and {R}[{RK}[{I}[2]]]<={R}[{RK}[{I}[3]]] ) '
+                    f'or ({R}[{RK}[{I}[4]]]<0 and {R}[{RK}[{I}[2]]]>={R}[{RK}[{I}[3]]] ) '
                     f'then {pc_var}={JT}[{I}[5]] _jmp=true end')
         elif op_name == "BREAK":
-            # BREAK 跳到循环结束 label（通过 jump_targets 间接查找）
             return f'{pc_var}={JT}[{I}[2]]'
         return f'-- unknown {op_name}'
 
