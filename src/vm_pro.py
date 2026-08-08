@@ -28,8 +28,12 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     from obfuscator_core import Node
 except Exception:
-    class Node:  # type: ignore
-        pass
+    # bundle（单文件）：obfuscator_core 段已定义真正的 Node，直接复用，勿覆盖
+    try:
+        Node  # noqa: F821  — 已由同文件前段定义
+    except NameError:
+        class Node:  # type: ignore
+            pass
 
 
 # =============================================================================
@@ -54,6 +58,24 @@ _PRO_BINOPS = ["+", "-", "*", "/", "%", "^", "..",
                "==", "~=", "<", ">", "<=", ">=", "and", "or",
                "&", "|", "~", "<<", ">>", "//"]
 _PRO_UNOPS = ["-", "not", "#"]
+
+
+# P1-3 字节码防篡改校验：CRC32 (IEEE 802.3) 查表
+# 编译期（Python）与运行期（Lua）使用同一张表、同一算法，保证两侧校验和一致。
+def _make_crc32_table() -> List[int]:
+    table = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            if c & 1:
+                c = (c >> 1) ^ 0xEDB88320
+            else:
+                c = c >> 1
+        table.append(c & 0xFFFFFFFF)
+    return table
+
+
+_CRC32_TABLE = _make_crc32_table()
 
 
 # =============================================================================
@@ -170,9 +192,24 @@ class ProVMCompiler:
         return idx
 
     def _patch_all(self):
+        # P1-2 控制流平坦化：跳转目标间接化
+        # 把所有 label 的 PC 存入 jump_targets 表，跳转指令存 label 索引
+        # 运行时 pc = jump_targets[idx]，反汇编器无法静态确定跳转目标
+        # 收集所有被引用的 label，分配索引
+        used_labels: List[str] = []
+        label_to_idx: Dict[str, int] = {}
+        for _, _, label_key in self._patches:
+            if label_key not in label_to_idx:
+                label_to_idx[label_key] = len(used_labels)
+                used_labels.append(label_key)
+        # 编译期暂存 label->PC 映射，运行时由解释器生成 jump_targets 表
+        self._used_labels = used_labels
+        self._label_to_idx = label_to_idx
+        # 回填跳转指令：把相对偏移改为 label 索引（1-based，匹配 Lua 表）
         for prog_idx, field, label_key in self._patches:
-            target = self._labels.get(label_key, prog_idx + 1)
-            self.prog[prog_idx][field] = target - (prog_idx + 1)
+            idx_1based = label_to_idx.get(label_key, 0) + 1
+            self.prog[prog_idx][field] = idx_1based
+        # CLOSURE 绝对地址仍直接回填（不走间接表）
         for prog_idx, func_id in self._closure_patches:
             target = self._labels.get(func_id, 1)
             self.prog[prog_idx][2] = target
@@ -884,9 +921,11 @@ class ProVMCompiler:
 
         bin_dispatch = self._gen_binop_dispatch(reg_var)
         un_dispatch = self._gen_unop_dispatch(reg_var)
+        # P1-2 控制流平坦化：跳转目标间接表
+        jt_var = gen.fresh()  # jump_targets 表变量名
         handler_chain = self._gen_handler_chain(
             op_var, reg_var, consts_var, strs_var, pc_var, inst_var,
-            bin_dispatch, un_dispatch, run_var, rets_var, va_var, uv_var)
+            bin_dispatch, un_dispatch, run_var, rets_var, va_var, uv_var, jt_var)
 
         # 自修改 dispatcher：opcode 字段额外异或 shift_key
         # shift_key = (pc // shift_period) & 0xFFFF，每 shift_period 条指令变化一次
@@ -896,13 +935,69 @@ class ProVMCompiler:
         bc_lua = self._encrypt_program(key, shift_period)
         ad_period = self.rng.randint(50, 150)
         ad_threshold = self.rng.choice([500, 999, 1500, 2000])
+        # 反 trace 细化：高频时间检测阈值 + hook 检测
+        # time_limit：每 ad_period 条指令的累计耗时上限（秒）
+        # 单步执行会让这个值暴涨 100-1000 倍，触发静默 corrupt
+        time_limit = self.rng.choice([0.05, 0.1, 0.2, 0.5])
+        time_var = gen.fresh()
+        last_time_var = gen.fresh()
+        hook_chk_var = gen.fresh()
+        corrupt_var = gen.fresh()
+
+        # P1-3 字节码防篡改校验：CRC32 分段校验
+        # 把字节码流切成若干段，每段预存 CRC32，运行期轮询重算并比对。
+        # 篡改任一字节 → 校验和失配 → 静默 corrupt（不报错，结果错乱，更难排查）。
+        segments = self._build_segments(key, shift_period)
+        crc_segs_var = gen.fresh()    # 段表变量名
+        crc_fn_var = gen.fresh()      # _crc_seg 函数变量名
+        seg_chk_var = gen.fresh()      # 段轮询计数器
+        crc_tab_var = gen.fresh()      # CRC 查表缓存
+        # 序列化段表：{ {lo, hi, crc}, ... }
+        seg_items = []
+        for lo, hi, crc in segments:
+            seg_items.append(f'{{{lo},{hi},{crc}}}')
+        crc_segs_lua = "{" + ",".join(seg_items) + "}"
+        # 运行期 CRC32 算法与编译期 _compute_seg_crc 完全一致（同表、同字节序、同遍历）
+        # 每个数字元素拆成 4 个小端字节喂入 CRC（与 Python 侧逐字节对齐）
+        crc_fn_lua = (
+            f'local {crc_tab_var}=nil '
+            f'local function {crc_fn_var}(_bc,_lo,_hi) '
+            f'if not {crc_tab_var} then '
+            f'{crc_tab_var}={{}} '
+            f'for _i=0,255 do local _c=_i for _=1,8 do '
+            f'if _c%2==1 then _c=(_c//2)~0xEDB88320 else _c=_c//2 end end '
+            f'{crc_tab_var}[_i]=_c end end '
+            f'local _crc=0xFFFFFFFF '
+            f'for _pc=_lo,_hi do local _ins=_bc[_pc] '
+            f'if _ins then for _i=1,#_ins do local _e=_ins[_i] '
+            f'if type(_e)=="number" then local _v=_e '
+            f'local _b0=_v%256 local _b1=(_v//256)%256 '
+            f'local _b2=(_v//65536)%256 local _b3=(_v//16777216)%256 '
+            f'_crc=(_crc//256)~{crc_tab_var}[(_crc~_b0)%256] '
+            f'_crc=(_crc//256)~{crc_tab_var}[(_crc~_b1)%256] '
+            f'_crc=(_crc//256)~{crc_tab_var}[(_crc~_b2)%256] '
+            f'_crc=(_crc//256)~{crc_tab_var}[(_crc~_b3)%256] '
+            f'end end end end '
+            f'return _crc~0xFFFFFFFF end'
+        )
+
+        # 生成 jump_targets 表：每个被引用的 label 对应一个 PC 值
+        jt_items = []
+        for i, label_key in enumerate(getattr(self, '_used_labels', [])):
+            target_pc = self._labels.get(label_key, 1)
+            jt_items.append(f'[{i+1}]={target_pc}')
+        jt_lua = "{" + ",".join(jt_items) + "}"
 
         src = f'''-- [AI-DETECT] 付费级字节码 VM 保护
 local function {fn_name}()
     local {bc_var} = {bc_lua}
     local {key_var} = {key}
     local {consts_var} = {consts_lua}
+    local {jt_var} = {jt_lua}
     {strs_lua}
+    local {corrupt_var} = false  -- 反 trace 触发标志：true 时静默 corrupt 内部状态
+    {crc_fn_lua}
+    local {crc_segs_var} = {crc_segs_lua}
     local function {run_var}({pc_var}_start, {uv_var}, ...)
         if {uv_var} == nil then {uv_var} = {{}} end
         local {va_var} = {{...}}
@@ -911,6 +1006,8 @@ local function {fn_name}()
         local {rets_var} = {{}}
         local {ad_var} = 0
         local {bc_len_var} = #{bc_var}
+        local {last_time_var} = os.clock()
+        local {seg_chk_var} = 0
         while {pc_var} <= {bc_len_var} do
             local {raw_var} = {bc_var}[{pc_var}]
             if not {raw_var} then break end
@@ -932,12 +1029,62 @@ local function {fn_name}()
             local {op_var} = {inst_var}[1] ~ {shift_var}
             {ad_var} = {ad_var} + 1
             if {ad_var} % {ad_period} == 0 then
+                -- 反 trace 1: _G 表大小监测（注入器环境注入大量全局）
                 local _gc = 0
                 for _ in pairs(_G) do _gc = _gc + 1 end
                 if _gc > {ad_threshold} then return nil end
+                -- 反 trace 2: 高频时间检测
+                -- 正常执行 ad_period 条指令耗时 << time_limit
+                -- 单步/trace 会让耗时暴涨 100-1000 倍
+                local {time_var} = os.clock()
+                if {time_var} - {last_time_var} > {time_limit} then
+                    {corrupt_var} = true
+                end
+                -- last_time_var 在本块末尾重置（见 P1-3 后），避免 CRC 计算耗时被计入下一窗口
+                -- 反 trace 3: debug hook 检测
+                -- debug.sethook 被设置说明有人在 trace（line/call/return 断点）
+                local {hook_chk_var} = debug and debug.gethook and debug.gethook()
+                if {hook_chk_var} then
+                    {corrupt_var} = true
+                end
+                -- 反 trace 4: 调用栈深度检测
+                -- VM 正常调用栈深度有限，过深说明被包装/trace
+                if debug and debug.getinfo then
+                    local _di = debug.getinfo(3, "f")
+                    -- _di 为 nil 说明栈很浅（正常），非 nil 说明有外层包装
+                    -- 但 VM 自身也有包装，这里只检测极深栈（>20 层）
+                    local _depth = 0
+                    local _frame = debug.getinfo(1, "f")
+                    while _frame and _depth < 30 do
+                        _depth = _depth + 1
+                        _frame = debug.getinfo(_depth + 1, "f")
+                    end
+                    if _depth >= 25 then {corrupt_var} = true end
+                end
+                -- P1-3 字节码防篡改校验：CRC32 分段轮询
+                -- 每个 ad_period 周期校验一段，轮询覆盖全部段。
+                -- 任一字节被篡改 → 校验和失配 → 静默 corrupt。
+                local _ns = #{crc_segs_var}
+                if _ns > 0 then
+                    local _si = ({seg_chk_var} % _ns) + 1
+                    local _seg = {crc_segs_var}[_si]
+                    local _rc = {crc_fn_var}({bc_var}, _seg[1], _seg[2])
+                    if _rc ~= _seg[3] then {corrupt_var} = true end
+                    {seg_chk_var} = {seg_chk_var} + 1
+                end
+                -- 重置时间窗口基准：把本块全部工作（含 CRC 计算）排除出下一窗口
+                {last_time_var} = os.clock()
             end
+            -- corrupt 触发：静默破坏内部状态（不报错，让结果错乱，比直接崩更难排查）
+            if {corrupt_var} then
+                {reg_var}[1] = nil
+                {reg_var}[2] = "corrupted"
+                {pc_var} = {pc_var} + {ad_var} % 7 + 1
+            end
+            -- jump_flag：跳转指令设置后，跳过 pc+1（因为已设绝对目标）
+            local _jmp = false
             {handler_chain}
-            {pc_var} = {pc_var} + 1
+            if not _jmp then {pc_var} = {pc_var} + 1 end
         end
     end
     return {run_var}(1, {{}})
@@ -945,6 +1092,27 @@ end
 return {fn_name}()
 '''
         return src
+
+    def _encrypted_elem(self, pc: int, i: int, p, key: int, shift_period: int):
+        """计算单条字节码元素 (pc, i) 的加密形式。
+        返回 (is_num, value)：
+          is_num=True  → value 是加密后的 32-bit 整数（用于 CRC 校验）
+          is_num=False → value 是 Lua 字符串字面量（寄存器名等，原样透传）
+        与 _encrypt_program 序列化、运行期 bc_var 表内容完全一致。"""
+        if isinstance(p, str):
+            return False, self._fmt_str(p)
+        if isinstance(p, bool):
+            return True, 1 if p else 0
+        if isinstance(p, (int, float)):
+            val = int(p) & 0xFFFFFFFF
+            enc = (val ^ ((key + pc + i) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            if i == 1:
+                shift_key = (pc // shift_period) & 0xFFFF
+                enc = (enc ^ shift_key) & 0xFFFFFFFF
+            return True, enc
+        if p is None:
+            return True, 0
+        return False, str(p)
 
     def _encrypt_program(self, key: int, shift_period: int) -> str:
         """序列化 prog 为 Lua 表，数字元素加密。
@@ -955,24 +1123,56 @@ return {fn_name}()
         shift_key = (pc // shift_period) & 0xFFFF，让 opcode 含义随 PC 位置变化。"""
         parts = []
         for pc, ins in enumerate(self.prog[1:], start=1):
-            shift_key = (pc // shift_period) & 0xFFFF
             elem_parts = []
             for i, p in enumerate(ins, start=1):
-                if isinstance(p, str):
-                    elem_parts.append(self._fmt_str(p))
-                elif isinstance(p, (int, float)):
-                    val = int(p) & 0xFFFFFFFF
-                    enc = (val ^ ((key + pc + i) & 0xFFFFFFFF)) & 0xFFFFFFFF
-                    # opcode 字段（第 1 个元素）额外异或 shift_key
-                    if i == 1:
-                        enc = (enc ^ shift_key) & 0xFFFFFFFF
-                    elem_parts.append(str(enc))
-                elif p is None:
-                    elem_parts.append("0")
+                is_num, val = self._encrypted_elem(pc, i, p, key, shift_period)
+                if is_num:
+                    elem_parts.append(str(val))
                 else:
-                    elem_parts.append(str(p))
+                    elem_parts.append(val)
             parts.append("{" + ",".join(elem_parts) + "}")
         return "{" + ",".join(parts) + "}"
+
+    def _compute_seg_crc(self, lo: int, hi: int, key: int, shift_period: int) -> int:
+        """计算字节码段 [lo, hi]（1-based PC，闭区间）的 CRC32。
+        仅对数字元素（加密后的 32-bit 值，每个拆成 4 个小端字节）参与计算，
+        与运行期 _crc_seg 的遍历方式逐字节一致。"""
+        crc = 0xFFFFFFFF
+        tab = _CRC32_TABLE
+        for pc in range(lo, hi + 1):
+            ins = self.prog[pc]
+            for i, p in enumerate(ins, start=1):
+                is_num, val = self._encrypted_elem(pc, i, p, key, shift_period)
+                if not is_num:
+                    continue
+                v = val & 0xFFFFFFFF
+                for j in range(4):
+                    b = (v >> (8 * j)) & 0xFF
+                    crc = (crc >> 8) ^ tab[(crc ^ b) & 0xFF]
+        return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+    def _build_segments(self, key: int, shift_period: int):
+        """把字节码流切成 3-6 段，每段计算 CRC32 校验和。
+        返回 [(lo, hi, crc), ...]，运行期逐段校验，篡改任一段即触发静默 corrupt。"""
+        bc_len = len(self.prog) - 1  # prog[0] 是占位
+        if bc_len < 1:
+            return []
+        num_segments = self.rng.randint(3, 6)
+        num_segments = min(num_segments, bc_len)
+        seg_size = max(1, bc_len // num_segments)
+        segments = []
+        for s in range(num_segments):
+            lo = 1 + s * seg_size
+            if s == num_segments - 1:
+                hi = bc_len
+            else:
+                hi = lo + seg_size - 1
+            if lo > hi:
+                continue
+            crc = self._compute_seg_crc(lo, hi, key, shift_period)
+            segments.append((lo, hi, crc))
+        return segments
+
 
     def _fmt_const(self, c):
         if isinstance(c, float) and c.is_integer():
@@ -1062,7 +1262,7 @@ return {fn_name}()
 
     def _gen_handler_chain(self, op_var, reg_var, consts_var, strs_var,
                            pc_var, inst_var, bin_dispatch, un_dispatch,
-                           run_var, rets_var, va_var, uv_var) -> str:
+                           run_var, rets_var, va_var, uv_var, jt_var) -> str:
         op_order = list(self.opcode.keys())
         self.rng.shuffle(op_order)
         handlers = []
@@ -1070,7 +1270,7 @@ return {fn_name}()
             variants = self.opcode_variants[op_name]
             h = self._gen_handler(op_name, reg_var, consts_var,
                                   strs_var, pc_var, inst_var, bin_dispatch, un_dispatch,
-                                  run_var, rets_var, va_var, uv_var)
+                                  run_var, rets_var, va_var, uv_var, jt_var)
             handlers.append((variants, h))
         handlers.sort(key=lambda x: x[0][0])
         parts = []
@@ -1084,7 +1284,7 @@ return {fn_name}()
         return "\n".join(parts)
 
     def _gen_handler(self, op_name, R, C, S, pc_var, I, bin_d, un_d,
-                     RUN, RETS, VA, UV) -> str:
+                     RUN, RETS, VA, UV, JT) -> str:
         # 假 opcode（JUNK1-8）：dispatcher 里有 handler，看起来像真实逻辑
         # 但执行无害操作（写入死寄存器或读取后丢弃），反汇编器无法分辨真假
         # 每个 JUNK 用不同的伪操作模式，增加分析难度
@@ -1130,11 +1330,13 @@ return {fn_name}()
         elif op_name == "UNOP":
             return f'local d,a,c={I}[2],{I}[3],{I}[4] {un_d}'
         elif op_name == "JMP":
-            return f'{pc_var}={pc_var}+{I}[2]'
+            # P1-2 控制流平坦化：跳转目标间接化
+            # I[2] 是 jump_targets 表的索引（1-based），运行时查找真实 PC
+            return f'{pc_var}={JT}[{I}[2]] _jmp=true'
         elif op_name == "CJMP":
-            return f'if {R}[{I}[2]] then {pc_var}={pc_var}+{I}[3] end'
+            return f'if {R}[{I}[2]] then {pc_var}={JT}[{I}[3]] _jmp=true end'
         elif op_name == "NJMP":
-            return f'if not {R}[{I}[2]] then {pc_var}={pc_var}+{I}[3] end'
+            return f'if not {R}[{I}[2]] then {pc_var}={JT}[{I}[3]] _jmp=true end'
         elif op_name == "CALL":
             return (f'local _fn={R}[{I}[3]] local _args={{}} '
                     f'for _ai=1,{I}[4] do _args[_ai]={R}[{I}[4+_ai]] end '
@@ -1185,17 +1387,20 @@ return {fn_name}()
             # 写入闭包 upvalue 表（捕获变量）
             return f'{UV}[_dec_str({S}[{I}[2]+1])]={R}[{I}[3]]'
         elif op_name == "FORPREP":
+            # I[6] 是 jump_targets 索引（1-based），跳到循环结束
             return (f'{R}[{I}[2]]={R}[{I}[3]] '
                     f'if ({R}[{I}[5]]>0 and {R}[{I}[3]]>{R}[{I}[4]]) '
                     f'or ({R}[{I}[5]]<0 and {R}[{I}[3]]<{R}[{I}[4]]) '
-                    f'then {pc_var}={pc_var}+{I}[6] end')
+                    f'then {pc_var}={JT}[{I}[6]] _jmp=true end')
         elif op_name == "FORLOOP":
+            # I[5] 是 jump_targets 索引（1-based），跳回循环开始
             return (f'{R}[{I}[2]]={R}[{I}[2]]+{R}[{I}[4]] '
                     f'if ({R}[{I}[4]]>0 and {R}[{I}[2]]<={R}[{I}[3]]) '
                     f'or ({R}[{I}[4]]<0 and {R}[{I}[2]]>={R}[{I}[3]]) '
-                    f'then {pc_var}={pc_var}+{I}[5] end')
+                    f'then {pc_var}={JT}[{I}[5]] _jmp=true end')
         elif op_name == "BREAK":
-            return f'{pc_var}={pc_var}+999'
+            # BREAK 跳到循环结束 label（通过 jump_targets 间接查找）
+            return f'{pc_var}={JT}[{I}[2]]'
         return f'-- unknown {op_name}'
 
 

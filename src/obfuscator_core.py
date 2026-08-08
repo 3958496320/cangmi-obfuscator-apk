@@ -7580,11 +7580,16 @@ def obfuscate(src: str,
     # 失败则保留原代码（安全闸：绝不报错，不影响注入器兼容性）。
     if not disable_vm_pro:
         try:
-            from vm_pro import vm_pro_compile
+            # bundle（单文件）：vm_pro 已内联在同一文件，vm_pro_compile 直接可用
+            # modular（src/）：从独立 vm_pro 模块导入
+            try:
+                from vm_pro import vm_pro_compile as _vm_pro_compile
+            except ImportError:
+                _vm_pro_compile = vm_pro_compile  # type: ignore[name-defined]
             _final_chunk = parse_source(src)
             if _final_chunk:
                 _gen_vp = NameGenerator(rng)
-                _vm_code = vm_pro_compile(_final_chunk, rng, _gen_vp)
+                _vm_code = _vm_pro_compile(_final_chunk, rng, _gen_vp)
                 if _vm_code:
                     code = _WATERMARK_HEADER + _vm_code + _LEGAL_FOOTER
                     stats["vm_pro"] = "enabled"
