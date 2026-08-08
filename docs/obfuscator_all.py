@@ -3917,7 +3917,9 @@ def _walk_inject(node: Node, rng: random.Random, gen: NameGenerator,
                 if max_pos < 0:
                     max_pos = 0
                 pos = rng.randint(0, max_pos)
-                val.insert(pos, _gen_garbage_block(gen, rng))
+                gb = _gen_garbage_block(gen, rng)
+                gb.attrs["_no_const_encrypt"] = True  # v8: 垃圾块常量不 MBA 膨胀，减小产物
+                val.insert(pos, gb)
                 injected[0] += 1
             # 继续递归这些语句
             for s in val:
@@ -4967,6 +4969,7 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
                   exprs=[N("True")])],
           elifs=[], else_body=None),
     ])
+    glm_count_chk.attrs["_no_const_encrypt"] = True  # v8: 检测块常量不 MBA 膨胀
 
     # v7 新增检测：tick() 连续采样差值异常（单步调试特征）
     # 正常执行两次 tick() 差值极小（<0.001s），单步调试时差值显著放大
@@ -4996,6 +4999,7 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
                   exprs=[N("True")])],
           elifs=[], else_body=None),
     ])
+    tick_chk.attrs["_no_const_encrypt"] = True  # v8: 检测块常量不 MBA 膨胀
 
     all_blocks = (dbg_block_body + ge_block_body + hf_block_body
                   + ie_block_body + env_block_body
@@ -5041,15 +5045,19 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
         group_body = []
         for u in group:
             group_body.extend(u)
-        dispersed.append(N("Do", body=group_body))
+        _grp_do = N("Do", body=group_body)
+        _grp_do.attrs["_no_const_encrypt"] = True  # v8: 检测块内部常量不 MBA 膨胀
+        dispersed.append(_grp_do)
         # 组间噪声：计数器自增（无副作用，但让 do-block 不相邻）
         if gi + group_size < len(units):
-            dispersed.append(N("Do", body=[
+            _noise_do = N("Do", body=[
                 N("Assign", targets=[name_node(_disp_counter)],
                  exprs=[N("BinOp", op="+",
                           left=name_node(_disp_counter),
                           right=number_node(1))])
-            ]))
+            ])
+            _noise_do.attrs["_no_const_encrypt"] = True  # v8
+            dispersed.append(_noise_do)
 
     # v8 薄弱点C：glm/tick 检测已加入 all_blocks 随机打散（见上方构造），
     # 不再在分散后追加，避免位置固定末尾被破解者定位。
@@ -5543,9 +5551,16 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     prelude.append(N("LocalAssign", names=[flag], exprs=[N("False")]))
     prelude.append(N("LocalAssign", names=[counter],
                      exprs=[N("Table", fields=[])]))
-    prelude.append(N("LocalAssign", names=[fa], exprs=[number_node(fa_init)]))
-    prelude.append(N("LocalAssign", names=[fb], exprs=[number_node(fb_init)]))
-    prelude.append(N("LocalAssign", names=[fc], exprs=[number_node(fc_init)]))
+    # v8: fa/fb/fc 初值是保护逻辑内部参数，标记不 MBA 膨胀，避免常量加密导致产物过大
+    _fa_la = N("LocalAssign", names=[fa], exprs=[number_node(fa_init)])
+    _fa_la.attrs["_no_const_encrypt"] = True
+    _fb_la = N("LocalAssign", names=[fb], exprs=[number_node(fb_init)])
+    _fb_la.attrs["_no_const_encrypt"] = True
+    _fc_la = N("LocalAssign", names=[fc], exprs=[number_node(fc_init)])
+    _fc_la.attrs["_no_const_encrypt"] = True
+    prelude.append(_fa_la)
+    prelude.append(_fb_la)
+    prelude.append(_fc_la)
 
     # 子 flag 篡改辅助：检测到异常时把子 flag 设为"污染值"（与初值不同）
     def _taint(sub_flag_var: str):
@@ -5577,6 +5592,7 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
         env_check("workspace", "userdata", target=fa),
         env_check("print", "function", target=fa),
     ])
+    env_block.attrs["_no_const_encrypt"] = True  # v8: 保护逻辑内部常量不 MBA 膨胀
     prelude.append(env_block)
     stats["checks"] += 3
 
@@ -5611,6 +5627,7 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
         env_check("os", "table", target=fc),
         env_check("coroutine", "table", target=fc),
     ])
+    ext_env_block.attrs["_no_const_encrypt"] = True  # v8: 保护逻辑内部常量不 MBA 膨胀
     prelude.append(ext_env_block)
     stats["checks"] += 19
 
@@ -5631,7 +5648,7 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     prelude.append(N("Do", body=cp_block_body))
 
     # 4) 反内存扫描：大量无意义局部（do-block 隔离）
-    noise_count = rng.randint(8, 16)
+    noise_count = rng.randint(6, 12)
     noise_body = []
     for _ in range(noise_count):
         nm = gen.fresh()
@@ -5641,20 +5658,24 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                             exprs=[N("BinOp", op="~",
                                      left=name_node(nm),
                                      right=number_node(rng.randint(1, 255)))]))
-    prelude.append(N("Do", body=noise_body))
+    _noise_do = N("Do", body=noise_body)
+    _noise_do.attrs["_no_const_encrypt"] = True  # v8: 噪声常量不 MBA 膨胀
+    prelude.append(_noise_do)
     stats["noise"] = noise_count
 
     # 5) 行为伪装：有界无用循环
-    camo_iters = rng.randint(50, 300)
+    camo_iters = rng.randint(30, 150)
     camo_var = gen.fresh()
-    prelude.append(N("Do", body=[
+    _camo_do = N("Do", body=[
         N("LocalAssign", names=[camo_var], exprs=[number_node(0)]),
         N("NumericFor", var=gen.fresh(), start=number_node(1),
           limit=number_node(camo_iters), step=None,
           body=[N("Assign", targets=[name_node(camo_var)],
                   exprs=[N("BinOp", op="+", left=name_node(camo_var),
                            right=number_node(1))])]),
-    ]))
+    ])
+    _camo_do.attrs["_no_const_encrypt"] = True  # v8: 伪装循环常量不 MBA 膨胀
+    prelude.append(_camo_do)
 
     # 6) 递归自检：栈深度检测（pcall 包裹 debug.getinfo）
     stack_fn = N("Function", params=[], is_vararg=False, body=[
@@ -5745,11 +5766,13 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
     cp_cond = cp_verify_conds[0]
     for c in cp_verify_conds[1:]:
         cp_cond = N("BinOp", op="or", left=cp_cond, right=c)
-    prelude.append(N("Do", body=[
+    _cp_verify_do = N("Do", body=[
         N("If", cond=cp_cond,
           body=[_taint(fc)],
           elifs=[], else_body=None),
-    ]))
+    ])
+    _cp_verify_do.attrs["_no_const_encrypt"] = True  # v8
+    prelude.append(_cp_verify_do)
     stats["checks"] += 1
 
     # 8.65) 多 flag 交叉校验汇总（薄弱点2增强核心 + 薄弱点A极致增强）
@@ -5782,9 +5805,11 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
           body=[N("Assign", targets=[name_node(flag)], exprs=[N("True")])],
           elifs=[], else_body=None),
     ])
-    prelude.append(N("Do", body=[
+    _xcheck_do = N("Do", body=[
         N("LocalAssign", names=["_xok"], exprs=[_pcall(N("Paren", expr=xcheck_fn))]),
-    ]))
+    ])
+    _xcheck_do.attrs["_no_const_encrypt"] = True  # v8: 派生常数不 MBA 膨胀
+    prelude.append(_xcheck_do)
     stats["checks"] += 1
 
     # 8.7) 定时自校验 + 自动恢复（提升8）
@@ -5908,6 +5933,8 @@ def inject_runtime_protection(chunk: Node, rng: random.Random,
                     ])))]),
         ]),
     ]
+    # v8: 定时交叉校验的派生常数不 MBA 膨胀
+    verify_body[-1].attrs["_no_const_encrypt"] = True
 
     # 异步定时执行：pcall(spawn(function() while true do task.wait(n); pcall(verify) end end))
     # 逃生：若 task.wait 未真正 yield（注入器缺陷），连续两次迭代间隔极短则跳出。
@@ -6540,21 +6567,15 @@ def _build_time_probe(gen: NameGenerator, rng: random.Random,
     t1 = gen.fresh()
     t2ok = gen.fresh()
     t2 = gen.fresh()
-    window = gen.fresh()
     threshold = rng.uniform(0.3, 1.5)  # 秒
-    W = rng.randint(3, 5)  # 滑动窗口大小
-    M = rng.randint(2, 3)  # 触发阈值（连续 M 次慢才触发）
+    M = rng.randint(2, 3)  # 连续慢次数阈值
+    slow_streak = gen.fresh()  # 连续慢计数器
     clock_fn = N("Function", params=[], is_vararg=False, body=[
         N("Return", exprs=[call_node(
             index_node(name_node("os"), string_node("clock")), [])])
     ])
-    slow_idx = gen.fresh()
-    slow_cnt = gen.fresh()
-    win_len = gen.fresh()
-    start_idx = gen.fresh()
-    return N("Do", body=[
-        # 滑动窗口表初始化（首次进入时为空表）
-        N("LocalAssign", names=[window], exprs=[N("Table", fields=[])]),
+    _tp = N("Do", body=[
+        N("LocalAssign", names=[slow_streak], exprs=[number_node(0)]),
         N("LocalAssign", names=[t1ok, t1], exprs=[
             _pcall(N("Paren", expr=clock_fn))
         ]),
@@ -6569,7 +6590,7 @@ def _build_time_probe(gen: NameGenerator, rng: random.Random,
                     index_node(name_node("os"), string_node("clock")), [])])
             ])))
         ]),
-        # 记录本次采样：慢(1)/正常(0) 追加到窗口表
+        # 连续慢计数：慢则 streak+1，正常则重置为 0
         N("If",
           cond=N("BinOp", op="and",
                  left=N("BinOp", op="and",
@@ -6584,60 +6605,24 @@ def _build_time_probe(gen: NameGenerator, rng: random.Random,
                                         left=name_node(t2),
                                         right=name_node(t1))),
                                  right=number_node(round(threshold, 4))))),
-          body=[N("Assign",
-                  targets=[N("Index", obj=name_node(window),
-                             key=N("BinOp", op="+",
-                                   left=N("UnaryOp", op="#",
-                                          operand=name_node(window)),
-                                   right=number_node(1)))],
-                  exprs=[number_node(1)])],
+          body=[N("Assign", targets=[name_node(slow_streak)],
+                  exprs=[N("BinOp", op="+",
+                           left=name_node(slow_streak),
+                           right=number_node(1))])],
           elifs=[],
-          else_body=[N("Assign",
-                  targets=[N("Index", obj=name_node(window),
-                             key=N("BinOp", op="+",
-                                   left=N("UnaryOp", op="#",
-                                          operand=name_node(window)),
-                                   right=number_node(1)))],
+          else_body=[N("Assign", targets=[name_node(slow_streak)],
                   exprs=[number_node(0)])]),
-        # 滑动窗口判定：窗口满 W 次后，统计最近 W 次的慢次数
-        N("LocalAssign", names=[win_len], exprs=[
-            N("UnaryOp", op="#", operand=name_node(window))]),
+        # 连续 M 次慢才触发 flag
         N("If",
           cond=N("BinOp", op=">=",
-                 left=name_node(win_len),
-                 right=number_node(W)),
-          body=[N("Do", body=[
-              N("LocalAssign", names=[slow_cnt], exprs=[number_node(0)]),
-              N("LocalAssign", names=[start_idx], exprs=[
-                  N("BinOp", op="+",
-                    left=N("BinOp", op="-",
-                           left=name_node(win_len),
-                           right=number_node(W)),
-                    right=number_node(1))]),
-              N("NumericFor", var=slow_idx,
-                start=name_node(start_idx),
-                limit=name_node(win_len),
-                step=None,
-                body=[N("If",
-                  cond=N("BinOp", op="==",
-                         left=N("Index", obj=name_node(window),
-                                key=name_node(slow_idx)),
-                         right=number_node(1)),
-                  body=[N("Assign", targets=[name_node(slow_cnt)],
-                          exprs=[N("BinOp", op="+",
-                                   left=name_node(slow_cnt),
-                                   right=number_node(1))])],
-                  elifs=[], else_body=None)]),
-              N("If",
-                cond=N("BinOp", op=">=",
-                       left=name_node(slow_cnt),
-                       right=number_node(M)),
-                body=[N("Assign", targets=[name_node(flag_name)],
-                        exprs=[N("True")])],
-                elifs=[], else_body=None),
-          ])],
+                 left=name_node(slow_streak),
+                 right=number_node(M)),
+          body=[N("Assign", targets=[name_node(flag_name)],
+                  exprs=[N("True")])],
           elifs=[], else_body=None),
     ])
+    _tp.attrs["_no_const_encrypt"] = True  # v8: 滑动窗口常量不 MBA 膨胀
+    return _tp
 
 
 def _build_getinfo_probe(gen: NameGenerator, rng: random.Random,
@@ -7687,15 +7672,23 @@ def obfuscate_code(code_str, ninja_mode=False):
     内部调用 obfuscate() 并取其返回字典中的 "code" 字段。
 
     参数：
-        ninja_mode: 忍者注入器兼容模式。**不关闭任何保护层**
-                    （VM / loadstring / dyninst 全开，保护强度不降低），
-                    仅对最终产物做更激进的行宽整形（max_line=120 vs 默认 200），
-                    消除让弱注入器解析卡顿的超长单行巨型表字面量。
-                    卡顿真凶是单行数千字符的表字面量（如雷达 Positions 表
-                    ×加密字符串展开），而非保护层本身；行宽整形在表项逗号处
-                    安全折行，Luau 表字面量允许换行，语义零变化。
+        ninja_mode: 忍者注入器兼容模式。仅控制行宽整形（max_line=120 vs 200）。
+                    不影响保护层开关（见下方默认禁用说明）。
+
+    默认禁用 VM / dyninst / loadstring（弱注入器兼容）：
+        这三个特性是产物体积膨胀的主因（VM 解释器 19 handler + 洗牌循环、
+        dyninst 把运算符变函数调用、loadstring 动态代码生成）。
+        在忍者注入器等弱注入器上，大产物会导致解析超时→脚本启动无反应。
+        禁用后仍保留 10 层保护全开（L0 水印 / L1 字符串加密 / L1b 常量加密 /
+        L2 重命名 / L3 CFF 控制流平坦化 / L4 垃圾代码 / L4b 三元伪装 /
+        L5 反调试 / L6 多态诱饵 / L7 API 重定向 / L8 运行时保护 /
+        L10 代码块分割 / L11 反启发式），含 v7/v8 全部增强
+        （多 flag 交叉校验 / 检测点分散 / 滑动窗口时间检测）。
     """
-    code = obfuscate(code_str)["code"]  # 全保护，不 disable 任何层
+    code = obfuscate(code_str,
+                     disable_vm=True,           # VM 解释器体积大，弱注入器解析超时
+                     disable_dyninst=True,      # dyninst 运算符→函数调用增加解析负担
+                     disable_loadstring=True)["code"]  # loadstring 动态加载在弱注入器上不稳定
     max_line = 120 if ninja_mode else 200
     return _wrap_long_lines(code, max_line=max_line)
 
