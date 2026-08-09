@@ -42,6 +42,9 @@ import time
 
 
 # =============================================================================
+
+
+# =============================================================================
 # === obfuscator_core.py (monolith: ast_parser..adaptive_engine..core) ===
 # =============================================================================
 
@@ -6867,10 +6870,11 @@ _PROFILE_SMALL = {
 
 _PROFILE_MEDIUM = {
     "name": "medium",
-    "dyninst_points": 40,
-    "chunk_split_max_order": 25,
+    # 全档位统一最强保护：不管脚本大小，所有保护层开到最大值
+    "dyninst_points": 50,
+    "chunk_split_max_order": 30,
     "anti_heuristic": True,
-    "garbage_ratio": 1.3,
+    "garbage_ratio": 1.6,
     "cff_max_states": 50,            # 红线最大值
     "vm_enable": True,
     "loadstring_enable": True,
@@ -6878,11 +6882,11 @@ _PROFILE_MEDIUM = {
 
 _PROFILE_LARGE = {
     "name": "large",
-    # 大脚本(>500行)：适度控制强度避免输出过大导致注入器加载失败
-    "dyninst_points": 30,
-    "chunk_split_max_order": 20,
+    # 全档位统一最强保护：不管脚本大小，所有保护层开到最大值
+    "dyninst_points": 50,
+    "chunk_split_max_order": 30,
     "anti_heuristic": True,
-    "garbage_ratio": 1.0,
+    "garbage_ratio": 1.6,
     "cff_max_states": 50,            # 红线最大值
     "vm_enable": True,
     "loadstring_enable": True,
@@ -8369,22 +8373,22 @@ def obfuscate_code(code_str, ninja_mode=False):
         ninja_mode: 忍者注入器兼容模式。仅控制行宽整形（max_line=120 vs 200）。
                     不影响保护层开关（见下方说明）。
 
-    保护策略（91% 保护 / 9% 性能）：
-        disable_vm=True:        关闭 L3 旧版逐函数 VM（体积大、与 vm_pro 冗余）。
-        disable_vm_pro=False:   开启付费级字节码 VM（vm_pro）——把整个脚本编译成
+    保护策略（100% 最强保护，所有层全开）：
+        disable_vm=False:      开启 L3 旧版逐函数 VM（vm_pro 失败时的回退保护）。
+        disable_vm_pro=False:  开启付费级字节码 VM（vm_pro）——把整个脚本编译成
                                 扁平字节码流 + 加密多态解释器，这是最高级保护。
-        disable_dyninst=True:   dyninst 运算符→函数调用增加解析负担，与 vm_pro 冗余。
-        disable_loadstring=True: loadstring 动态加载在弱注入器上不稳定。
+        disable_dyninst=False: 开启 L9 动态指令替换（运算符→_G 函数调用）。
+        disable_loadstring=False: 开启 L8 loadstring 动态加载（带 pcall + inline 回退，安全）。
 
         vm_pro 成功时：输出 = 水印 + 字节码VM解释器 + 法律声明，
         自带字符串加密 / 常量加密 / 控制流平坦化 / 反调试 / 多态。
         vm_pro 失败时：安全回退到 12 层混淆产物（L0-L11 全开），绝不报错。
     """
     code = obfuscate(code_str,
-                     disable_vm=True,           # 旧版逐函数 VM（与 vm_pro 冗余，关闭）
+                     disable_vm=False,          # 旧版逐函数 VM 全开（vm_pro 回退保护）
                      disable_vm_pro=False,      # 付费级字节码 VM（最高保护，始终开启）
-                     disable_dyninst=True,      # dyninst 与 vm_pro 冗余
-                     disable_loadstring=True)["code"]  # loadstring 弱注入器不稳定
+                     disable_dyninst=False,     # L9 动态指令替换全开
+                     disable_loadstring=False)["code"]  # L8 loadstring 全开（带回退，安全）
     max_line = 120 if ninja_mode else 200
     return _wrap_long_lines(code, max_line=max_line)
 
