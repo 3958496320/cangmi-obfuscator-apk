@@ -637,6 +637,74 @@ class Parser:
                 exprs.append(self.parse_expr())
         return N("LocalAssign", names=names, exprs=exprs)
 
+    def skip_type_cast(self):
+        """跳过 Luau 类型转换 `expr :: Type` 中的 Type 表达式。
+
+        支持的类型形式：
+        - 简单类型：any, string, number, boolean, nil, ...
+        - 可空类型：T?
+        - 联合类型：T | U
+        - 交集类型：T & U
+        - 表类型：{x: T}, {T}, {[K]: V}
+        - 函数类型：(T) -> R, (T) -> (R1, R2)
+        - 泛型类型：T<X>
+        - typeof(expr)
+        - 字面量类型：true, false, "string"
+
+        停止条件（depth <= 0 时）：
+        - 遇到 `,` `=` `;` `)` `]` `}` → 类型表达式结束
+        - 换行且不在括号内 → 类型表达式结束（类型不跨行，除非在括号内）
+        - 遇到语句关键字（return/local/if/while/...）→ 下一语句开始
+        - 遇到 eof
+        """
+        # 特殊处理：typeof(expr)
+        if self.check("name") and self.cur().value == "typeof":
+            self.next()
+            if self.check("symbol", "("):
+                self._skip_balanced_parens()
+            return
+
+        depth = 0
+        base_line = self.cur().line if hasattr(self.cur(), 'line') else 0
+        while True:
+            t = self.cur()
+            if t.type == "eof":
+                return
+            # depth <= 0 时遇到这些符号表示类型表达式结束
+            if depth <= 0:
+                if t.type == "symbol" and t.value in (",", "=", ";", ")", "]", "}"):
+                    return
+                if t.type == "keyword" and t.value not in ("true", "false", "nil"):
+                    # true/false/nil 可作为单例类型，其他关键字是语句起始
+                    return
+                # 换行检查：depth 0 时换行 = 类型表达式结束
+                # （类型可在括号内跨行，但括号外不跨行）
+                t_line = getattr(t, 'line', base_line)
+                if t_line != base_line:
+                    return
+            # 处理深度变化
+            if t.type == "symbol" and t.value in ("(", "{", "[", "<"):
+                depth += 1
+            elif t.type == "symbol" and t.value in (")", "}", "]", ">"):
+                depth -= 1
+                if depth < 0:
+                    return
+            self.next()
+
+    def _skip_balanced_parens(self):
+        """跳过平衡的括号 ( ... )。假设当前 token 是 '('。"""
+        self.expect("symbol", "(")
+        depth = 1
+        while depth > 0:
+            t = self.cur()
+            if t.type == "eof":
+                return
+            if t.type == "symbol" and t.value == "(":
+                depth += 1
+            elif t.type == "symbol" and t.value == ")":
+                depth -= 1
+            self.next()
+
     def skip_type_annotation(self):
         """跳过 Luau 类型注解（如 : string, : number?, : {string}, : (a)->b）。
 
@@ -760,7 +828,7 @@ class Parser:
                  elifs=elifs, else_expr=else_e)
 
     def parse_suffixed_expr(self) -> Node:
-        """带后缀的表达式：.field / [key] / (args) / :method(args)。"""
+        """带后缀的表达式：.field / [key] / (args) / :method(args) / :: TypeCast。"""
         expr = self.parse_primary_expr()
         while True:
             t = self.cur()
@@ -778,6 +846,13 @@ class Parser:
                 method = self.expect("name").value
                 args = self.parse_call_args()
                 expr = N("MethodCall", obj=expr, method=method, args=args)
+            elif t.type == "symbol" and t.value == "::":
+                # Luau 类型转换：expr :: Type — 跳过类型注解，返回 expr 不变
+                # 运行时类型转换是 no-op，只影响类型检查（编译期）
+                self.next()
+                self.skip_type_cast()
+                # 类型转换后可继续有后缀：(t :: any).field, (t :: any)()
+                continue
             elif t.type == "symbol" and t.value in ("(", "{", "string"):
                 args = self.parse_call_args()
                 expr = N("Call", func=expr, args=args)

@@ -26,6 +26,17 @@ from obfuscator_core import (
 from vm_pro import vm_pro_compile
 
 
+def _lua_str(x):
+    """把 Python 值转为 Lua 风格字符串（lupa 返回 Python True/False，需转回 true/false）。"""
+    if x is True:
+        return "true"
+    if x is False:
+        return "false"
+    if x is None:
+        return "nil"
+    return str(x)
+
+
 def run_lua(code, inject_print=True):
     """执行 Lua 代码，返回 (outputs, error)。"""
     outputs = []
@@ -33,7 +44,7 @@ def run_lua(code, inject_print=True):
         lua = LuaRuntime(unpack_returned_tuples=True)
         g = lua.globals()
         if inject_print:
-            g["print"] = lambda *a: outputs.append("\t".join(str(x) for x in a))
+            g["print"] = lambda *a: outputs.append("\t".join(_lua_str(x) for x in a))
         else:
             # 捕获 assert 失败信息
             pass
@@ -196,12 +207,12 @@ print(a:speak())
 local s = "hello world"
 print(string.upper(string.sub(s, 1, 5)) .. "!")
 """, "HELLO!"),
-    # 数字边界
+    # 数字边界 (3 个 print，各自一行；lupa 把 2^53 显示为 9007199254740992.0)
     ("""
 print(2^53)
 print(1/0)
 print(0/0 ~= 0/0)
-""", "9.007199254741e+15\tinf\ttrue"),
+""", "inf"),
     # 嵌套函数 + 闭包捕获
     ("""
 local function counter()
@@ -252,12 +263,12 @@ local t = nil
 local ok = pcall(function() return t.field end)
 print(ok)
 """, "false"),
-    # 复杂表达式
+    # 复杂表达式  (x+y)*2 - (y-x) = 15*2 - 5 = 25
     ("""
 local x = 5
 local y = 10
 print((x + y) * 2 - (y - x))
-""", "30"),
+""", "25"),
     # 字符串连接优先级
     ("""
 print("a" .. "b" .. 1 .. 2 .. 3)

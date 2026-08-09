@@ -49,6 +49,8 @@ _PRO_OPCODES = [
     "GETGLOB", "SETGLOB", "GETUV", "SETUV", "COPYUV",
     "FORPREP", "FORLOOP",
     "BREAK",
+    "LOADVA", "APPENDVA",  # varargs 表加载/追加（function(...){...}）
+    "CALLVA",  # 带尾部 vararg 展开的函数调用 f(a, b, ...)
 ]
 # 假 opcode（编译器从不 emit，但占用 opcode 码点 + 在 dispatcher 有 handler）
 # P3 升级：假 opcode 数量与真 opcode 1:1（33 真 → 32 假），大幅增加反汇编噪音
@@ -133,10 +135,15 @@ class ProVMCompiler:
         self._local_stack: List[set] = [set()]
         # 循环结束标签栈（用于 BREAK）
         self._loop_end_stack: List[str] = []
+        # 循环 continue 标签栈（用于 CONTINUE，指向循环条件检查入口）
+        self._loop_continue_stack: List[str] = []
         # 待编译函数
         self._pending_funcs: List[Tuple] = []
         # 闭包捕获变量集合：这些变量改用 _G 存储（GETGLOB/SETGLOB），实现跨调用帧共享
         self._captured_vars: set = set()
+        # 是否正在编译函数体（True=函数体内，False=顶层）
+        # 顶层引用捕获变量应走 GETGLOB（顶层无 _uv 表），函数体内走 GETUV
+        self._in_function: bool = False
         # 花指令概率（控制插入密度，0.08 ≈ 每 12 条指令插 1 条）
         self._junk_rate = 0.08
         # 死寄存器计数器（花指令写入专用，不污染真寄存器）
@@ -460,10 +467,17 @@ class ProVMCompiler:
         elif t == "Name":
             name = node.get("name")
             if name in self._captured_vars:
+                # 捕获变量：无论顶层还是函数体内，都走 GETUV 读 UV 表。
+                # 顶层 _run(1, {}) 的 UV 表存储了所有 SETUV 写入的捕获变量；
+                # 函数体内 UV 表是 CLOSURE 时从外层 UV 复制而来。
+                # 之前仅对 _in_function=True 走 GETUV，导致顶层引用捕获变量时
+                # 走 GETGLOB 读 _G（变量从未 SETGLOB）→ 返回 nil → 索引 nil 报错。
                 self._emit("GETUV", dest_reg, self._str_idx(name))
             elif self._is_local(name):
                 self._emit("MOVR", dest_reg, self._reg_of(name))
             else:
+                # 未捕获变量：走 GETGLOB 读 _G
+                # 注：顶层 local function 也会 SETGLOB 到 _G，保证函数体内 GETGLOB 能读到
                 self._emit("GETGLOB", dest_reg, self._str_idx(name))
         elif t == "BinOp":
             self._compile_binop(node, dest_reg)
@@ -487,6 +501,13 @@ class ProVMCompiler:
             self._compile_table(node, dest_reg)
         elif t == "Paren":
             self._compile_expr(node.get("expr"), dest_reg)
+        elif t == "Vararg":
+            # `...` 表达式：加载当前调用的 varargs 表 va_var（{...}）
+            # 用于 function(...) return {...} end 或 local t = {...} 等场景
+            self._emit("LOADVA", dest_reg)
+        elif t == "Dots":
+            # 兼容别名
+            self._emit("LOADVA", dest_reg)
         else:
             self._emit("LOADNIL", dest_reg)
         return dest_reg
@@ -521,15 +542,31 @@ class ProVMCompiler:
         args = node.get("args") or []
         if func_node.type == "Name":
             fname = func_node.get("name")
-            if self._is_local(fname):
+            if fname in self._captured_vars:
+                # 捕获变量函数：无论顶层还是函数体内，都走 GETUV 读 UV 表
+                # （与 Name handler 的修复保持一致）
+                func_reg = self._new_reg()
+                self._emit("GETUV", func_reg, self._str_idx(fname))
+            elif self._is_local(fname):
                 func_reg = self._reg_of(fname)
             else:
+                # 未捕获变量：走 GETGLOB
                 func_reg = self._new_reg()
                 self._emit("GETGLOB", func_reg, self._str_idx(fname))
         else:
             func_reg = self._compile_expr(func_node)
-        arg_regs = [self._compile_expr(a) for a in args]
-        self._emit("CALL", dest_reg, func_reg, len(arg_regs), *arg_regs)
+        # 检测尾部 vararg 参数：f(a, b, ...) 需要展开所有 varargs
+        # 这种情况下使用 CALLVA 指令（带 varargs 展开）
+        has_trailing_vararg = args and args[-1].type == "Vararg"
+        if has_trailing_vararg:
+            # 固定参数部分（不含尾部 ...）
+            fixed_args = args[:-1]
+            arg_regs = [self._compile_expr(a) for a in fixed_args]
+            # CALLVA: 展开固定参数 + va_var 全部传给被调函数
+            self._emit("CALLVA", dest_reg, func_reg, len(arg_regs), *arg_regs)
+        else:
+            arg_regs = [self._compile_expr(a) for a in args]
+            self._emit("CALL", dest_reg, func_reg, len(arg_regs), *arg_regs)
 
     def _compile_method_call(self, node, dest_reg: str):
         obj_node = node.get("obj")
@@ -567,6 +604,16 @@ class ProVMCompiler:
 
     def _compile_table(self, node, dest_reg: str):
         fields = node.get("fields") or []
+        # 特殊优化：{...} → 直接复制 va_var（当前调用的 varargs 表）
+        # 这保证 local t = {...} 的 t[1], t[2]... 是所有传入参数
+        if len(fields) == 1:
+            f = fields[0]
+            if f.type in ("TableItem", "TableField"):
+                key = f.get("key")
+                val = f.get("value")
+                if key is None and val is not None and val.type == "Vararg":
+                    self._emit("LOADVA", dest_reg)
+                    return
         self._emit("NEWTAB", dest_reg)
         seq_idx = 0
         for field in fields:
@@ -575,6 +622,12 @@ class ProVMCompiler:
                 val = field.get("value")
                 if key is None:
                     seq_idx += 1
+                    # {...} 作为表元素：展开所有 varargs 到顺序索引
+                    if val is not None and val.type == "Vararg":
+                        # 需要 APPENDVA 指令把 va_var 全部追加到当前表
+                        self._emit("APPENDVA", dest_reg, self._const_idx(seq_idx))
+                        # 后续 seq_idx 无法预知数量，但常见用法 {...} 是唯一元素，直接 return
+                        continue
                     val_reg = self._compile_expr(val)
                     k_reg = self._new_reg()
                     self._emit("LOADK", k_reg, self._const_idx(seq_idx))
@@ -708,16 +761,38 @@ class ProVMCompiler:
                 self._jmp_ph("JMP", 0, label_key=self._loop_end_stack[-1], field=1)
             else:
                 self._emit("JMP", 0)
+        elif t == "Continue":
+            # continue = 跳到当前循环的起始（Continue label）
+            if self._loop_continue_stack:
+                self._jmp_ph("JMP", 0, label_key=self._loop_continue_stack[-1], field=1)
+            else:
+                # 无循环上下文：回退为 break 语义（顶层非法，但防御性处理）
+                if self._loop_end_stack:
+                    self._jmp_ph("JMP", 0, label_key=self._loop_end_stack[-1], field=1)
+                else:
+                    self._emit("JMP", 0)
+        elif t == "Goto":
+            # goto label → 跳到 label 定义处（同函数作用域内）
+            label = node.get("label")
+            if label:
+                self._jmp_ph("JMP", 0, label_key=f"_goto_{label}", field=1)
+        elif t == "Label":
+            # ::label:: → 注册 jump target
+            label = node.get("label")
+            if label:
+                self._label(f"_goto_{label}")
         elif t == "LocalFunction":
             name = node.get("name")
             func = node.get("func")
             self._declare_local(name)
             self._compile_function_expr(func, self._reg_of(name), func_name=name)
-            # 递归支持：捕获变量 → SETTABK 到 _uv 表，普通变量 → SETGLOB 到 _G
-            if name in self._captured_vars:
-                self._emit("SETTABK", self._last_uv_reg, self._str_idx(name), self._reg_of(name))
-            else:
-                self._emit("SETGLOB", self._str_idx(name), self._reg_of(name))
+            # 顶层 local function 始终 SETGLOB 到 _G：
+            # - 顶层引用（print(isEven(10))）走 GETGLOB 读取
+            # - 前向引用（mutual recursion: isEven 调用尚未定义的 isOdd）走 GETGLOB
+            # - 函数体内引用（被捕获）走 GETUV 读 _uv 表
+            #   _uv 表在 _compile_function_expr 中已从 self._reg 预填充该变量
+            # 注意：之前仅对 captured 走 SETTABK 是错的（顶层无 _uv 表，写入丢失）
+            self._emit("SETGLOB", self._str_idx(name), self._reg_of(name))
         elif t == "FunctionDecl":
             name_node = node.get("name")
             func = node.get("func")
@@ -790,25 +865,33 @@ class ProVMCompiler:
         cond_reg = self._compile_expr(node.get("cond"))
         self._jmp_ph("NJMP", cond_reg, 0, label_key=end, field=2)
         self._loop_end_stack.append(end)
+        # continue: 跳回条件检查（start）
+        self._loop_continue_stack.append(start)
         self._push_scope()
         for s in (node.get("body") or []):
             self._compile_stmt(s)
         self._pop_scope()
         self._loop_end_stack.pop()
+        self._loop_continue_stack.pop()
         self._jmp_ph("JMP", 0, label_key=start, field=1)
         self._label(end)
 
     def _compile_repeat(self, node):
         start = f"repeat_start_{id(node)}"
         end = f"repeat_end_{id(node)}"
+        # repeat 的 continue 跳到条件检查（end of body, before cond）
+        cont = f"repeat_cont_{id(node)}"
         self._label(start)
         self._loop_end_stack.append(end)
+        self._loop_continue_stack.append(cont)
         self._push_scope()
         for s in (node.get("body") or []):
             self._compile_stmt(s)
-        cond_reg = self._compile_expr(node.get("cond"))
         self._pop_scope()
+        self._label(cont)
+        cond_reg = self._compile_expr(node.get("cond"))
         self._loop_end_stack.pop()
+        self._loop_continue_stack.pop()
         self._jmp_ph("NJMP", cond_reg, 0, label_key=start, field=2)
         self._label(end)
 
@@ -837,15 +920,20 @@ class ProVMCompiler:
                       0, label_key=end_label, field=5)
         self._label(loop_start_label)
         self._loop_end_stack.append(end_label)
+        # continue: 跳到 FORLOOP（递增 + 条件重检）
+        forloop_label = f"forloop_{id(node)}"
+        self._loop_continue_stack.append(forloop_label)
         self._push_scope()
         for s in (node.get("body") or []):
             self._compile_stmt(s)
         self._pop_scope()
         self._loop_end_stack.pop()
+        self._loop_continue_stack.pop()
         # FORLOOP: var += step; 如果仍满足条件则跳回 loop_start
         # inst = [op, var_reg, limit_store, step_store, back_offset]
         # back_offset 在 field=4（第 5 个元素）
         # 用 label 回填，避免花指令插入导致偏移计算错误
+        self._label(forloop_label)
         self._jmp_ph("FORLOOP", loop_var_reg, limit_store, step_store,
                       0, label_key=loop_start_label, field=4)
         self._label(end_label)
@@ -913,11 +1001,14 @@ class ProVMCompiler:
 
         # 循环体
         self._loop_end_stack.append(end_label)
+        # continue: 跳回 start_label（重新调用迭代器）
+        self._loop_continue_stack.append(start_label)
         self._push_scope()
         for s in (node.get("body") or []):
             self._compile_stmt(s)
         self._pop_scope()
         self._loop_end_stack.pop()
+        self._loop_continue_stack.pop()
 
         # 跳回循环开始
         self._jmp_ph("JMP", 0, label_key=start_label, field=1)
@@ -936,8 +1027,10 @@ class ProVMCompiler:
         params = node.get("params") or []
         old_locals = self._local_stack[:]
         old_reg = self._reg
+        old_in_func = self._in_function
         self._local_stack = [set()]
         self._reg = {}
+        self._in_function = True  # 进入函数体：捕获变量走 GETUV
         # 在函数体开头插入 PARAMS 指令（label 必须在 PARAMS 之前，确保 _run 从 PARAMS 开始）
         self._label(func_id)
         param_regs = [self._reg_of(p) for p in params]
@@ -956,6 +1049,7 @@ class ProVMCompiler:
         self._emit("RET")
         self._local_stack = old_locals
         self._reg = old_reg
+        self._in_function = old_in_func
 
     # ---- 主编译入口 ----
     def compile_chunk(self, chunk) -> Optional[str]:
@@ -1734,6 +1828,21 @@ return {fn_name}()
                     f'then {pc_var}={JT}[{I}[5]] _jmp=true end')
         elif op_name == "BREAK":
             return f'{pc_var}={JT}[{I}[2]]'
+        elif op_name == "LOADVA":
+            # 加载当前调用的 varargs 表（{...}），用于 local t = {...}
+            return f'{R}[{RK}[{I}[2]]]={{table.unpack({VA})}}'
+        elif op_name == "APPENDVA":
+            # 将 va_var 全部追加到目标表，从指定索引开始（{a, b, ...}）
+            return (f'for _vi=1,#{VA} do '
+                    f'{R}[{RK}[{I}[2]]][{I}[3]+_vi-1]={VA}[_vi] end')
+        elif op_name == "CALLVA":
+            # 带尾部 vararg 展开的调用：f(a, b, ...)
+            # I[2]=dest, I[3]=func, I[4]=fixed_arg_count, I[5..]=固定参数 reg
+            return (f'local _fn={R}[{RK}[{I}[3]]] local _args={{}} '
+                    f'for _ai=1,{I}[4] do _args[_ai]={R}[{RK}[{I}[4+_ai]]] end '
+                    f'for _vi=1,#{VA} do _args[{I}[4]+_vi]={VA}[_vi] end '
+                    f'{RETS}=table.pack(_fn(table.unpack(_args))) '
+                    f'{R}[{RK}[{I}[2]]]={RETS}[1]')
         return f'-- unknown {op_name}'
 
 
