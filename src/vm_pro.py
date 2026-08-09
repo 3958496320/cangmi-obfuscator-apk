@@ -1741,7 +1741,7 @@ return {fn_name}()
 # 三、公开 API
 # =============================================================================
 def vm_pro_compile(chunk, rng: random.Random, gen,
-                   enable_nested_vm: bool = False,
+                   enable_nested_vm: bool = True,
                    enable_register_virt: bool = True,
                    enable_anti_hook: bool = True) -> Optional[str]:
     """尝试用付费级字节码 VM 编译整个 chunk。
@@ -1749,13 +1749,13 @@ def vm_pro_compile(chunk, rng: random.Random, gen,
     成功返回解释器 Lua 源码字符串，失败返回 None（调用方回退）。
 
     参数：
-        enable_nested_vm:     VM嵌套VM（Dual-VM）。默认关闭。
+        enable_nested_vm:     VM嵌套VM（Dual-VM）。默认开启（最强保护）。
                               开启时将内层VM代码加密后包装在外层解密加载器中，
-                              增加逆向深度但增大产物体积。仅对小脚本启用。
+                              增加逆向深度。无论脚本大小均启用，追求最强保护。
         enable_register_virt: 寄存器虚拟化（P2-2）。默认开启。
                               开启时寄存器访问转为间接寻址查表 RK[name]。
         enable_anti_hook:     反Hook检测（P3-2 API完整性校验）。默认开启。
-                              关闭时跳过API签名校验（兼容特殊注入器环境）。
+                              关闭时跳过API签名校验。
     """
     compiler = ProVMCompiler(rng, gen)
     compiler._enable_register_virt = enable_register_virt

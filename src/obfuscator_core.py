@@ -8220,16 +8220,18 @@ def obfuscate(src: str,
             _final_chunk = parse_source(src)
             if _final_chunk:
                 _gen_vp = NameGenerator(rng)
-                # v9 VM嵌套VM：对小脚本自动启用（产物体积可控，增加逆向深度）
-                # 用户清单第二类第1项：默认关闭；仅对小脚本启用
-                _src_lines = src.count("\n") + 1
-                _enable_nested = _src_lines <= 50
+                # VM 全开：无论脚本大小，启用最强保护
+                #   - enable_nested_vm=True   VM嵌套VM（Dual-VM），增加逆向深度
+                #   - enable_register_virt=True 寄存器虚拟化
+                #   - enable_anti_hook=True    反Hook检测
                 _vm_code = _vm_pro_compile(
                     _final_chunk, rng, _gen_vp,
-                    enable_nested_vm=_enable_nested)
+                    enable_nested_vm=True,
+                    enable_register_virt=True,
+                    enable_anti_hook=True)
                 if _vm_code:
                     code = _WATERMARK_HEADER + _vm_code + _LEGAL_FOOTER
-                    stats["vm_pro"] = "enabled"
+                    stats["vm_pro"] = "enabled+nested+regvirt+antihook"
                 else:
                     stats["vm_pro"] = "fallback"
             else:
