@@ -1773,21 +1773,26 @@ return {fn_name}()
         elif op_name == "NJMP":
             return f'if not {R}[{RK}[{I}[2]]] then {pc_var}={JT}[{I}[3]] _jmp=true end'
         elif op_name == "CALL":
+            # I[4] = 固定参数数；用 table.unpack(_args, 1, I[4]) 显式指定长度，
+            # 避免 nil 参数导致 #_args 错误（unpack 默认用 #t 会停在 nil 处）
             return (f'local _fn={R}[{RK}[{I}[3]]] local _args={{}} '
                     f'for _ai=1,{I}[4] do _args[_ai]={R}[{RK}[{I}[4+_ai]]] end '
-                    f'{RETS}=table.pack(_fn(table.unpack(_args))) '
+                    f'{RETS}=table.pack(_fn(table.unpack(_args,1,{I}[4]))) '
                     f'{R}[{RK}[{I}[2]]]={RETS}[1]')
         elif op_name == "CALLV":
+            # I[5] = 固定参数数（不含 self）；同样显式指定 unpack 长度
             return (f'local _obj={R}[{RK}[{I}[3]]] local _m=_dec_str({S}[{I}[4]+1]) '
                     f'local _args={{}} '
                     f'for _ai=1,{I}[5] do _args[_ai]={R}[{RK}[{I}[5+_ai]]] end '
                     f'local _fn=_obj[_m] '
-                    f'{RETS}=table.pack(_fn(_obj,table.unpack(_args))) '
+                    f'{RETS}=table.pack(_fn(_obj,table.unpack(_args,1,{I}[5]))) '
                     f'{R}[{RK}[{I}[2]]]={RETS}[1]')
         elif op_name == "RET":
+            # I[3] = 返回值数；用 table.unpack(_rv, 1, I[3]) 显式指定长度，
+            # 避免 nil 返回值导致 #_rv 错误（return nil, 42 会停在 nil 处）
             return (f'if {I}[3] and {I}[3]>0 then '
-                    f'local _rv={{}} for _ri=1,{I}[3] do _rv[_ri]={R}[{RK}[{I}[3+_ri]]] end '
-                    f'return table.unpack(_rv) end '
+                    f'local _rv={{}} for _ri=1,{I}[3] do _rv[_ri]={R}[{RK}[{{I}[3+_ri]}}] end '
+                    f'return table.unpack(_rv,1,{I}[3]) end '
                     f'return')
         elif op_name == "CLOSURE":
             return (f'local _uvc={{}} '

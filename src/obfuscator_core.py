@@ -827,6 +827,19 @@ class Parser:
         return N("IfExpr", cond=cond, then_expr=then_e,
                  elifs=elifs, else_expr=else_e)
 
+    def _is_prefixexp(self, expr) -> bool:
+        """判断 expr 是否为 Lua 「前缀表达式」（可被调用）。
+        Lua 文法：prefixexp ::= var | functioncall | '(' exp ')'
+        - var = Name | prefixexp[expr] | prefixexp.Name
+        - functioncall = prefixexp args | prefixexp:Name args
+        所以 Name / Index / Call / MethodCall / Paren 都是 prefixexp；
+        Table / Number / String / Nil / True / False / Vararg / BinOp / UnOp /
+        Function / IfExpr 都不是（直接调用会语法错误）。
+        """
+        if expr is None:
+            return False
+        return expr.type in ("Name", "Index", "Call", "MethodCall", "Paren")
+
     def parse_suffixed_expr(self) -> Node:
         """带后缀的表达式：.field / [key] / (args) / :method(args) / :: TypeCast。"""
         expr = self.parse_primary_expr()
@@ -853,15 +866,25 @@ class Parser:
                 self.skip_type_cast()
                 # 类型转换后可继续有后缀：(t :: any).field, (t :: any)()
                 continue
-            elif t.type == "symbol" and t.value in ("(", "{", "string"):
+            elif t.type == "symbol" and t.value == "(":
+                # 函数调用 f(args)：仅当 expr 是 prefixexp 才允许
+                # （Table/Number/String 字面量后跟 (args) 不是调用，是语法错误）
+                # 这避免了 `local t = {x=1}\n(args)` 被误判为 `{x=1}(args)` 调用
+                if not self._is_prefixexp(expr):
+                    break
                 args = self.parse_call_args()
                 expr = N("Call", func=expr, args=args)
             elif t.type == "string":
-                # f"str" 形式调用
+                # f"str" 形式调用：仅当 expr 是 prefixexp 才允许
+                if not self._is_prefixexp(expr):
+                    break
                 arg = N("String", value=t.value)
                 self.next()
                 expr = N("Call", func=expr, args=[arg])
             elif t.type == "symbol" and t.value == "{":
+                # f{...} 形式调用（表参数）：仅当 expr 是 prefixexp 才允许
+                if not self._is_prefixexp(expr):
+                    break
                 arg = self.parse_table()
                 expr = N("Call", func=expr, args=[arg])
             else:
@@ -7551,11 +7574,13 @@ def apply_const_encrypt(chunk: Node, rng: random.Random) -> dict:
         if node.type == "Number":
             try:
                 val = float(node.get("value"))
-                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
-                    n = int(val)
-                    count[0] += 1
-                    return _gen_arith_mba(n)
-            except (ValueError, TypeError):
+                # 跳过 NaN / Inf / -Inf（int(val) 会 OverflowError）
+                if not (val != val or val == float("inf") or val == float("-inf")):
+                    if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                        n = int(val)
+                        count[0] += 1
+                        return _gen_arith_mba(n)
+            except (ValueError, TypeError, OverflowError):
                 pass
         return node
 
@@ -7851,9 +7876,11 @@ def apply_const_arrayify(chunk: Node, rng: random.Random) -> dict:
         if node.type == "Number":
             try:
                 val = float(node.get("value"))
-                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
-                    value_counts[int(val)] = value_counts.get(int(val), 0) + 1
-            except (ValueError, TypeError):
+                # 跳过 NaN / Inf / -Inf（int(val) 会 OverflowError）
+                if not (val != val or val == float("inf") or val == float("-inf")):
+                    if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                        value_counts[int(val)] = value_counts.get(int(val), 0) + 1
+            except (ValueError, TypeError, OverflowError):
                 pass
         for v in node.attrs.values():
             if isinstance(v, Node):
@@ -7910,16 +7937,18 @@ def apply_const_arrayify(chunk: Node, rng: random.Random) -> dict:
         if node.type == "Number":
             try:
                 val = float(node.get("value"))
-                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
-                    n = int(val)
-                    if n in value_to_idx:
-                        idx = value_to_idx[n]
-                        replace_count[0] += 1
-                        # _T[idx] —— idx 不标记 _no_const_encrypt，让 L1b MBA 展开它
-                        return N("Index",
-                                 obj=N("Name", name=table_name),
-                                 key=N("Number", value=str(idx)))
-            except (ValueError, TypeError):
+                # 跳过 NaN / Inf / -Inf（int(val) 会 OverflowError）
+                if not (val != val or val == float("inf") or val == float("-inf")):
+                    if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                        n = int(val)
+                        if n in value_to_idx:
+                            idx = value_to_idx[n]
+                            replace_count[0] += 1
+                            # _T[idx] —— idx 不标记 _no_const_encrypt，让 L1b MBA 展开它
+                            return N("Index",
+                                     obj=N("Name", name=table_name),
+                                     key=N("Number", value=str(idx)))
+            except (ValueError, TypeError, OverflowError):
                 pass
         return node
 
@@ -7994,8 +8023,14 @@ def apply_mba_expr(chunk: Node, rng: random.Random) -> dict:
             right = node.get("right")
             if left.type == "Number" and right.type == "Number":
                 try:
-                    a = int(float(left.get("value")))
-                    b = int(float(right.get("value")))
+                    la = float(left.get("value"))
+                    lb = float(right.get("value"))
+                    # 跳过 NaN / Inf / -Inf（int() 会 OverflowError）
+                    if (la != la or la == float("inf") or la == float("-inf") or
+                        lb != lb or lb == float("inf") or lb == float("-inf")):
+                        raise ValueError("inf or nan")
+                    a = int(la)
+                    b = int(lb)
                     if 0 <= a <= 0x7FFFFFFF and 0 <= b <= 0x7FFFFFFF:
                         # a + b = (a ^ b) + 2*(a & b)
                         # 构造 AST: (a ~ b) + (2 * (a & b))
