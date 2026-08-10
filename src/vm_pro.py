@@ -51,6 +51,10 @@ _PRO_OPCODES = [
     "BREAK",
     "LOADVA", "APPENDVA",  # varargs 表加载/追加（function(...){...}）
     "CALLVA",  # 带尾部 vararg 展开的函数调用 f(a, b, ...)
+    "RETVA",   # return ... 或 return a, b, ...（vararg 返回值展开）
+    "CALLMR",  # 带尾部多返回值展开的函数调用 f(a, b, g()) — g() 的所有返回值作为尾部参数
+    "TABMR",   # 表构造器追加多返回值：{a, b, g()} — g() 的所有返回值追加到表
+    "RETMR",   # return a, b, g() — g() 的所有返回值作为尾部返回值
 ]
 # 假 opcode（编译器从不 emit，但占用 opcode 码点 + 在 dispatcher 有 handler）
 # P3 升级：假 opcode 数量与真 opcode 1:1（33 真 → 32 假），大幅增加反汇编噪音
@@ -564,6 +568,16 @@ class ProVMCompiler:
             arg_regs = [self._compile_expr(a) for a in fixed_args]
             # CALLVA: 展开固定参数 + va_var 全部传给被调函数
             self._emit("CALLVA", dest_reg, func_reg, len(arg_regs), *arg_regs)
+        elif args and args[-1].type in ("Call", "Invoke"):
+            # 尾部多返回值展开：f(a, b, g()) — g() 的所有返回值作为尾部参数
+            # 只有最后一个参数会展开所有返回值，中间参数取首个返回值（Lua 语义）
+            fixed_args = args[:-1]
+            arg_regs = [self._compile_expr(a) for a in fixed_args]
+            # 编译最后一个 call — 这会填充 _rets（保留所有返回值）
+            last_call_reg = self._new_reg()
+            self._compile_call(args[-1], last_call_reg)
+            # CALLMR: 固定参数 + _rets 的所有返回值作为尾部参数
+            self._emit("CALLMR", dest_reg, func_reg, len(arg_regs), *arg_regs)
         else:
             arg_regs = [self._compile_expr(a) for a in args]
             self._emit("CALL", dest_reg, func_reg, len(arg_regs), *arg_regs)
@@ -580,9 +594,33 @@ class ProVMCompiler:
             method_str = method.get("value") or str(method)
         else:
             method_str = str(method)
-        arg_regs = [self._compile_expr(a) for a in args]
-        self._emit("CALLV", dest_reg, obj_reg, self._str_idx(method_str),
-                   len(arg_regs), *arg_regs)
+        # 检测尾部 vararg / 多返回值（与 _compile_call 保持一致）
+        has_trailing_vararg = args and args[-1].type == "Vararg"
+        if has_trailing_vararg:
+            fixed_args = args[:-1]
+            arg_regs = [self._compile_expr(a) for a in fixed_args]
+            # CALLVVA: 方法调用 + vararg 展开（暂复用 CALLVA 语义，但带 self）
+            # 这里用 CALLVA 但把 self 作为第一个固定参数
+            # 实际上方法调用 obj:m(...) 等价于 obj.m(obj, ...)
+            # 我们先取 _fn = obj[m]，再 CALLVA(_fn, obj, ...)
+            func_reg = self._new_reg()
+            self._emit("GETTABK", func_reg, obj_reg, self._str_idx(method_str))
+            self._emit("CALLVA", dest_reg, func_reg, len(arg_regs) + 1, obj_reg, *arg_regs)
+        elif args and args[-1].type in ("Call", "Invoke"):
+            # 尾部多返回值展开：obj:m(a, b, g())
+            fixed_args = args[:-1]
+            arg_regs = [self._compile_expr(a) for a in fixed_args]
+            last_call_reg = self._new_reg()
+            self._compile_call(args[-1], last_call_reg)
+            # obj:m(...) 等价于调用 obj.m(obj, ...)
+            func_reg = self._new_reg()
+            self._emit("GETTABK", func_reg, obj_reg, self._str_idx(method_str))
+            # CALLMR: 固定参数（含 self）+ _rets 多返回值
+            self._emit("CALLMR", dest_reg, func_reg, len(arg_regs) + 1, obj_reg, *arg_regs)
+        else:
+            arg_regs = [self._compile_expr(a) for a in args]
+            self._emit("CALLV", dest_reg, obj_reg, self._str_idx(method_str),
+                       len(arg_regs), *arg_regs)
 
     def _compile_function_expr(self, node, dest_reg: str, func_name: str = None):
         func_id = f"func_{id(node)}"
@@ -612,7 +650,10 @@ class ProVMCompiler:
                 key = f.get("key")
                 val = f.get("value")
                 if key is None and val is not None and val.type == "Vararg":
-                    self._emit("LOADVA", dest_reg)
+                    # {...} 必须创建一个新表，包含所有 vararg 值
+                    # 用 NEWTAB + APPENDVA(1) 把 va_var 全部追加到新表
+                    self._emit("NEWTAB", dest_reg)
+                    self._emit("APPENDVA", dest_reg, 1)
                     return
         self._emit("NEWTAB", dest_reg)
         seq_idx = 0
@@ -625,8 +666,20 @@ class ProVMCompiler:
                     # {...} 作为表元素：展开所有 varargs 到顺序索引
                     if val is not None and val.type == "Vararg":
                         # 需要 APPENDVA 指令把 va_var 全部追加到当前表
-                        self._emit("APPENDVA", dest_reg, self._const_idx(seq_idx))
+                        # 直接传 seq_idx 作为字面量（不经过 const_idx，避免索引误解）
+                        self._emit("APPENDVA", dest_reg, seq_idx)
                         # 后续 seq_idx 无法预知数量，但常见用法 {...} 是唯一元素，直接 return
+                        continue
+                    # 尾部多返回值：{a, b, g()} — g() 的所有返回值追加到表末尾
+                    # 只有最后一个无 key 字段才展开多返回值（Lua 语义）
+                    is_last_seq = (field is fields[-1])
+                    if is_last_seq and val is not None and val.type in ("Call", "Invoke"):
+                        # 先编译该 call 填充 _rets，再 TABMR 追加
+                        last_call_reg = self._new_reg()
+                        self._compile_call(val, last_call_reg)
+                        # 直接传 seq_idx 作为字面量
+                        self._emit("TABMR", dest_reg, seq_idx)
+                        # 多返回值数量未知，后续无法继续顺序索引（Lua 语义：多返回值后不能有更多无 key 字段）
                         continue
                     val_reg = self._compile_expr(val)
                     k_reg = self._new_reg()
@@ -1019,6 +1072,28 @@ class ProVMCompiler:
         if not exprs:
             self._emit("RET")
         else:
+            # 检查最后一个表达式是否为 vararg（return ... 或 return f(), ...）
+            # 这种情况下需要展开 vararg 的所有值作为返回值
+            if len(exprs) == 1 and exprs[0].type == "Vararg":
+                # return ... → 直接返回 va_var 的所有值（I[2]=0 表示无固定值）
+                self._emit("RETVA", 0)
+                return
+            if len(exprs) >= 2 and exprs[-1].type == "Vararg":
+                # return a, b, ... → 固定部分 + vararg 展开
+                fixed_regs = [self._compile_expr(e) for e in exprs[:-1]]
+                self._emit("RETVA", len(fixed_regs), *fixed_regs)
+                return
+            # 尾部多返回值：return a, b, g() — g() 的所有返回值作为尾部返回值
+            # 只有最后一个表达式才展开多返回值（Lua 语义）
+            if len(exprs) >= 1 and exprs[-1].type in ("Call", "Invoke"):
+                fixed_regs = [self._compile_expr(e) for e in exprs[:-1]]
+                # 编译最后一个 call — 填充 _rets
+                last_call_reg = self._new_reg()
+                self._compile_call(exprs[-1], last_call_reg)
+                # RETMR: 固定返回值 + _rets 的所有返回值作为尾部
+                # 这里复用 RETVA 的 _rv 拼接逻辑，但用 _rets 替代 _va
+                self._emit("RETMR", len(fixed_regs), *fixed_regs)
+                return
             regs = [self._compile_expr(e) for e in exprs]
             self._emit("RET", regs[0], len(regs), *regs)
 
@@ -1298,7 +1373,9 @@ local function {fn_name}()
         local {erase_done_var} = false  -- 保留兼容（不再永久跳过 CRC，改用 erased_seg 精细跳过）
         local function {run_var}({pc_var}_start, {uv_var}, ...)
         if {uv_var} == nil then {uv_var} = {{}} end
-        local {va_var} = {{...}}
+        -- varargs 表：用 table.pack 保留 nil 参数（select('#', ...) 给出真实数量）
+        -- 之前用 {{...}} 会丢失 nil 之后的所有参数（{{}} 按 # 取长度）
+        local {va_var} = table.pack(...)
         local {pc_var} = {pc_var}_start
         local {reg_var} = {{}}
         local {rets_var} = {{}}
@@ -1791,15 +1868,27 @@ return {fn_name}()
             # I[3] = 返回值数；用 table.unpack(_rv, 1, I[3]) 显式指定长度，
             # 避免 nil 返回值导致 #_rv 错误（return nil, 42 会停在 nil 处）
             return (f'if {I}[3] and {I}[3]>0 then '
-                    f'local _rv={{}} for _ri=1,{I}[3] do _rv[_ri]={R}[{RK}[{{I}[3+_ri]}}] end '
+                    f'local _rv={{}} for _ri=1,{I}[3] do _rv[_ri]={R}[{RK}[{I}[3+_ri]]] end '
                     f'return table.unpack(_rv,1,{I}[3]) end '
                     f'return')
+        elif op_name == "RETVA":
+            # return ... 或 return a, b, ...
+            # I[2] = 固定返回值数（不含 ...）；va_var.n 是 varargs 数量
+            # 无固定值（I[2]==0）时直接 return table.unpack(va, 1, va.n)
+            # 有固定值时把固定值放前面，vararg 展开放后面
+            return (f'if {I}[2] and {I}[2]>0 then '
+                    f'local _rv={{}} for _ri=1,{I}[2] do _rv[_ri]={R}[{RK}[{I}[2+_ri]]] end '
+                    f'for _vi=1,{VA}.n do _rv[{I}[2]+_vi]={VA}[_vi] end '
+                    f'return table.unpack(_rv,1,{I}[2]+{VA}.n) end '
+                    f'return table.unpack({VA},1,{VA}.n)')
         elif op_name == "CLOSURE":
             return (f'local _uvc={{}} '
                     f'for _k,_v in pairs({UV}) do _uvc[_k]=_v end '
                     f'for _k,_v in pairs({R}[{RK}[{I}[4]]]) do _uvc[_k]=_v end '
                     f'{R}[{RK}[{I}[2]]]=function(...) return {RUN}({I}[3],_uvc,...) end')
         elif op_name == "PARAMS":
+            # va_var 是 table.pack(...) 结果，用 .n 字段保留 nil 参数
+            # 直接按索引读取（包括 nil 值）
             return f'for _pi=1,{I}[2] do {R}[{RK}[{I}[2+_pi]]]={VA}[_pi] end'
         elif op_name == "GETRET":
             return f'{R}[{RK}[{I}[2]]]={RETS}[{I}[3]]'
@@ -1834,20 +1923,58 @@ return {fn_name}()
         elif op_name == "BREAK":
             return f'{pc_var}={JT}[{I}[2]]'
         elif op_name == "LOADVA":
-            # 加载当前调用的 varargs 表（{...}），用于 local t = {...}
-            return f'{R}[{RK}[{I}[2]]]={{table.unpack({VA})}}'
+            # 加载 vararg 的第一个值（用于 local x = ... 或 (...) 表达式）
+            # 注意：local t = {...} 由 _compile_table 单独处理（NEWTAB + APPENDVA），
+            # 不会走到这里。这里只处理「单值上下文」的 ... 表达式。
+            # va_var 是 table.pack(...) 结果，va_var[1] 是第一个参数（可为 nil）
+            return f'{R}[{RK}[{I}[2]]]={VA}[1]'
         elif op_name == "APPENDVA":
             # 将 va_var 全部追加到目标表，从指定索引开始（{a, b, ...}）
-            return (f'for _vi=1,#{VA} do '
+            # 用 va_var.n 显式指定长度，避免 nil 截断
+            return (f'for _vi=1,{VA}.n do '
                     f'{R}[{RK}[{I}[2]]][{I}[3]+_vi-1]={VA}[_vi] end')
         elif op_name == "CALLVA":
             # 带尾部 vararg 展开的调用：f(a, b, ...)
             # I[2]=dest, I[3]=func, I[4]=fixed_arg_count, I[5..]=固定参数 reg
+            # 用 va_var.n 显式指定长度，避免 nil 截断
             return (f'local _fn={R}[{RK}[{I}[3]]] local _args={{}} '
                     f'for _ai=1,{I}[4] do _args[_ai]={R}[{RK}[{I}[4+_ai]]] end '
-                    f'for _vi=1,#{VA} do _args[{I}[4]+_vi]={VA}[_vi] end '
-                    f'{RETS}=table.pack(_fn(table.unpack(_args))) '
+                    f'for _vi=1,{VA}.n do _args[{I}[4]+_vi]={VA}[_vi] end '
+                    f'local _na={I}[4]+{VA}.n '
+                    f'{RETS}=table.pack(_fn(table.unpack(_args,1,_na))) '
                     f'{R}[{RK}[{I}[2]]]={RETS}[1]')
+        elif op_name == "CALLMR":
+            # 带尾部多返回值展开的调用：f(a, b, g()) — g() 的所有返回值作为尾部参数
+            # I[2]=dest, I[3]=func, I[4]=fixed_arg_count, I[5..]=固定参数 reg
+            # 尾部参数来自上一个 CALL 填充的 _rets 表（table.pack 结果，含 .n）
+            # 先保存 _mr=_rets（因为本次 CALL 会覆盖 _rets），再拼接固定参数 + 多返回值
+            return (f'local _fn={R}[{RK}[{I}[3]]] local _args={{}} '
+                    f'for _ai=1,{I}[4] do _args[_ai]={R}[{RK}[{I}[4+_ai]]] end '
+                    f'local _mr={RETS} '
+                    f'local _mn=_mr.n or 0 '
+                    f'for _mi=1,_mn do _args[{I}[4]+_mi]=_mr[_mi] end '
+                    f'local _na={I}[4]+_mn '
+                    f'{RETS}=table.pack(_fn(table.unpack(_args,1,_na))) '
+                    f'{R}[{RK}[{I}[2]]]={RETS}[1]')
+        elif op_name == "TABMR":
+            # 表构造器追加多返回值：{a, b, g()} — g() 的所有返回值追加到表末尾
+            # I[2]=dest_tab, I[3]=start_idx（追加起始索引，1-based）
+            # 尾部元素来自上一个 CALL 填充的 _rets 表
+            return (f'local _mr={RETS} '
+                    f'local _mn=_mr.n or 0 '
+                    f'for _mi=1,_mn do {R}[{RK}[{I}[2]]][{I}[3]+_mi-1]=_mr[_mi] end')
+        elif op_name == "RETMR":
+            # return a, b, g() — 固定返回值 + g() 的所有返回值作为尾部
+            # I[2] = 固定返回值数（不含多返回值部分）；尾部来自 _rets（上一个 CALL）
+            # 先保存 _mr=_rets，再拼接固定值 + _mr 展开值
+            return (f'if {I}[2] and {I}[2]>0 then '
+                    f'local _rv={{}} for _ri=1,{I}[2] do _rv[_ri]={R}[{RK}[{I}[2+_ri]]] end '
+                    f'local _mr={RETS} '
+                    f'local _mn=_mr.n or 0 '
+                    f'for _mi=1,_mn do _rv[{I}[2]+_mi]=_mr[_mi] end '
+                    f'return table.unpack(_rv,1,{I}[2]+_mn) end '
+                    f'local _mr={RETS} '
+                    f'return table.unpack(_mr,1,_mr.n or 0)')
         return f'-- unknown {op_name}'
 
 

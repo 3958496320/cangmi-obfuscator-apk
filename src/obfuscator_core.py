@@ -4748,20 +4748,29 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
     ]
 
     # 5. 环境完整性检测：game 必须存在且为 Instance（非 Roblox 环境则标记）
+    # 注意：typeof 是 Roblox 专有函数，标准 Lua 不存在，必须用 pcall 包裹
     game_fn = N("Function", params=[], is_vararg=False, body=[
         N("Return", exprs=[N("Name", name="game")])
+    ])
+    typeof_fn = N("Function", params=["x"], is_vararg=False, body=[
+        N("Return", exprs=[N("Call", func=N("Name", name="typeof"),
+                             args=[N("Name", name="x")])])
     ])
     env_block_body = [
         N("LocalAssign", names=["ok5", "gm"],
           exprs=[N("Call", func=N("Name", name="pcall"),
                    args=[N("Paren", expr=game_fn)])]),
+        N("LocalAssign", names=["_tok", "_typ"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=typeof_fn), N("Name", name="gm")])]),
         N("If",
           cond=N("BinOp", op="or",
                  left=N("UnaryOp", op="not", operand=N("Name", name="ok5")),
-                 right=N("BinOp", op="~=",
-                         left=N("Call", func=N("Name", name="typeof"),
-                                args=[N("Name", name="gm")]),
-                         right=N("String", value="Instance"))),
+                 right=N("BinOp", op="and",
+                         left=N("Name", name="_tok"),
+                         right=N("BinOp", op="~=",
+                                 left=N("Name", name="_typ"),
+                                 right=N("String", value="Instance")))),
           body=[N("Assign", targets=[N("Name", name=flag_name)],
                   exprs=[N("True")])],
           elifs=[], else_body=None),
