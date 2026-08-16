@@ -45,6 +45,9 @@ import time
 
 
 # =============================================================================
+
+
+# =============================================================================
 # === obfuscator_core.py (monolith: ast_parser..adaptive_engine..core) ===
 # =============================================================================
 
@@ -665,6 +668,74 @@ class Parser:
                 exprs.append(self.parse_expr())
         return N("LocalAssign", names=names, exprs=exprs)
 
+    def skip_type_cast(self):
+        """跳过 Luau 类型转换 `expr :: Type` 中的 Type 表达式。
+
+        支持的类型形式：
+        - 简单类型：any, string, number, boolean, nil, ...
+        - 可空类型：T?
+        - 联合类型：T | U
+        - 交集类型：T & U
+        - 表类型：{x: T}, {T}, {[K]: V}
+        - 函数类型：(T) -> R, (T) -> (R1, R2)
+        - 泛型类型：T<X>
+        - typeof(expr)
+        - 字面量类型：true, false, "string"
+
+        停止条件（depth <= 0 时）：
+        - 遇到 `,` `=` `;` `)` `]` `}` → 类型表达式结束
+        - 换行且不在括号内 → 类型表达式结束（类型不跨行，除非在括号内）
+        - 遇到语句关键字（return/local/if/while/...）→ 下一语句开始
+        - 遇到 eof
+        """
+        # 特殊处理：typeof(expr)
+        if self.check("name") and self.cur().value == "typeof":
+            self.next()
+            if self.check("symbol", "("):
+                self._skip_balanced_parens()
+            return
+
+        depth = 0
+        base_line = self.cur().line if hasattr(self.cur(), 'line') else 0
+        while True:
+            t = self.cur()
+            if t.type == "eof":
+                return
+            # depth <= 0 时遇到这些符号表示类型表达式结束
+            if depth <= 0:
+                if t.type == "symbol" and t.value in (",", "=", ";", ")", "]", "}"):
+                    return
+                if t.type == "keyword" and t.value not in ("true", "false", "nil"):
+                    # true/false/nil 可作为单例类型，其他关键字是语句起始
+                    return
+                # 换行检查：depth 0 时换行 = 类型表达式结束
+                # （类型可在括号内跨行，但括号外不跨行）
+                t_line = getattr(t, 'line', base_line)
+                if t_line != base_line:
+                    return
+            # 处理深度变化
+            if t.type == "symbol" and t.value in ("(", "{", "[", "<"):
+                depth += 1
+            elif t.type == "symbol" and t.value in (")", "}", "]", ">"):
+                depth -= 1
+                if depth < 0:
+                    return
+            self.next()
+
+    def _skip_balanced_parens(self):
+        """跳过平衡的括号 ( ... )。假设当前 token 是 '('。"""
+        self.expect("symbol", "(")
+        depth = 1
+        while depth > 0:
+            t = self.cur()
+            if t.type == "eof":
+                return
+            if t.type == "symbol" and t.value == "(":
+                depth += 1
+            elif t.type == "symbol" and t.value == ")":
+                depth -= 1
+            self.next()
+
     def skip_type_annotation(self):
         """跳过 Luau 类型注解（如 : string, : number?, : {string}, : (a)->b）。
 
@@ -787,8 +858,21 @@ class Parser:
         return N("IfExpr", cond=cond, then_expr=then_e,
                  elifs=elifs, else_expr=else_e)
 
+    def _is_prefixexp(self, expr) -> bool:
+        """判断 expr 是否为 Lua 「前缀表达式」（可被调用）。
+        Lua 文法：prefixexp ::= var | functioncall | '(' exp ')'
+        - var = Name | prefixexp[expr] | prefixexp.Name
+        - functioncall = prefixexp args | prefixexp:Name args
+        所以 Name / Index / Call / MethodCall / Paren 都是 prefixexp；
+        Table / Number / String / Nil / True / False / Vararg / BinOp / UnOp /
+        Function / IfExpr 都不是（直接调用会语法错误）。
+        """
+        if expr is None:
+            return False
+        return expr.type in ("Name", "Index", "Call", "MethodCall", "Paren")
+
     def parse_suffixed_expr(self) -> Node:
-        """带后缀的表达式：.field / [key] / (args) / :method(args)。"""
+        """带后缀的表达式：.field / [key] / (args) / :method(args) / :: TypeCast。"""
         expr = self.parse_primary_expr()
         while True:
             t = self.cur()
@@ -806,15 +890,32 @@ class Parser:
                 method = self.expect("name").value
                 args = self.parse_call_args()
                 expr = N("MethodCall", obj=expr, method=method, args=args)
-            elif t.type == "symbol" and t.value in ("(", "{", "string"):
+            elif t.type == "symbol" and t.value == "::":
+                # Luau 类型转换：expr :: Type — 跳过类型注解，返回 expr 不变
+                # 运行时类型转换是 no-op，只影响类型检查（编译期）
+                self.next()
+                self.skip_type_cast()
+                # 类型转换后可继续有后缀：(t :: any).field, (t :: any)()
+                continue
+            elif t.type == "symbol" and t.value == "(":
+                # 函数调用 f(args)：仅当 expr 是 prefixexp 才允许
+                # （Table/Number/String 字面量后跟 (args) 不是调用，是语法错误）
+                # 这避免了 `local t = {x=1}\n(args)` 被误判为 `{x=1}(args)` 调用
+                if not self._is_prefixexp(expr):
+                    break
                 args = self.parse_call_args()
                 expr = N("Call", func=expr, args=args)
             elif t.type == "string":
-                # f"str" 形式调用
+                # f"str" 形式调用：仅当 expr 是 prefixexp 才允许
+                if not self._is_prefixexp(expr):
+                    break
                 arg = N("String", value=t.value)
                 self.next()
                 expr = N("Call", func=expr, args=[arg])
             elif t.type == "symbol" and t.value == "{":
+                # f{...} 形式调用（表参数）：仅当 expr 是 prefixexp 才允许
+                if not self._is_prefixexp(expr):
+                    break
                 arg = self.parse_table()
                 expr = N("Call", func=expr, args=[arg])
             else:
@@ -4678,20 +4779,29 @@ def inject_anti_debug(chunk: Node, rng: random.Random,
     ]
 
     # 5. 环境完整性检测：game 必须存在且为 Instance（非 Roblox 环境则标记）
+    # 注意：typeof 是 Roblox 专有函数，标准 Lua 不存在，必须用 pcall 包裹
     game_fn = N("Function", params=[], is_vararg=False, body=[
         N("Return", exprs=[N("Name", name="game")])
+    ])
+    typeof_fn = N("Function", params=["x"], is_vararg=False, body=[
+        N("Return", exprs=[N("Call", func=N("Name", name="typeof"),
+                             args=[N("Name", name="x")])])
     ])
     env_block_body = [
         N("LocalAssign", names=["ok5", "gm"],
           exprs=[N("Call", func=N("Name", name="pcall"),
                    args=[N("Paren", expr=game_fn)])]),
+        N("LocalAssign", names=["_tok", "_typ"],
+          exprs=[N("Call", func=N("Name", name="pcall"),
+                   args=[N("Paren", expr=typeof_fn), N("Name", name="gm")])]),
         N("If",
           cond=N("BinOp", op="or",
                  left=N("UnaryOp", op="not", operand=N("Name", name="ok5")),
-                 right=N("BinOp", op="~=",
-                         left=N("Call", func=N("Name", name="typeof"),
-                                args=[N("Name", name="gm")]),
-                         right=N("String", value="Instance"))),
+                 right=N("BinOp", op="and",
+                         left=N("Name", name="_tok"),
+                         right=N("BinOp", op="~=",
+                                 left=N("Name", name="_typ"),
+                                 right=N("String", value="Instance")))),
           body=[N("Assign", targets=[N("Name", name=flag_name)],
                   exprs=[N("True")])],
           elifs=[], else_body=None),
@@ -7504,11 +7614,13 @@ def apply_const_encrypt(chunk: Node, rng: random.Random) -> dict:
         if node.type == "Number":
             try:
                 val = float(node.get("value"))
-                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
-                    n = int(val)
-                    count[0] += 1
-                    return _gen_arith_mba(n)
-            except (ValueError, TypeError):
+                # 跳过 NaN / Inf / -Inf（int(val) 会 OverflowError）
+                if not (val != val or val == float("inf") or val == float("-inf")):
+                    if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                        n = int(val)
+                        count[0] += 1
+                        return _gen_arith_mba(n)
+            except (ValueError, TypeError, OverflowError):
                 pass
         return node
 
@@ -7804,9 +7916,11 @@ def apply_const_arrayify(chunk: Node, rng: random.Random) -> dict:
         if node.type == "Number":
             try:
                 val = float(node.get("value"))
-                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
-                    value_counts[int(val)] = value_counts.get(int(val), 0) + 1
-            except (ValueError, TypeError):
+                # 跳过 NaN / Inf / -Inf（int(val) 会 OverflowError）
+                if not (val != val or val == float("inf") or val == float("-inf")):
+                    if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                        value_counts[int(val)] = value_counts.get(int(val), 0) + 1
+            except (ValueError, TypeError, OverflowError):
                 pass
         for v in node.attrs.values():
             if isinstance(v, Node):
@@ -7863,16 +7977,18 @@ def apply_const_arrayify(chunk: Node, rng: random.Random) -> dict:
         if node.type == "Number":
             try:
                 val = float(node.get("value"))
-                if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
-                    n = int(val)
-                    if n in value_to_idx:
-                        idx = value_to_idx[n]
-                        replace_count[0] += 1
-                        # _T[idx] —— idx 不标记 _no_const_encrypt，让 L1b MBA 展开它
-                        return N("Index",
-                                 obj=N("Name", name=table_name),
-                                 key=N("Number", value=str(idx)))
-            except (ValueError, TypeError):
+                # 跳过 NaN / Inf / -Inf（int(val) 会 OverflowError）
+                if not (val != val or val == float("inf") or val == float("-inf")):
+                    if val == int(val) and 0 <= int(val) <= 0x7FFFFFFF:
+                        n = int(val)
+                        if n in value_to_idx:
+                            idx = value_to_idx[n]
+                            replace_count[0] += 1
+                            # _T[idx] —— idx 不标记 _no_const_encrypt，让 L1b MBA 展开它
+                            return N("Index",
+                                     obj=N("Name", name=table_name),
+                                     key=N("Number", value=str(idx)))
+            except (ValueError, TypeError, OverflowError):
                 pass
         return node
 
@@ -7947,8 +8063,14 @@ def apply_mba_expr(chunk: Node, rng: random.Random) -> dict:
             right = node.get("right")
             if left.type == "Number" and right.type == "Number":
                 try:
-                    a = int(float(left.get("value")))
-                    b = int(float(right.get("value")))
+                    la = float(left.get("value"))
+                    lb = float(right.get("value"))
+                    # 跳过 NaN / Inf / -Inf（int() 会 OverflowError）
+                    if (la != la or la == float("inf") or la == float("-inf") or
+                        lb != lb or lb == float("inf") or lb == float("-inf")):
+                        raise ValueError("inf or nan")
+                    a = int(la)
+                    b = int(lb)
                     if 0 <= a <= 0x7FFFFFFF and 0 <= b <= 0x7FFFFFFF:
                         # a + b = (a ^ b) + 2*(a & b)
                         # 构造 AST: (a ~ b) + (2 * (a & b))
@@ -8249,18 +8371,25 @@ def obfuscate(src: str,
             _final_chunk = parse_source(src)
             if _final_chunk:
                 _gen_vp = NameGenerator(rng)
-                # VM 全开：无论脚本大小，启用最强保护
+                # VM 全开：≤800 行脚本启用最强保护
                 #   - enable_nested_vm=True   VM嵌套VM（Dual-VM），增加逆向深度
                 #   - enable_register_virt=True 寄存器虚拟化
                 #   - enable_anti_hook=True    反Hook检测
+                # 【网页端大脚本防崩溃】>800 行自动关闭「VM嵌套VM」：
+                # 嵌套 VM 的字节码膨胀是平方级，手机浏览器 WASM 堆上限低
+                # （约 300-500MB），大脚本嵌套编译会 OOM 闪退/卡死页面。
+                # VM 本体/寄存器虚拟化/反Hook 全部保留，强度只降嵌套一层。
+                _src_lines = src.count("\n") + 1
+                _use_nested = _src_lines <= 800
                 _vm_code = _vm_pro_compile(
                     _final_chunk, rng, _gen_vp,
-                    enable_nested_vm=True,
+                    enable_nested_vm=_use_nested,
                     enable_register_virt=True,
                     enable_anti_hook=True)
                 if _vm_code:
                     code = _WATERMARK_HEADER + _vm_code + _LEGAL_FOOTER
-                    stats["vm_pro"] = "enabled+nested+regvirt+antihook"
+                    stats["vm_pro"] = ("enabled+nested+regvirt+antihook" if _use_nested
+                                       else "enabled+regvirt+antihook")
                 else:
                     stats["vm_pro"] = "fallback"
             else:
@@ -8440,18 +8569,25 @@ _PRO_OPCODES = [
     "JMP", "CJMP", "NJMP",
     "CALL", "CALLV", "RET", "CLOSURE", "PARAMS", "GETRET",
     "NEWTAB", "GETTAB", "SETTAB", "GETTABK", "SETTABK",
-    "GETGLOB", "SETGLOB", "GETUV", "SETUV", "COPYUV",
+    "GETGLOB", "SETGLOB", "GETUV", "SETUV", "DECLUV", "COPYUV",
     "FORPREP", "FORLOOP",
     "BREAK",
+    "LOADVA", "APPENDVA",  # varargs 表加载/追加（function(...){...}）
+    "CALLVA",  # 带尾部 vararg 展开的函数调用 f(a, b, ...)
+    "RETVA",   # return ... 或 return a, b, ...（vararg 返回值展开）
+    "CALLMR",  # 带尾部多返回值展开的函数调用 f(a, b, g()) — g() 的所有返回值作为尾部参数
+    "TABMR",   # 表构造器追加多返回值：{a, b, g()} — g() 的所有返回值追加到表
+    "RETMR",   # return a, b, g() — g() 的所有返回值作为尾部返回值
 ]
 # 假 opcode（编译器从不 emit，但占用 opcode 码点 + 在 dispatcher 有 handler）
-# P3 升级：假 opcode 数量与真 opcode 1:1（33 真 → 32 假），大幅增加反汇编噪音
+# P3 升级：假 opcode 数量超过真 opcode（34 真 → 40 假），大幅增加反汇编噪音
 # 反汇编工具会看到这些 opcode 并尝试分析其语义，浪费精力
 _PRO_FAKE_OPCODES = [
     "JUNK1", "JUNK2", "JUNK3", "JUNK4", "JUNK5", "JUNK6", "JUNK7", "JUNK8",
     "JUNK9", "JUNK10", "JUNK11", "JUNK12", "JUNK13", "JUNK14", "JUNK15", "JUNK16",
     "JUNK17", "JUNK18", "JUNK19", "JUNK20", "JUNK21", "JUNK22", "JUNK23", "JUNK24",
     "JUNK25", "JUNK26", "JUNK27", "JUNK28", "JUNK29", "JUNK30", "JUNK31", "JUNK32",
+    "JUNK33", "JUNK34", "JUNK35", "JUNK36", "JUNK37", "JUNK38", "JUNK39", "JUNK40",
 ]
 
 _PRO_BINOPS = ["+", "-", "*", "/", "%", "^", "..",
@@ -8525,12 +8661,19 @@ class ProVMCompiler:
         self._closure_patches: List[Tuple[int, str]] = []
         # 作用域
         self._local_stack: List[set] = [set()]
+        # 作用域遮蔽恢复栈：每层记录 (name, 外层寄存器或None)，pop 时恢复
+        self._scope_shadows: List[List[Tuple[str, Optional[str]]]] = [[]]
         # 循环结束标签栈（用于 BREAK）
         self._loop_end_stack: List[str] = []
+        # 循环 continue 标签栈（用于 CONTINUE，指向循环条件检查入口）
+        self._loop_continue_stack: List[str] = []
         # 待编译函数
         self._pending_funcs: List[Tuple] = []
         # 闭包捕获变量集合：这些变量改用 _G 存储（GETGLOB/SETGLOB），实现跨调用帧共享
         self._captured_vars: set = set()
+        # 是否正在编译函数体（True=函数体内，False=顶层）
+        # 顶层引用捕获变量应走 GETGLOB（顶层无 _uv 表），函数体内走 GETUV
+        self._in_function: bool = False
         # 花指令概率（控制插入密度，0.08 ≈ 每 12 条指令插 1 条）
         self._junk_rate = 0.08
         # 死寄存器计数器（花指令写入专用，不污染真寄存器）
@@ -8716,15 +8859,35 @@ class ProVMCompiler:
     # ---- 作用域 ----
     def _push_scope(self):
         self._local_stack.append(set())
+        self._scope_shadows.append([])
 
     def _pop_scope(self):
+        # 作用域退出：恢复被内层同名局部变量遮蔽的外层寄存器绑定。
+        # 【作用域遮蔽修复】旧实现 _reg 是平坦名字表，do block / 内层作用域
+        # 声明同名局部变量会直接复用外层寄存器，作用域结束后外层变量被
+        # 内层值污染（local x=1 do local x=10 end print(x) 输出 10 而非 1）。
         self._local_stack.pop()
+        shadows = self._scope_shadows.pop()
+        for name, old_reg in reversed(shadows):
+            if old_reg is None:
+                self._reg.pop(name, None)
+            else:
+                self._reg[name] = old_reg
 
     def _declare_local(self, name: str):
-        self._local_stack[-1].add(name)
+        cur = self._local_stack[-1]
+        if name in cur:
+            return  # 同作用域重复声明：复用寄存器（Lua 顺序覆盖语义）
+        cur.add(name)
+        if name in self._reg:
+            # 遮蔽外层同名绑定：本作用域分配全新寄存器，退出时恢复外层映射
+            self._scope_shadows[-1].append((name, self._reg[name]))
+            self._reg[name] = self._new_reg()
+        else:
+            self._scope_shadows[-1].append((name, None))
 
     def _is_local(self, name: str) -> bool:
-        # 捕获变量不是局部变量（走 _G），其他正常判断
+        # 捕获变量不是局部变量（走 box/_uv），其他正常判断
         if name in self._captured_vars:
             return False
         return any(name in s for s in self._local_stack)
@@ -8854,10 +9017,17 @@ class ProVMCompiler:
         elif t == "Name":
             name = node.get("name")
             if name in self._captured_vars:
+                # 捕获变量：无论顶层还是函数体内，都走 GETUV 读 UV 表。
+                # 顶层 _run(1, {}) 的 UV 表存储了所有 SETUV 写入的捕获变量；
+                # 函数体内 UV 表是 CLOSURE 时从外层 UV 复制而来。
+                # 之前仅对 _in_function=True 走 GETUV，导致顶层引用捕获变量时
+                # 走 GETGLOB 读 _G（变量从未 SETGLOB）→ 返回 nil → 索引 nil 报错。
                 self._emit("GETUV", dest_reg, self._str_idx(name))
             elif self._is_local(name):
                 self._emit("MOVR", dest_reg, self._reg_of(name))
             else:
+                # 未捕获变量：走 GETGLOB 读 _G
+                # 注：顶层 local function 也会 SETGLOB 到 _G，保证函数体内 GETGLOB 能读到
                 self._emit("GETGLOB", dest_reg, self._str_idx(name))
         elif t == "BinOp":
             self._compile_binop(node, dest_reg)
@@ -8881,6 +9051,13 @@ class ProVMCompiler:
             self._compile_table(node, dest_reg)
         elif t == "Paren":
             self._compile_expr(node.get("expr"), dest_reg)
+        elif t == "Vararg":
+            # `...` 表达式：加载当前调用的 varargs 表 va_var（{...}）
+            # 用于 function(...) return {...} end 或 local t = {...} 等场景
+            self._emit("LOADVA", dest_reg)
+        elif t == "Dots":
+            # 兼容别名
+            self._emit("LOADVA", dest_reg)
         else:
             self._emit("LOADNIL", dest_reg)
         return dest_reg
@@ -8915,15 +9092,41 @@ class ProVMCompiler:
         args = node.get("args") or []
         if func_node.type == "Name":
             fname = func_node.get("name")
-            if self._is_local(fname):
+            if fname in self._captured_vars:
+                # 捕获变量函数：无论顶层还是函数体内，都走 GETUV 读 UV 表
+                # （与 Name handler 的修复保持一致）
+                func_reg = self._new_reg()
+                self._emit("GETUV", func_reg, self._str_idx(fname))
+            elif self._is_local(fname):
                 func_reg = self._reg_of(fname)
             else:
+                # 未捕获变量：走 GETGLOB
                 func_reg = self._new_reg()
                 self._emit("GETGLOB", func_reg, self._str_idx(fname))
         else:
             func_reg = self._compile_expr(func_node)
-        arg_regs = [self._compile_expr(a) for a in args]
-        self._emit("CALL", dest_reg, func_reg, len(arg_regs), *arg_regs)
+        # 检测尾部 vararg 参数：f(a, b, ...) 需要展开所有 varargs
+        # 这种情况下使用 CALLVA 指令（带 varargs 展开）
+        has_trailing_vararg = args and args[-1].type == "Vararg"
+        if has_trailing_vararg:
+            # 固定参数部分（不含尾部 ...）
+            fixed_args = args[:-1]
+            arg_regs = [self._compile_expr(a) for a in fixed_args]
+            # CALLVA: 展开固定参数 + va_var 全部传给被调函数
+            self._emit("CALLVA", dest_reg, func_reg, len(arg_regs), *arg_regs)
+        elif args and args[-1].type in ("Call", "Invoke"):
+            # 尾部多返回值展开：f(a, b, g()) — g() 的所有返回值作为尾部参数
+            # 只有最后一个参数会展开所有返回值，中间参数取首个返回值（Lua 语义）
+            fixed_args = args[:-1]
+            arg_regs = [self._compile_expr(a) for a in fixed_args]
+            # 编译最后一个 call — 这会填充 _rets（保留所有返回值）
+            last_call_reg = self._new_reg()
+            self._compile_call(args[-1], last_call_reg)
+            # CALLMR: 固定参数 + _rets 的所有返回值作为尾部参数
+            self._emit("CALLMR", dest_reg, func_reg, len(arg_regs), *arg_regs)
+        else:
+            arg_regs = [self._compile_expr(a) for a in args]
+            self._emit("CALL", dest_reg, func_reg, len(arg_regs), *arg_regs)
 
     def _compile_method_call(self, node, dest_reg: str):
         obj_node = node.get("obj")
@@ -8937,21 +9140,51 @@ class ProVMCompiler:
             method_str = method.get("value") or str(method)
         else:
             method_str = str(method)
-        arg_regs = [self._compile_expr(a) for a in args]
-        self._emit("CALLV", dest_reg, obj_reg, self._str_idx(method_str),
-                   len(arg_regs), *arg_regs)
+        # 检测尾部 vararg / 多返回值（与 _compile_call 保持一致）
+        has_trailing_vararg = args and args[-1].type == "Vararg"
+        if has_trailing_vararg:
+            fixed_args = args[:-1]
+            arg_regs = [self._compile_expr(a) for a in fixed_args]
+            # CALLVVA: 方法调用 + vararg 展开（暂复用 CALLVA 语义，但带 self）
+            # 这里用 CALLVA 但把 self 作为第一个固定参数
+            # 实际上方法调用 obj:m(...) 等价于 obj.m(obj, ...)
+            # 我们先取 _fn = obj[m]，再 CALLVA(_fn, obj, ...)
+            func_reg = self._new_reg()
+            self._emit("GETTABK", func_reg, obj_reg, self._str_idx(method_str))
+            self._emit("CALLVA", dest_reg, func_reg, len(arg_regs) + 1, obj_reg, *arg_regs)
+        elif args and args[-1].type in ("Call", "Invoke"):
+            # 尾部多返回值展开：obj:m(a, b, g())
+            fixed_args = args[:-1]
+            arg_regs = [self._compile_expr(a) for a in fixed_args]
+            last_call_reg = self._new_reg()
+            self._compile_call(args[-1], last_call_reg)
+            # obj:m(...) 等价于调用 obj.m(obj, ...)
+            func_reg = self._new_reg()
+            self._emit("GETTABK", func_reg, obj_reg, self._str_idx(method_str))
+            # CALLMR: 固定参数（含 self）+ _rets 多返回值
+            self._emit("CALLMR", dest_reg, func_reg, len(arg_regs) + 1, obj_reg, *arg_regs)
+        else:
+            arg_regs = [self._compile_expr(a) for a in args]
+            self._emit("CALLV", dest_reg, obj_reg, self._str_idx(method_str),
+                       len(arg_regs), *arg_regs)
 
     def _compile_function_expr(self, node, dest_reg: str, func_name: str = None):
         func_id = f"func_{id(node)}"
-        # 创建闭包 upvalue 表：捕获当前作用域中已定义的捕获变量
+        # 闭包 UV 表（box 语义）：
+        # 捕获变量在外层通过 DECLUV 声明为单元素 box（{value}）存于外层 _uv；
+        # CLOSURE handler 会浅拷贝外层 _uv（box 引用共享），无需寄存器快照预填充。
+        # 旧实现按寄存器值快照填充，导致闭包间不共享 upvalue（快照语义错误）。
         uv_reg = self._new_reg()
         self._emit("NEWTAB", uv_reg)
-        for var in self._captured_vars:
-            # 跳过函数自身（尚未定义，由调用方在 CLOSURE 后补设）
-            if var == func_name:
-                continue
-            if var in self._reg:
-                self._emit("SETTABK", uv_reg, self._str_idx(var), self._reg_of(var))
+        # 【强度增强】诱饵 upvalue 污染：向闭包 UV 合并表注入随机名字的伪捕获项，
+        # 误导逆向者分析「函数捕获了哪些变量」。诱饵名为 fresh 随机标识符，
+        # 永不与任何真实变量名冲突（编译器只为真实捕获名发射 GETUV/SETUV/DECLUV），
+        # 因此零语义影响、零兼容风险，仅增加 _uv 命名空间噪音。
+        for _ in range(self.rng.randint(1, 3)):
+            decoy_key = self.gen.fresh()
+            decoy_val = self._new_reg()
+            self._emit("LOADK", decoy_val, self._const_idx(self.rng.randint(0, 65535)))
+            self._emit("SETTABK", uv_reg, self._str_idx(decoy_key), decoy_val)
         # CLOSURE 指令：[opcode, dest_reg, startPC(待回填), uv_reg]
         idx = self._emit("CLOSURE", dest_reg, 0, uv_reg)
         self._closure_patches.append((idx, func_id))
@@ -8961,6 +9194,19 @@ class ProVMCompiler:
 
     def _compile_table(self, node, dest_reg: str):
         fields = node.get("fields") or []
+        # 特殊优化：{...} → 直接复制 va_var（当前调用的 varargs 表）
+        # 这保证 local t = {...} 的 t[1], t[2]... 是所有传入参数
+        if len(fields) == 1:
+            f = fields[0]
+            if f.type in ("TableItem", "TableField"):
+                key = f.get("key")
+                val = f.get("value")
+                if key is None and val is not None and val.type == "Vararg":
+                    # {...} 必须创建一个新表，包含所有 vararg 值
+                    # 用 NEWTAB + APPENDVA(1) 把 va_var 全部追加到新表
+                    self._emit("NEWTAB", dest_reg)
+                    self._emit("APPENDVA", dest_reg, 1)
+                    return
         self._emit("NEWTAB", dest_reg)
         seq_idx = 0
         for field in fields:
@@ -8969,6 +9215,24 @@ class ProVMCompiler:
                 val = field.get("value")
                 if key is None:
                     seq_idx += 1
+                    # {...} 作为表元素：展开所有 varargs 到顺序索引
+                    if val is not None and val.type == "Vararg":
+                        # 需要 APPENDVA 指令把 va_var 全部追加到当前表
+                        # 直接传 seq_idx 作为字面量（不经过 const_idx，避免索引误解）
+                        self._emit("APPENDVA", dest_reg, seq_idx)
+                        # 后续 seq_idx 无法预知数量，但常见用法 {...} 是唯一元素，直接 return
+                        continue
+                    # 尾部多返回值：{a, b, g()} — g() 的所有返回值追加到表末尾
+                    # 只有最后一个无 key 字段才展开多返回值（Lua 语义）
+                    is_last_seq = (field is fields[-1])
+                    if is_last_seq and val is not None and val.type in ("Call", "Invoke"):
+                        # 先编译该 call 填充 _rets，再 TABMR 追加
+                        last_call_reg = self._new_reg()
+                        self._compile_call(val, last_call_reg)
+                        # 直接传 seq_idx 作为字面量
+                        self._emit("TABMR", dest_reg, seq_idx)
+                        # 多返回值数量未知，后续无法继续顺序索引（Lua 语义：多返回值后不能有更多无 key 字段）
+                        continue
                     val_reg = self._compile_expr(val)
                     k_reg = self._new_reg()
                     self._emit("LOADK", k_reg, self._const_idx(seq_idx))
@@ -8989,10 +9253,15 @@ class ProVMCompiler:
             return False
         return all(c.isalnum() or c == "_" for c in s)
 
-    def _store_name(self, name: str, val_reg: str):
-        """把值存入变量：捕获变量走 SETUV（闭包 upvalue 表），局部变量走 declare + MOVR。"""
+    def _store_name(self, name: str, val_reg: str, is_decl: bool = False):
+        """把值存入变量。
+        捕获变量（box 语义）：
+        - 声明（is_decl=True，LocalAssign）：DECLUV 新建 box —— 每次执行到此（函数调用/循环迭代）
+          都产生独立 box，与 Lua 局部变量语义一致；
+        - 纯赋值：SETUV 写入既有 box（与外层/其他闭包共享）。
+        局部变量：declare + MOVR。"""
         if name in self._captured_vars:
-            self._emit("SETUV", self._str_idx(name), val_reg)
+            self._emit("DECLUV" if is_decl else "SETUV", self._str_idx(name), val_reg)
         else:
             self._declare_local(name)
             self._emit("MOVR", self._reg_of(name), val_reg)
@@ -9011,7 +9280,7 @@ class ProVMCompiler:
                 for i, name in enumerate(names):
                     tmp = self._new_reg()
                     self._emit("GETRET", tmp, i + 1)
-                    self._store_name(name, tmp)
+                    self._store_name(name, tmp, is_decl=True)
             else:
                 # 先编译所有表达式（到临时寄存器），再赋值
                 val_regs = []
@@ -9022,12 +9291,14 @@ class ProVMCompiler:
                         val_regs.append(None)
                 for i, name in enumerate(names):
                     if name in self._captured_vars:
+                        # local 声明 → DECLUV 新 box（每次函数调用/循环迭代独立，
+                        # 同名局部变量互不串扰；闭包经 box 引用共享该变量）
                         if val_regs[i] is not None:
-                            self._emit("SETUV", self._str_idx(name), val_regs[i])
+                            self._emit("DECLUV", self._str_idx(name), val_regs[i])
                         else:
                             nil_reg = self._new_reg()
                             self._emit("LOADNIL", nil_reg)
-                            self._emit("SETUV", self._str_idx(name), nil_reg)
+                            self._emit("DECLUV", self._str_idx(name), nil_reg)
                     else:
                         self._declare_local(name)
                         if val_regs[i] is not None:
@@ -9102,16 +9373,47 @@ class ProVMCompiler:
                 self._jmp_ph("JMP", 0, label_key=self._loop_end_stack[-1], field=1)
             else:
                 self._emit("JMP", 0)
+        elif t == "Continue":
+            # continue = 跳到当前循环的起始（Continue label）
+            if self._loop_continue_stack:
+                self._jmp_ph("JMP", 0, label_key=self._loop_continue_stack[-1], field=1)
+            else:
+                # 无循环上下文：回退为 break 语义（顶层非法，但防御性处理）
+                if self._loop_end_stack:
+                    self._jmp_ph("JMP", 0, label_key=self._loop_end_stack[-1], field=1)
+                else:
+                    self._emit("JMP", 0)
+        elif t == "Goto":
+            # goto label → 跳到 label 定义处（同函数作用域内）
+            label = node.get("label")
+            if label:
+                self._jmp_ph("JMP", 0, label_key=f"_goto_{label}", field=1)
+        elif t == "Label":
+            # ::label:: → 注册 jump target
+            label = node.get("label")
+            if label:
+                self._label(f"_goto_{label}")
         elif t == "LocalFunction":
             name = node.get("name")
             func = node.get("func")
             self._declare_local(name)
-            self._compile_function_expr(func, self._reg_of(name), func_name=name)
-            # 递归支持：捕获变量 → SETTABK 到 _uv 表，普通变量 → SETGLOB 到 _G
+            # 【box 语义】local function f 等价于 local f; f = function...
+            # Lua 中局部名在闭包创建前已声明。被捕获（含自递归+被他人捕获的
+            # 组合场景）时：先 DECLUV(nil) 声明 box → CLOSURE 复制带上 box 引用
+            # → SETUV 把闭包值填入共享 box。这样函数体内自递归（GETUV）与
+            # 外部捕获者（GETUV）读到的都是同一个 box，时序正确。
             if name in self._captured_vars:
-                self._emit("SETTABK", self._last_uv_reg, self._str_idx(name), self._reg_of(name))
-            else:
-                self._emit("SETGLOB", self._str_idx(name), self._reg_of(name))
+                _nil = self._new_reg()
+                self._emit("LOADNIL", _nil)
+                self._emit("DECLUV", self._str_idx(name), _nil)
+            self._compile_function_expr(func, self._reg_of(name), func_name=name)
+            if name in self._captured_vars:
+                self._emit("SETUV", self._str_idx(name), self._reg_of(name))
+            # 顶层 local function 始终 SETGLOB 到 _G：
+            # - 顶层引用（print(isEven(10))）走 GETGLOB 读取
+            # - 前向引用（mutual recursion: isEven 调用尚未定义的 isOdd）走 GETGLOB
+            # - 自递归（预扫描已 discard，不在 captured）函数体内走 GETGLOB 读取
+            self._emit("SETGLOB", self._str_idx(name), self._reg_of(name))
         elif t == "FunctionDecl":
             name_node = node.get("name")
             func = node.get("func")
@@ -9184,25 +9486,33 @@ class ProVMCompiler:
         cond_reg = self._compile_expr(node.get("cond"))
         self._jmp_ph("NJMP", cond_reg, 0, label_key=end, field=2)
         self._loop_end_stack.append(end)
+        # continue: 跳回条件检查（start）
+        self._loop_continue_stack.append(start)
         self._push_scope()
         for s in (node.get("body") or []):
             self._compile_stmt(s)
         self._pop_scope()
         self._loop_end_stack.pop()
+        self._loop_continue_stack.pop()
         self._jmp_ph("JMP", 0, label_key=start, field=1)
         self._label(end)
 
     def _compile_repeat(self, node):
         start = f"repeat_start_{id(node)}"
         end = f"repeat_end_{id(node)}"
+        # repeat 的 continue 跳到条件检查（end of body, before cond）
+        cont = f"repeat_cont_{id(node)}"
         self._label(start)
         self._loop_end_stack.append(end)
+        self._loop_continue_stack.append(cont)
         self._push_scope()
         for s in (node.get("body") or []):
             self._compile_stmt(s)
-        cond_reg = self._compile_expr(node.get("cond"))
         self._pop_scope()
+        self._label(cont)
+        cond_reg = self._compile_expr(node.get("cond"))
         self._loop_end_stack.pop()
+        self._loop_continue_stack.pop()
         self._jmp_ph("NJMP", cond_reg, 0, label_key=start, field=2)
         self._label(end)
 
@@ -9216,8 +9526,10 @@ class ProVMCompiler:
         else:
             step_reg = self._new_reg()
             self._emit("LOADK", step_reg, self._const_idx(1))
-        loop_var_reg = self._reg_of(var)
+        # 先声明再取寄存器：声明时若遮蔽外层同名变量会分配全新寄存器，
+        # 之后的 _reg_of(var) 才与循环体引用一致
         self._declare_local(var)
+        loop_var_reg = self._reg_of(var)
         # 专用寄存器保存 limit 和 step（跨迭代不变）
         limit_store = self._new_reg()
         step_store = self._new_reg()
@@ -9230,16 +9542,26 @@ class ProVMCompiler:
         self._jmp_ph("FORPREP", loop_var_reg, start_reg, limit_store, step_store,
                       0, label_key=end_label, field=5)
         self._label(loop_start_label)
+        # 循环变量被闭包捕获：每次迭代进入循环体时 DECLUV 新 box。
+        # Lua 语义：for 的循环变量每轮都是全新变量，
+        # fns[i] = function() return i end 各闭包捕获各自的 i。
+        if var in self._captured_vars:
+            self._emit("DECLUV", self._str_idx(var), loop_var_reg)
         self._loop_end_stack.append(end_label)
+        # continue: 跳到 FORLOOP（递增 + 条件重检）
+        forloop_label = f"forloop_{id(node)}"
+        self._loop_continue_stack.append(forloop_label)
         self._push_scope()
         for s in (node.get("body") or []):
             self._compile_stmt(s)
         self._pop_scope()
         self._loop_end_stack.pop()
+        self._loop_continue_stack.pop()
         # FORLOOP: var += step; 如果仍满足条件则跳回 loop_start
         # inst = [op, var_reg, limit_store, step_store, back_offset]
         # back_offset 在 field=4（第 5 个元素）
         # 用 label 回填，避免花指令插入导致偏移计算错误
+        self._label(forloop_label)
         self._jmp_ph("FORLOOP", loop_var_reg, limit_store, step_store,
                       0, label_key=loop_start_label, field=4)
         self._label(end_label)
@@ -9305,13 +9627,21 @@ class ProVMCompiler:
         # 更新控制变量: var = v1
         self._emit("MOVR", var_reg, self._reg_of(vars_[0]))
 
+        # 循环变量被闭包捕获：每轮迭代 DECLUV 新 box（Lua for-in 语义：每轮全新变量）
+        for v in vars_:
+            if v in self._captured_vars:
+                self._emit("DECLUV", self._str_idx(v), self._reg_of(v))
+
         # 循环体
         self._loop_end_stack.append(end_label)
+        # continue: 跳回 start_label（重新调用迭代器）
+        self._loop_continue_stack.append(start_label)
         self._push_scope()
         for s in (node.get("body") or []):
             self._compile_stmt(s)
         self._pop_scope()
         self._loop_end_stack.pop()
+        self._loop_continue_stack.pop()
 
         # 跳回循环开始
         self._jmp_ph("JMP", 0, label_key=start_label, field=1)
@@ -9322,6 +9652,28 @@ class ProVMCompiler:
         if not exprs:
             self._emit("RET")
         else:
+            # 检查最后一个表达式是否为 vararg（return ... 或 return f(), ...）
+            # 这种情况下需要展开 vararg 的所有值作为返回值
+            if len(exprs) == 1 and exprs[0].type == "Vararg":
+                # return ... → 直接返回 va_var 的所有值（I[2]=0 表示无固定值）
+                self._emit("RETVA", 0)
+                return
+            if len(exprs) >= 2 and exprs[-1].type == "Vararg":
+                # return a, b, ... → 固定部分 + vararg 展开
+                fixed_regs = [self._compile_expr(e) for e in exprs[:-1]]
+                self._emit("RETVA", len(fixed_regs), *fixed_regs)
+                return
+            # 尾部多返回值：return a, b, g() — g() 的所有返回值作为尾部返回值
+            # 只有最后一个表达式才展开多返回值（Lua 语义）
+            if len(exprs) >= 1 and exprs[-1].type in ("Call", "Invoke"):
+                fixed_regs = [self._compile_expr(e) for e in exprs[:-1]]
+                # 编译最后一个 call — 填充 _rets
+                last_call_reg = self._new_reg()
+                self._compile_call(exprs[-1], last_call_reg)
+                # RETMR: 固定返回值 + _rets 的所有返回值作为尾部
+                # 这里复用 RETVA 的 _rv 拼接逻辑，但用 _rets 替代 _va
+                self._emit("RETMR", len(fixed_regs), *fixed_regs)
+                return
             regs = [self._compile_expr(e) for e in exprs]
             self._emit("RET", regs[0], len(regs), *regs)
 
@@ -9330,26 +9682,34 @@ class ProVMCompiler:
         params = node.get("params") or []
         old_locals = self._local_stack[:]
         old_reg = self._reg
+        old_shadows = self._scope_shadows
+        old_in_func = self._in_function
         self._local_stack = [set()]
         self._reg = {}
+        self._scope_shadows = [[]]
+        self._in_function = True  # 进入函数体：捕获变量走 GETUV
         # 在函数体开头插入 PARAMS 指令（label 必须在 PARAMS 之前，确保 _run 从 PARAMS 开始）
         self._label(func_id)
-        param_regs = [self._reg_of(p) for p in params]
-        # 必须声明参数为局部变量，否则函数体内会误用 GETGLOB 取全局
+        # 必须先声明参数再取寄存器：声明时若遮蔽外层同名变量会分配全新寄存器，
+        # PARAMS 写入的寄存器与函数体引用的寄存器才能保持一致
         for p in params:
             self._declare_local(p)
+        param_regs = [self._reg_of(p) for p in params]
         self._emit("PARAMS", len(params), *param_regs)
-        # 捕获变量参数：PARAMS 把参数加载到寄存器后，还需 SETUV 存入 _uv，
-        # 否则内层闭包通过 GETUV 读取时会得到 nil。
-        # 典型场景：local function makeAdder(n) return function(x) return x + n end end
+        # 捕获变量参数：PARAMS 把参数加载到寄存器后，DECLUV 新建 box 存入 _uv。
+        # 必须用 DECLUV（新 box）而非 SETUV：同一闭包多次调用时参数各自独立
+        # （local function makeAdder(n) return function(x) return x + n end end，
+        #  makeAdder(1)/makeAdder(2) 的内层闭包不应共享 n）。
         for p in params:
             if p in self._captured_vars:
-                self._emit("SETUV", self._str_idx(p), self._reg_of(p))
+                self._emit("DECLUV", self._str_idx(p), self._reg_of(p))
         for s in (node.get("body") or []):
             self._compile_stmt(s)
         self._emit("RET")
         self._local_stack = old_locals
         self._reg = old_reg
+        self._scope_shadows = old_shadows
+        self._in_function = old_in_func
 
     # ---- 主编译入口 ----
     def compile_chunk(self, chunk) -> Optional[str]:
@@ -9420,7 +9780,7 @@ class ProVMCompiler:
         jt_var = gen.fresh()  # jump_targets 表变量名
         # P2-3 解释器分片嵌套：敏感 opcode 走独立 secure dispatcher
         secure_candidates = ["CALL", "CALLV", "RET", "CLOSURE",
-                             "GETGLOB", "SETGLOB", "GETUV", "SETUV"]
+                             "GETGLOB", "SETGLOB", "GETUV", "SETUV", "DECLUV"]
         secure_opnames = [op for op in secure_candidates if op in self.opcode]
         main_chain, secure_chain, secure_codes = self._gen_handler_chain(
             op_var, reg_var, consts_var, strs_var, pc_var, inst_var,
@@ -9442,11 +9802,14 @@ class ProVMCompiler:
         self._axis_seed = axis_seed
         bc_lua = self._encrypt_program(key, shift_period)
         ad_period = self.rng.randint(50, 150)
-        ad_threshold = self.rng.choice([500, 999, 1500, 2000])
         # 反 trace 细化：高频时间检测阈值 + hook 检测
         # time_limit：每 ad_period 条指令的累计耗时上限（秒）
         # 单步执行会让这个值暴涨 100-1000 倍，触发静默 corrupt
-        time_limit = self.rng.choice([0.05, 0.1, 0.2, 0.5])
+        # 注意阈值下限 1.0s：真实注入器（手机端/低端PC）在 GC 停顿、UI 渲染
+        # 抖动、后台抢占时短窗耗时可达数百毫秒，过低的阈值会把正常玩家
+        # 误判为调试器导致脚本静默无反应（实测根因之一）。
+        # 单步执行耗时 >> 1s，1.0-3.0s 仍能可靠区分。
+        time_limit = self.rng.choice([1.0, 1.5, 2.0, 3.0])
         time_var = gen.fresh()
         last_time_var = gen.fresh()
         hook_chk_var = gen.fresh()
@@ -9598,7 +9961,9 @@ local function {fn_name}()
         local {erase_done_var} = false  -- 保留兼容（不再永久跳过 CRC，改用 erased_seg 精细跳过）
         local function {run_var}({pc_var}_start, {uv_var}, ...)
         if {uv_var} == nil then {uv_var} = {{}} end
-        local {va_var} = {{...}}
+        -- varargs 表：用 table.pack 保留 nil 参数（select('#', ...) 给出真实数量）
+        -- 之前用 {{...}} 会丢失 nil 之后的所有参数（{{}} 按 # 取长度）
+        local {va_var} = table.pack(...)
         local {pc_var} = {pc_var}_start
         local {reg_var} = {{}}
         local {rets_var} = {{}}
@@ -9632,10 +9997,15 @@ local function {fn_name}()
             {op_var} = {op_var} ~ ((({pc_var} // {axis_period}) * {axis_seed}) & 0xFFFF)
             {ad_var} = {ad_var} + 1
             if {ad_var} % {ad_period} == 0 then
-                -- 反 trace 1: _G 表大小监测（注入器环境注入大量全局）
+                -- 反 trace 1: _G 表大小监测
+                -- 【兼容性修复】真实执行器（Ninja/Synapse/Wave/Delta 等）会向 _G
+                -- 注入数百到上千个自定义全局（getgenv/hookfunction/fire* 全家桶），
+                -- 旧阈值 500-2000 会把真实注入器误判为异常环境并 return nil
+                -- 静默退出 —— 这是「混淆后无反应」的实测根因之一。
+                -- 新阈值 20000：只有刻意构造的巨型沙箱才会触及，正常永不触发。
                 local _gc = 0
                 for _ in pairs(_G) do _gc = _gc + 1 end
-                if _gc > {ad_threshold} then return nil end
+                if _gc > 20000 then return nil end
                 -- 反 trace 2: 高频时间检测
                 -- 正常执行 ad_period 条指令耗时 << time_limit
                 -- 单步/trace 会让耗时暴涨 100-1000 倍
@@ -9645,10 +10015,15 @@ local function {fn_name}()
                 end
                 -- last_time_var 在本块末尾重置（见 P1-3 后），避免 CRC 计算耗时被计入下一窗口
                 -- 反 trace 3: debug hook 检测
-                -- debug.sethook 被设置说明有人在 trace（line/call/return 断点）
-                local {hook_chk_var} = debug and debug.gethook and debug.gethook()
+                -- 【兼容性修复】部分执行器自设 count 型 hook 做超时看门狗，属正常环境。
+                -- 只检测 line 型 hook（断点/单步 trace 的标志），count/call 型忽略。
+                -- debug.gethook() 返回 hook函数, mask字符串, count
+                local {hook_chk_var} = debug and debug.gethook
                 if {hook_chk_var} then
-                    {corrupt_var} = true
+                    local _okh, _hf, _hm = pcall(debug.gethook)
+                    if _okh and _hf and type(_hm) == "string" and _hm:find("l", 1, true) then
+                        {corrupt_var} = true
+                    end
                 end
                 -- 反 trace 4: 调用栈深度检测
                 -- VM 正常调用栈深度有限，过深说明被包装/trace
@@ -9658,28 +10033,30 @@ local function {fn_name}()
                     -- 但 VM 自身也有包装，这里只检测极深栈（>20 层）
                     local _depth = 0
                     local _frame = debug.getinfo(1, "f")
-                    while _frame and _depth < 30 do
+                    while _frame and _depth < 40 do
                         _depth = _depth + 1
                         _frame = debug.getinfo(_depth + 1, "f")
                     end
-                    if _depth >= 25 then {corrupt_var} = true end
+                    if _depth >= 35 then {corrupt_var} = true end
                 end
-                -- P3-1 环境指纹绑定：_VERSION 存在性校验
-                -- 检测 _VERSION 是否被篡改/删除（沙箱环境可能移除 _VERSION）
-                -- 软检测：只检 _VERSION 存在且为字符串，不比对具体值（兼容 Lua 5.1/5.3/5.5/Luau）
-                if type(_VERSION) ~= "string" or #_VERSION < 3 then {corrupt_var} = true end
-                -- P3-1b collectgarbage 异常检测（调试器常驻对象多，内存占用异常高）
+                -- P3-1 环境指纹绑定：_VERSION 校验
+                -- 【兼容性修复】部分执行器沙箱合法地移除 _VERSION，只在其
+                -- 「存在但被篡改为非字符串」时才判异常。
+                if _VERSION ~= nil and type(_VERSION) ~= "string" then {corrupt_var} = true end
+                -- P3-1b collectgarbage 异常检测
+                -- 【兼容性修复】真实游戏/执行器 Lua 堆可达数百 MB，50MB 旧阈值误判。
                 if collectgarbage then
                     local _mem = collectgarbage("count")
-                    if _mem and _mem > 50000 then {corrupt_var} = true end
+                    if _mem and _mem > 1000000 then {corrupt_var} = true end
                 end
                 -- P3-1c debug.getregistry 注入检测
+                -- 【兼容性修复】执行器自身向 registry 注册大量对象，200 旧阈值误判。
                 if debug and debug.getregistry then
                     local _ok, _reg = pcall(debug.getregistry)
                     if _ok and _reg then
                         local _rc = 0
                         for _ in pairs(_reg) do _rc = _rc + 1 end
-                        if _rc > 200 then {corrupt_var} = true end
+                        if _rc > 20000 then {corrupt_var} = true end
                     end
                 end
                 -- P3-2 反 Hook：关键 API 存在性校验（条件注入）
@@ -10073,28 +10450,45 @@ return {fn_name}()
         elif op_name == "NJMP":
             return f'if not {R}[{RK}[{I}[2]]] then {pc_var}={JT}[{I}[3]] _jmp=true end'
         elif op_name == "CALL":
+            # I[4] = 固定参数数；用 table.unpack(_args, 1, I[4]) 显式指定长度，
+            # 避免 nil 参数导致 #_args 错误（unpack 默认用 #t 会停在 nil 处）
             return (f'local _fn={R}[{RK}[{I}[3]]] local _args={{}} '
                     f'for _ai=1,{I}[4] do _args[_ai]={R}[{RK}[{I}[4+_ai]]] end '
-                    f'{RETS}=table.pack(_fn(table.unpack(_args))) '
+                    f'{RETS}=table.pack(_fn(table.unpack(_args,1,{I}[4]))) '
                     f'{R}[{RK}[{I}[2]]]={RETS}[1]')
         elif op_name == "CALLV":
+            # I[5] = 固定参数数（不含 self）；同样显式指定 unpack 长度
             return (f'local _obj={R}[{RK}[{I}[3]]] local _m=_dec_str({S}[{I}[4]+1]) '
                     f'local _args={{}} '
                     f'for _ai=1,{I}[5] do _args[_ai]={R}[{RK}[{I}[5+_ai]]] end '
                     f'local _fn=_obj[_m] '
-                    f'{RETS}=table.pack(_fn(_obj,table.unpack(_args))) '
+                    f'{RETS}=table.pack(_fn(_obj,table.unpack(_args,1,{I}[5]))) '
                     f'{R}[{RK}[{I}[2]]]={RETS}[1]')
         elif op_name == "RET":
+            # I[3] = 返回值数；用 table.unpack(_rv, 1, I[3]) 显式指定长度，
+            # 避免 nil 返回值导致 #_rv 错误（return nil, 42 会停在 nil 处）
             return (f'if {I}[3] and {I}[3]>0 then '
                     f'local _rv={{}} for _ri=1,{I}[3] do _rv[_ri]={R}[{RK}[{I}[3+_ri]]] end '
-                    f'return table.unpack(_rv) end '
+                    f'return table.unpack(_rv,1,{I}[3]) end '
                     f'return')
+        elif op_name == "RETVA":
+            # return ... 或 return a, b, ...
+            # I[2] = 固定返回值数（不含 ...）；va_var.n 是 varargs 数量
+            # 无固定值（I[2]==0）时直接 return table.unpack(va, 1, va.n)
+            # 有固定值时把固定值放前面，vararg 展开放后面
+            return (f'if {I}[2] and {I}[2]>0 then '
+                    f'local _rv={{}} for _ri=1,{I}[2] do _rv[_ri]={R}[{RK}[{I}[2+_ri]]] end '
+                    f'for _vi=1,{VA}.n do _rv[{I}[2]+_vi]={VA}[_vi] end '
+                    f'return table.unpack(_rv,1,{I}[2]+{VA}.n) end '
+                    f'return table.unpack({VA},1,{VA}.n)')
         elif op_name == "CLOSURE":
             return (f'local _uvc={{}} '
                     f'for _k,_v in pairs({UV}) do _uvc[_k]=_v end '
                     f'for _k,_v in pairs({R}[{RK}[{I}[4]]]) do _uvc[_k]=_v end '
                     f'{R}[{RK}[{I}[2]]]=function(...) return {RUN}({I}[3],_uvc,...) end')
         elif op_name == "PARAMS":
+            # va_var 是 table.pack(...) 结果，用 .n 字段保留 nil 参数
+            # 直接按索引读取（包括 nil 值）
             return f'for _pi=1,{I}[2] do {R}[{RK}[{I}[2+_pi]]]={VA}[_pi] end'
         elif op_name == "GETRET":
             return f'{R}[{RK}[{I}[2]]]={RETS}[{I}[3]]'
@@ -10113,9 +10507,20 @@ return {fn_name}()
         elif op_name == "SETGLOB":
             return f'_G[_dec_str({S}[{I}[2]+1])]={R}[{RK}[{I}[3]]]'
         elif op_name == "GETUV":
-            return f'{R}[{RK}[{I}[2]]]={UV}[_dec_str({S}[{I}[3]+1])]'
+            # box 读：_uv[name] 是单元素 box（{value}），CLOSURE 浅拷贝共享 box 引用
+            # box 不存在（读取早于声明/前向引用）→ nil
+            return (f'local _b={UV}[_dec_str({S}[{I}[3]+1])] '
+                    f'{R}[{RK}[{I}[2]]]=_b and _b[1]')
         elif op_name == "SETUV":
-            return f'{UV}[_dec_str({S}[{I}[2]+1])]={R}[{RK}[{I}[3]]]'
+            # box 写：写入既有 box（与外层/兄弟闭包共享该 upvalue）
+            # box 不存在（对未声明捕获名的纯赋值）→ 防御性建 box，避免报错
+            return (f'local _b={UV}[_dec_str({S}[{I}[2]+1])] '
+                    f'if _b then _b[1]={R}[{RK}[{I}[3]]] '
+                    f'else {UV}[_dec_str({S}[{I}[2]+1])]={{}} '
+                    f'{UV}[_dec_str({S}[{I}[2]+1])][1]={R}[{RK}[{I}[3]]] end')
+        elif op_name == "DECLUV":
+            # box 声明：新建 box 替换旧引用（局部变量语义——每次函数调用/循环迭代独立）
+            return f'{UV}[_dec_str({S}[{I}[2]+1])]={{}} {UV}[_dec_str({S}[{I}[2]+1])][1]={R}[{RK}[{I}[3]]]'
         elif op_name == "FORPREP":
             return (f'{R}[{RK}[{I}[2]]]={R}[{RK}[{I}[3]]] '
                     f'if ({R}[{RK}[{I}[5]]]>0 and {R}[{RK}[{I}[3]]]>{R}[{RK}[{I}[4]]] ) '
@@ -10128,6 +10533,59 @@ return {fn_name}()
                     f'then {pc_var}={JT}[{I}[5]] _jmp=true end')
         elif op_name == "BREAK":
             return f'{pc_var}={JT}[{I}[2]]'
+        elif op_name == "LOADVA":
+            # 加载 vararg 的第一个值（用于 local x = ... 或 (...) 表达式）
+            # 注意：local t = {...} 由 _compile_table 单独处理（NEWTAB + APPENDVA），
+            # 不会走到这里。这里只处理「单值上下文」的 ... 表达式。
+            # va_var 是 table.pack(...) 结果，va_var[1] 是第一个参数（可为 nil）
+            return f'{R}[{RK}[{I}[2]]]={VA}[1]'
+        elif op_name == "APPENDVA":
+            # 将 va_var 全部追加到目标表，从指定索引开始（{a, b, ...}）
+            # 用 va_var.n 显式指定长度，避免 nil 截断
+            return (f'for _vi=1,{VA}.n do '
+                    f'{R}[{RK}[{I}[2]]][{I}[3]+_vi-1]={VA}[_vi] end')
+        elif op_name == "CALLVA":
+            # 带尾部 vararg 展开的调用：f(a, b, ...)
+            # I[2]=dest, I[3]=func, I[4]=fixed_arg_count, I[5..]=固定参数 reg
+            # 用 va_var.n 显式指定长度，避免 nil 截断
+            return (f'local _fn={R}[{RK}[{I}[3]]] local _args={{}} '
+                    f'for _ai=1,{I}[4] do _args[_ai]={R}[{RK}[{I}[4+_ai]]] end '
+                    f'for _vi=1,{VA}.n do _args[{I}[4]+_vi]={VA}[_vi] end '
+                    f'local _na={I}[4]+{VA}.n '
+                    f'{RETS}=table.pack(_fn(table.unpack(_args,1,_na))) '
+                    f'{R}[{RK}[{I}[2]]]={RETS}[1]')
+        elif op_name == "CALLMR":
+            # 带尾部多返回值展开的调用：f(a, b, g()) — g() 的所有返回值作为尾部参数
+            # I[2]=dest, I[3]=func, I[4]=fixed_arg_count, I[5..]=固定参数 reg
+            # 尾部参数来自上一个 CALL 填充的 _rets 表（table.pack 结果，含 .n）
+            # 先保存 _mr=_rets（因为本次 CALL 会覆盖 _rets），再拼接固定参数 + 多返回值
+            return (f'local _fn={R}[{RK}[{I}[3]]] local _args={{}} '
+                    f'for _ai=1,{I}[4] do _args[_ai]={R}[{RK}[{I}[4+_ai]]] end '
+                    f'local _mr={RETS} '
+                    f'local _mn=_mr.n or 0 '
+                    f'for _mi=1,_mn do _args[{I}[4]+_mi]=_mr[_mi] end '
+                    f'local _na={I}[4]+_mn '
+                    f'{RETS}=table.pack(_fn(table.unpack(_args,1,_na))) '
+                    f'{R}[{RK}[{I}[2]]]={RETS}[1]')
+        elif op_name == "TABMR":
+            # 表构造器追加多返回值：{a, b, g()} — g() 的所有返回值追加到表末尾
+            # I[2]=dest_tab, I[3]=start_idx（追加起始索引，1-based）
+            # 尾部元素来自上一个 CALL 填充的 _rets 表
+            return (f'local _mr={RETS} '
+                    f'local _mn=_mr.n or 0 '
+                    f'for _mi=1,_mn do {R}[{RK}[{I}[2]]][{I}[3]+_mi-1]=_mr[_mi] end')
+        elif op_name == "RETMR":
+            # return a, b, g() — 固定返回值 + g() 的所有返回值作为尾部
+            # I[2] = 固定返回值数（不含多返回值部分）；尾部来自 _rets（上一个 CALL）
+            # 先保存 _mr=_rets，再拼接固定值 + _mr 展开值
+            return (f'if {I}[2] and {I}[2]>0 then '
+                    f'local _rv={{}} for _ri=1,{I}[2] do _rv[_ri]={R}[{RK}[{I}[2+_ri]]] end '
+                    f'local _mr={RETS} '
+                    f'local _mn=_mr.n or 0 '
+                    f'for _mi=1,_mn do _rv[{I}[2]+_mi]=_mr[_mi] end '
+                    f'return table.unpack(_rv,1,{I}[2]+_mn) end '
+                    f'local _mr={RETS} '
+                    f'return table.unpack(_mr,1,_mr.n or 0)')
         return f'-- unknown {op_name}'
 
 

@@ -8340,18 +8340,25 @@ def obfuscate(src: str,
             _final_chunk = parse_source(src)
             if _final_chunk:
                 _gen_vp = NameGenerator(rng)
-                # VM 全开：无论脚本大小，启用最强保护
+                # VM 全开：≤800 行脚本启用最强保护
                 #   - enable_nested_vm=True   VM嵌套VM（Dual-VM），增加逆向深度
                 #   - enable_register_virt=True 寄存器虚拟化
                 #   - enable_anti_hook=True    反Hook检测
+                # 【网页端大脚本防崩溃】>800 行自动关闭「VM嵌套VM」：
+                # 嵌套 VM 的字节码膨胀是平方级，手机浏览器 WASM 堆上限低
+                # （约 300-500MB），大脚本嵌套编译会 OOM 闪退/卡死页面。
+                # VM 本体/寄存器虚拟化/反Hook 全部保留，强度只降嵌套一层。
+                _src_lines = src.count("\n") + 1
+                _use_nested = _src_lines <= 800
                 _vm_code = _vm_pro_compile(
                     _final_chunk, rng, _gen_vp,
-                    enable_nested_vm=True,
+                    enable_nested_vm=_use_nested,
                     enable_register_virt=True,
                     enable_anti_hook=True)
                 if _vm_code:
                     code = _WATERMARK_HEADER + _vm_code + _LEGAL_FOOTER
-                    stats["vm_pro"] = "enabled+nested+regvirt+antihook"
+                    stats["vm_pro"] = ("enabled+nested+regvirt+antihook" if _use_nested
+                                       else "enabled+regvirt+antihook")
                 else:
                     stats["vm_pro"] = "fallback"
             else:
