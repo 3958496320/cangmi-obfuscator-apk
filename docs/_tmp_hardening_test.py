@@ -16,6 +16,14 @@ def _norm_outs(outs):
     """
     return [re.sub(r'\]:\d+:', ']:N:', s) for s in outs]
 
+
+def _norm_chunk(outs):
+    """进一步归一化 chunk 名：混淆后 error() 的 chunk 头（[string "..."]）
+    必然变为 VM 载荷头（头本身可含 ']'，如 "-- [AI-DETECT] ..."），
+    非语义差异。在行号归一化后，把 `[string ...]:N:` 整体替换为 CHUNK:N:，
+    只保留 ok 状态与消息本体。"""
+    return [re.sub(r'\[string .*\]:N:', 'CHUNK:N:', s) for s in _norm_outs(outs)]
+
 try:
     from lupa import LuaRuntime
     LUPA_OK = True
@@ -186,7 +194,7 @@ def test_semantic():
                 # 可能是 VM 保护导致的 error（水印等）。检查是否是预期
                 print(f"[sem {name} seed{seed}] 混淆脚本报错: {obf_err[:80]}")
                 ok = False; fail_cnt += 1; continue
-            nob, nor = _norm_outs(obf_out), _norm_outs(orig_out)
+            nob, nor = _norm_chunk(obf_out), _norm_chunk(orig_out)
             if nob != nor:
                 print(f"[sem {name} seed{seed}] 输出不匹配: orig={orig_out} obf={obf_out}")
                 ok = False; fail_cnt += 1; continue

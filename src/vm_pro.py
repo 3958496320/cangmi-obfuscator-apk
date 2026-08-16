@@ -46,7 +46,7 @@ _PRO_OPCODES = [
     "JMP", "CJMP", "NJMP",
     "CALL", "CALLV", "RET", "CLOSURE", "PARAMS", "GETRET",
     "NEWTAB", "GETTAB", "SETTAB", "GETTABK", "SETTABK",
-    "GETGLOB", "SETGLOB", "GETUV", "SETUV", "COPYUV",
+    "GETGLOB", "SETGLOB", "GETUV", "SETUV", "DECLUV", "COPYUV",
     "FORPREP", "FORLOOP",
     "BREAK",
     "LOADVA", "APPENDVA",  # varargs 表加载/追加（function(...){...}）
@@ -57,13 +57,14 @@ _PRO_OPCODES = [
     "RETMR",   # return a, b, g() — g() 的所有返回值作为尾部返回值
 ]
 # 假 opcode（编译器从不 emit，但占用 opcode 码点 + 在 dispatcher 有 handler）
-# P3 升级：假 opcode 数量与真 opcode 1:1（33 真 → 32 假），大幅增加反汇编噪音
+# P3 升级：假 opcode 数量超过真 opcode（34 真 → 40 假），大幅增加反汇编噪音
 # 反汇编工具会看到这些 opcode 并尝试分析其语义，浪费精力
 _PRO_FAKE_OPCODES = [
     "JUNK1", "JUNK2", "JUNK3", "JUNK4", "JUNK5", "JUNK6", "JUNK7", "JUNK8",
     "JUNK9", "JUNK10", "JUNK11", "JUNK12", "JUNK13", "JUNK14", "JUNK15", "JUNK16",
     "JUNK17", "JUNK18", "JUNK19", "JUNK20", "JUNK21", "JUNK22", "JUNK23", "JUNK24",
     "JUNK25", "JUNK26", "JUNK27", "JUNK28", "JUNK29", "JUNK30", "JUNK31", "JUNK32",
+    "JUNK33", "JUNK34", "JUNK35", "JUNK36", "JUNK37", "JUNK38", "JUNK39", "JUNK40",
 ]
 
 _PRO_BINOPS = ["+", "-", "*", "/", "%", "^", "..",
@@ -137,6 +138,8 @@ class ProVMCompiler:
         self._closure_patches: List[Tuple[int, str]] = []
         # 作用域
         self._local_stack: List[set] = [set()]
+        # 作用域遮蔽恢复栈：每层记录 (name, 外层寄存器或None)，pop 时恢复
+        self._scope_shadows: List[List[Tuple[str, Optional[str]]]] = [[]]
         # 循环结束标签栈（用于 BREAK）
         self._loop_end_stack: List[str] = []
         # 循环 continue 标签栈（用于 CONTINUE，指向循环条件检查入口）
@@ -333,15 +336,35 @@ class ProVMCompiler:
     # ---- 作用域 ----
     def _push_scope(self):
         self._local_stack.append(set())
+        self._scope_shadows.append([])
 
     def _pop_scope(self):
+        # 作用域退出：恢复被内层同名局部变量遮蔽的外层寄存器绑定。
+        # 【作用域遮蔽修复】旧实现 _reg 是平坦名字表，do block / 内层作用域
+        # 声明同名局部变量会直接复用外层寄存器，作用域结束后外层变量被
+        # 内层值污染（local x=1 do local x=10 end print(x) 输出 10 而非 1）。
         self._local_stack.pop()
+        shadows = self._scope_shadows.pop()
+        for name, old_reg in reversed(shadows):
+            if old_reg is None:
+                self._reg.pop(name, None)
+            else:
+                self._reg[name] = old_reg
 
     def _declare_local(self, name: str):
-        self._local_stack[-1].add(name)
+        cur = self._local_stack[-1]
+        if name in cur:
+            return  # 同作用域重复声明：复用寄存器（Lua 顺序覆盖语义）
+        cur.add(name)
+        if name in self._reg:
+            # 遮蔽外层同名绑定：本作用域分配全新寄存器，退出时恢复外层映射
+            self._scope_shadows[-1].append((name, self._reg[name]))
+            self._reg[name] = self._new_reg()
+        else:
+            self._scope_shadows[-1].append((name, None))
 
     def _is_local(self, name: str) -> bool:
-        # 捕获变量不是局部变量（走 _G），其他正常判断
+        # 捕获变量不是局部变量（走 box/_uv），其他正常判断
         if name in self._captured_vars:
             return False
         return any(name in s for s in self._local_stack)
@@ -624,15 +647,21 @@ class ProVMCompiler:
 
     def _compile_function_expr(self, node, dest_reg: str, func_name: str = None):
         func_id = f"func_{id(node)}"
-        # 创建闭包 upvalue 表：捕获当前作用域中已定义的捕获变量
+        # 闭包 UV 表（box 语义）：
+        # 捕获变量在外层通过 DECLUV 声明为单元素 box（{value}）存于外层 _uv；
+        # CLOSURE handler 会浅拷贝外层 _uv（box 引用共享），无需寄存器快照预填充。
+        # 旧实现按寄存器值快照填充，导致闭包间不共享 upvalue（快照语义错误）。
         uv_reg = self._new_reg()
         self._emit("NEWTAB", uv_reg)
-        for var in self._captured_vars:
-            # 跳过函数自身（尚未定义，由调用方在 CLOSURE 后补设）
-            if var == func_name:
-                continue
-            if var in self._reg:
-                self._emit("SETTABK", uv_reg, self._str_idx(var), self._reg_of(var))
+        # 【强度增强】诱饵 upvalue 污染：向闭包 UV 合并表注入随机名字的伪捕获项，
+        # 误导逆向者分析「函数捕获了哪些变量」。诱饵名为 fresh 随机标识符，
+        # 永不与任何真实变量名冲突（编译器只为真实捕获名发射 GETUV/SETUV/DECLUV），
+        # 因此零语义影响、零兼容风险，仅增加 _uv 命名空间噪音。
+        for _ in range(self.rng.randint(1, 3)):
+            decoy_key = self.gen.fresh()
+            decoy_val = self._new_reg()
+            self._emit("LOADK", decoy_val, self._const_idx(self.rng.randint(0, 65535)))
+            self._emit("SETTABK", uv_reg, self._str_idx(decoy_key), decoy_val)
         # CLOSURE 指令：[opcode, dest_reg, startPC(待回填), uv_reg]
         idx = self._emit("CLOSURE", dest_reg, 0, uv_reg)
         self._closure_patches.append((idx, func_id))
@@ -701,10 +730,15 @@ class ProVMCompiler:
             return False
         return all(c.isalnum() or c == "_" for c in s)
 
-    def _store_name(self, name: str, val_reg: str):
-        """把值存入变量：捕获变量走 SETUV（闭包 upvalue 表），局部变量走 declare + MOVR。"""
+    def _store_name(self, name: str, val_reg: str, is_decl: bool = False):
+        """把值存入变量。
+        捕获变量（box 语义）：
+        - 声明（is_decl=True，LocalAssign）：DECLUV 新建 box —— 每次执行到此（函数调用/循环迭代）
+          都产生独立 box，与 Lua 局部变量语义一致；
+        - 纯赋值：SETUV 写入既有 box（与外层/其他闭包共享）。
+        局部变量：declare + MOVR。"""
         if name in self._captured_vars:
-            self._emit("SETUV", self._str_idx(name), val_reg)
+            self._emit("DECLUV" if is_decl else "SETUV", self._str_idx(name), val_reg)
         else:
             self._declare_local(name)
             self._emit("MOVR", self._reg_of(name), val_reg)
@@ -723,7 +757,7 @@ class ProVMCompiler:
                 for i, name in enumerate(names):
                     tmp = self._new_reg()
                     self._emit("GETRET", tmp, i + 1)
-                    self._store_name(name, tmp)
+                    self._store_name(name, tmp, is_decl=True)
             else:
                 # 先编译所有表达式（到临时寄存器），再赋值
                 val_regs = []
@@ -734,12 +768,14 @@ class ProVMCompiler:
                         val_regs.append(None)
                 for i, name in enumerate(names):
                     if name in self._captured_vars:
+                        # local 声明 → DECLUV 新 box（每次函数调用/循环迭代独立，
+                        # 同名局部变量互不串扰；闭包经 box 引用共享该变量）
                         if val_regs[i] is not None:
-                            self._emit("SETUV", self._str_idx(name), val_regs[i])
+                            self._emit("DECLUV", self._str_idx(name), val_regs[i])
                         else:
                             nil_reg = self._new_reg()
                             self._emit("LOADNIL", nil_reg)
-                            self._emit("SETUV", self._str_idx(name), nil_reg)
+                            self._emit("DECLUV", self._str_idx(name), nil_reg)
                     else:
                         self._declare_local(name)
                         if val_regs[i] is not None:
@@ -838,13 +874,22 @@ class ProVMCompiler:
             name = node.get("name")
             func = node.get("func")
             self._declare_local(name)
+            # 【box 语义】local function f 等价于 local f; f = function...
+            # Lua 中局部名在闭包创建前已声明。被捕获（含自递归+被他人捕获的
+            # 组合场景）时：先 DECLUV(nil) 声明 box → CLOSURE 复制带上 box 引用
+            # → SETUV 把闭包值填入共享 box。这样函数体内自递归（GETUV）与
+            # 外部捕获者（GETUV）读到的都是同一个 box，时序正确。
+            if name in self._captured_vars:
+                _nil = self._new_reg()
+                self._emit("LOADNIL", _nil)
+                self._emit("DECLUV", self._str_idx(name), _nil)
             self._compile_function_expr(func, self._reg_of(name), func_name=name)
+            if name in self._captured_vars:
+                self._emit("SETUV", self._str_idx(name), self._reg_of(name))
             # 顶层 local function 始终 SETGLOB 到 _G：
             # - 顶层引用（print(isEven(10))）走 GETGLOB 读取
             # - 前向引用（mutual recursion: isEven 调用尚未定义的 isOdd）走 GETGLOB
-            # - 函数体内引用（被捕获）走 GETUV 读 _uv 表
-            #   _uv 表在 _compile_function_expr 中已从 self._reg 预填充该变量
-            # 注意：之前仅对 captured 走 SETTABK 是错的（顶层无 _uv 表，写入丢失）
+            # - 自递归（预扫描已 discard，不在 captured）函数体内走 GETGLOB 读取
             self._emit("SETGLOB", self._str_idx(name), self._reg_of(name))
         elif t == "FunctionDecl":
             name_node = node.get("name")
@@ -958,8 +1003,10 @@ class ProVMCompiler:
         else:
             step_reg = self._new_reg()
             self._emit("LOADK", step_reg, self._const_idx(1))
-        loop_var_reg = self._reg_of(var)
+        # 先声明再取寄存器：声明时若遮蔽外层同名变量会分配全新寄存器，
+        # 之后的 _reg_of(var) 才与循环体引用一致
         self._declare_local(var)
+        loop_var_reg = self._reg_of(var)
         # 专用寄存器保存 limit 和 step（跨迭代不变）
         limit_store = self._new_reg()
         step_store = self._new_reg()
@@ -972,6 +1019,11 @@ class ProVMCompiler:
         self._jmp_ph("FORPREP", loop_var_reg, start_reg, limit_store, step_store,
                       0, label_key=end_label, field=5)
         self._label(loop_start_label)
+        # 循环变量被闭包捕获：每次迭代进入循环体时 DECLUV 新 box。
+        # Lua 语义：for 的循环变量每轮都是全新变量，
+        # fns[i] = function() return i end 各闭包捕获各自的 i。
+        if var in self._captured_vars:
+            self._emit("DECLUV", self._str_idx(var), loop_var_reg)
         self._loop_end_stack.append(end_label)
         # continue: 跳到 FORLOOP（递增 + 条件重检）
         forloop_label = f"forloop_{id(node)}"
@@ -1052,6 +1104,11 @@ class ProVMCompiler:
         # 更新控制变量: var = v1
         self._emit("MOVR", var_reg, self._reg_of(vars_[0]))
 
+        # 循环变量被闭包捕获：每轮迭代 DECLUV 新 box（Lua for-in 语义：每轮全新变量）
+        for v in vars_:
+            if v in self._captured_vars:
+                self._emit("DECLUV", self._str_idx(v), self._reg_of(v))
+
         # 循环体
         self._loop_end_stack.append(end_label)
         # continue: 跳回 start_label（重新调用迭代器）
@@ -1102,28 +1159,33 @@ class ProVMCompiler:
         params = node.get("params") or []
         old_locals = self._local_stack[:]
         old_reg = self._reg
+        old_shadows = self._scope_shadows
         old_in_func = self._in_function
         self._local_stack = [set()]
         self._reg = {}
+        self._scope_shadows = [[]]
         self._in_function = True  # 进入函数体：捕获变量走 GETUV
         # 在函数体开头插入 PARAMS 指令（label 必须在 PARAMS 之前，确保 _run 从 PARAMS 开始）
         self._label(func_id)
-        param_regs = [self._reg_of(p) for p in params]
-        # 必须声明参数为局部变量，否则函数体内会误用 GETGLOB 取全局
+        # 必须先声明参数再取寄存器：声明时若遮蔽外层同名变量会分配全新寄存器，
+        # PARAMS 写入的寄存器与函数体引用的寄存器才能保持一致
         for p in params:
             self._declare_local(p)
+        param_regs = [self._reg_of(p) for p in params]
         self._emit("PARAMS", len(params), *param_regs)
-        # 捕获变量参数：PARAMS 把参数加载到寄存器后，还需 SETUV 存入 _uv，
-        # 否则内层闭包通过 GETUV 读取时会得到 nil。
-        # 典型场景：local function makeAdder(n) return function(x) return x + n end end
+        # 捕获变量参数：PARAMS 把参数加载到寄存器后，DECLUV 新建 box 存入 _uv。
+        # 必须用 DECLUV（新 box）而非 SETUV：同一闭包多次调用时参数各自独立
+        # （local function makeAdder(n) return function(x) return x + n end end，
+        #  makeAdder(1)/makeAdder(2) 的内层闭包不应共享 n）。
         for p in params:
             if p in self._captured_vars:
-                self._emit("SETUV", self._str_idx(p), self._reg_of(p))
+                self._emit("DECLUV", self._str_idx(p), self._reg_of(p))
         for s in (node.get("body") or []):
             self._compile_stmt(s)
         self._emit("RET")
         self._local_stack = old_locals
         self._reg = old_reg
+        self._scope_shadows = old_shadows
         self._in_function = old_in_func
 
     # ---- 主编译入口 ----
@@ -1195,7 +1257,7 @@ class ProVMCompiler:
         jt_var = gen.fresh()  # jump_targets 表变量名
         # P2-3 解释器分片嵌套：敏感 opcode 走独立 secure dispatcher
         secure_candidates = ["CALL", "CALLV", "RET", "CLOSURE",
-                             "GETGLOB", "SETGLOB", "GETUV", "SETUV"]
+                             "GETGLOB", "SETGLOB", "GETUV", "SETUV", "DECLUV"]
         secure_opnames = [op for op in secure_candidates if op in self.opcode]
         main_chain, secure_chain, secure_codes = self._gen_handler_chain(
             op_var, reg_var, consts_var, strs_var, pc_var, inst_var,
@@ -1217,11 +1279,14 @@ class ProVMCompiler:
         self._axis_seed = axis_seed
         bc_lua = self._encrypt_program(key, shift_period)
         ad_period = self.rng.randint(50, 150)
-        ad_threshold = self.rng.choice([500, 999, 1500, 2000])
         # 反 trace 细化：高频时间检测阈值 + hook 检测
         # time_limit：每 ad_period 条指令的累计耗时上限（秒）
         # 单步执行会让这个值暴涨 100-1000 倍，触发静默 corrupt
-        time_limit = self.rng.choice([0.05, 0.1, 0.2, 0.5])
+        # 注意阈值下限 1.0s：真实注入器（手机端/低端PC）在 GC 停顿、UI 渲染
+        # 抖动、后台抢占时短窗耗时可达数百毫秒，过低的阈值会把正常玩家
+        # 误判为调试器导致脚本静默无反应（实测根因之一）。
+        # 单步执行耗时 >> 1s，1.0-3.0s 仍能可靠区分。
+        time_limit = self.rng.choice([1.0, 1.5, 2.0, 3.0])
         time_var = gen.fresh()
         last_time_var = gen.fresh()
         hook_chk_var = gen.fresh()
@@ -1409,10 +1474,15 @@ local function {fn_name}()
             {op_var} = {op_var} ~ ((({pc_var} // {axis_period}) * {axis_seed}) & 0xFFFF)
             {ad_var} = {ad_var} + 1
             if {ad_var} % {ad_period} == 0 then
-                -- 反 trace 1: _G 表大小监测（注入器环境注入大量全局）
+                -- 反 trace 1: _G 表大小监测
+                -- 【兼容性修复】真实执行器（Ninja/Synapse/Wave/Delta 等）会向 _G
+                -- 注入数百到上千个自定义全局（getgenv/hookfunction/fire* 全家桶），
+                -- 旧阈值 500-2000 会把真实注入器误判为异常环境并 return nil
+                -- 静默退出 —— 这是「混淆后无反应」的实测根因之一。
+                -- 新阈值 20000：只有刻意构造的巨型沙箱才会触及，正常永不触发。
                 local _gc = 0
                 for _ in pairs(_G) do _gc = _gc + 1 end
-                if _gc > {ad_threshold} then return nil end
+                if _gc > 20000 then return nil end
                 -- 反 trace 2: 高频时间检测
                 -- 正常执行 ad_period 条指令耗时 << time_limit
                 -- 单步/trace 会让耗时暴涨 100-1000 倍
@@ -1422,10 +1492,15 @@ local function {fn_name}()
                 end
                 -- last_time_var 在本块末尾重置（见 P1-3 后），避免 CRC 计算耗时被计入下一窗口
                 -- 反 trace 3: debug hook 检测
-                -- debug.sethook 被设置说明有人在 trace（line/call/return 断点）
-                local {hook_chk_var} = debug and debug.gethook and debug.gethook()
+                -- 【兼容性修复】部分执行器自设 count 型 hook 做超时看门狗，属正常环境。
+                -- 只检测 line 型 hook（断点/单步 trace 的标志），count/call 型忽略。
+                -- debug.gethook() 返回 hook函数, mask字符串, count
+                local {hook_chk_var} = debug and debug.gethook
                 if {hook_chk_var} then
-                    {corrupt_var} = true
+                    local _okh, _hf, _hm = pcall(debug.gethook)
+                    if _okh and _hf and type(_hm) == "string" and _hm:find("l", 1, true) then
+                        {corrupt_var} = true
+                    end
                 end
                 -- 反 trace 4: 调用栈深度检测
                 -- VM 正常调用栈深度有限，过深说明被包装/trace
@@ -1435,28 +1510,30 @@ local function {fn_name}()
                     -- 但 VM 自身也有包装，这里只检测极深栈（>20 层）
                     local _depth = 0
                     local _frame = debug.getinfo(1, "f")
-                    while _frame and _depth < 30 do
+                    while _frame and _depth < 40 do
                         _depth = _depth + 1
                         _frame = debug.getinfo(_depth + 1, "f")
                     end
-                    if _depth >= 25 then {corrupt_var} = true end
+                    if _depth >= 35 then {corrupt_var} = true end
                 end
-                -- P3-1 环境指纹绑定：_VERSION 存在性校验
-                -- 检测 _VERSION 是否被篡改/删除（沙箱环境可能移除 _VERSION）
-                -- 软检测：只检 _VERSION 存在且为字符串，不比对具体值（兼容 Lua 5.1/5.3/5.5/Luau）
-                if type(_VERSION) ~= "string" or #_VERSION < 3 then {corrupt_var} = true end
-                -- P3-1b collectgarbage 异常检测（调试器常驻对象多，内存占用异常高）
+                -- P3-1 环境指纹绑定：_VERSION 校验
+                -- 【兼容性修复】部分执行器沙箱合法地移除 _VERSION，只在其
+                -- 「存在但被篡改为非字符串」时才判异常。
+                if _VERSION ~= nil and type(_VERSION) ~= "string" then {corrupt_var} = true end
+                -- P3-1b collectgarbage 异常检测
+                -- 【兼容性修复】真实游戏/执行器 Lua 堆可达数百 MB，50MB 旧阈值误判。
                 if collectgarbage then
                     local _mem = collectgarbage("count")
-                    if _mem and _mem > 50000 then {corrupt_var} = true end
+                    if _mem and _mem > 1000000 then {corrupt_var} = true end
                 end
                 -- P3-1c debug.getregistry 注入检测
+                -- 【兼容性修复】执行器自身向 registry 注册大量对象，200 旧阈值误判。
                 if debug and debug.getregistry then
                     local _ok, _reg = pcall(debug.getregistry)
                     if _ok and _reg then
                         local _rc = 0
                         for _ in pairs(_reg) do _rc = _rc + 1 end
-                        if _rc > 200 then {corrupt_var} = true end
+                        if _rc > 20000 then {corrupt_var} = true end
                     end
                 end
                 -- P3-2 反 Hook：关键 API 存在性校验（条件注入）
@@ -1907,9 +1984,20 @@ return {fn_name}()
         elif op_name == "SETGLOB":
             return f'_G[_dec_str({S}[{I}[2]+1])]={R}[{RK}[{I}[3]]]'
         elif op_name == "GETUV":
-            return f'{R}[{RK}[{I}[2]]]={UV}[_dec_str({S}[{I}[3]+1])]'
+            # box 读：_uv[name] 是单元素 box（{value}），CLOSURE 浅拷贝共享 box 引用
+            # box 不存在（读取早于声明/前向引用）→ nil
+            return (f'local _b={UV}[_dec_str({S}[{I}[3]+1])] '
+                    f'{R}[{RK}[{I}[2]]]=_b and _b[1]')
         elif op_name == "SETUV":
-            return f'{UV}[_dec_str({S}[{I}[2]+1])]={R}[{RK}[{I}[3]]]'
+            # box 写：写入既有 box（与外层/兄弟闭包共享该 upvalue）
+            # box 不存在（对未声明捕获名的纯赋值）→ 防御性建 box，避免报错
+            return (f'local _b={UV}[_dec_str({S}[{I}[2]+1])] '
+                    f'if _b then _b[1]={R}[{RK}[{I}[3]]] '
+                    f'else {UV}[_dec_str({S}[{I}[2]+1])]={{}} '
+                    f'{UV}[_dec_str({S}[{I}[2]+1])][1]={R}[{RK}[{I}[3]]] end')
+        elif op_name == "DECLUV":
+            # box 声明：新建 box 替换旧引用（局部变量语义——每次函数调用/循环迭代独立）
+            return f'{UV}[_dec_str({S}[{I}[2]+1])]={{}} {UV}[_dec_str({S}[{I}[2]+1])][1]={R}[{RK}[{I}[3]]]'
         elif op_name == "FORPREP":
             return (f'{R}[{RK}[{I}[2]]]={R}[{RK}[{I}[3]]] '
                     f'if ({R}[{RK}[{I}[5]]]>0 and {R}[{RK}[{I}[3]]]>{R}[{RK}[{I}[4]]] ) '
