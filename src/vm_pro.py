@@ -43,6 +43,7 @@ except Exception:
 _PRO_OPCODES = [
     "LOADK", "LOADSTR", "LOADBOOL", "LOADNIL", "MOVR",
     "BINOP", "UNOP",
+    "LOADKN",  # P2-4 常量池双表示方言：数字常量走字符串池四层加密，运行期 tonumber 还原
     "JMP", "CJMP", "NJMP",
     "CALL", "CALLV", "RET", "CLOSURE", "PARAMS", "GETRET",
     "NEWTAB", "GETTAB", "SETTAB", "GETTABK", "SETTABK",
@@ -1226,6 +1227,10 @@ class ProVMCompiler:
         bc_len_var = gen.fresh()
         uv_var = gen.fresh()  # 闭包 upvalue 表变量名
 
+        # P2-4 常量池双表示方言：在任何池序列化之前改写字节码
+        # （LOADK→LOADKN 会向 strs 池追加加密条目，并设置 _op_extra）
+        self._dialect_consts()
+
         consts_lua = "{" + ",".join(self._fmt_const(c) for c in self.consts) + "}"
         strs_lua = self._gen_str_pool_lua(strs_var)
 
@@ -1277,6 +1282,37 @@ class ProVMCompiler:
         axis_seed = self.rng.randint(0x100, 0xFFFF)
         self._axis_period = axis_period
         self._axis_seed = axis_seed
+        # ---- P2-2 滚动密钥链：基本块种子 + 块内链式演化 ----
+        # leaders = {1} ∪ 跳转目标 ∪ CLOSURE 入口（run_var 的全部可能入口）
+        # 每个leader随机分配32位种子；块内每条指令执行后 chain 演化一步。
+        # 密钥与「执行历史」绑定：静态 dump 必须先还原块结构+种子+演化
+        # 公式才能解密任一指令，单条指令脱壳工具直接失效。
+        # 注意：必须放在 _dialect_consts 之后（链混合的 opcode 是方言改写后的值）。
+        leaders = {1}
+        for _lk in getattr(self, '_used_labels', []):
+            leaders.add(self._labels.get(_lk, 1))
+        for _, _fid in getattr(self, '_closure_patches', []):
+            leaders.add(self._labels.get(_fid, 1))
+        self._seeds = {L: self.rng.randint(0x10000, 0xFFFFFFFF)
+                       for L in sorted(leaders)}
+        # 编译期模拟链演化：chain_map[pc] = 执行到 pc 时的链状态
+        # 与运行期完全一致：leader 处重置种子，顺序流逐条演化
+        chain_map = {}
+        _cur = self._seeds.get(1, key)
+        _bc_total = len(self.prog) - 1
+        for _pc in range(1, _bc_total + 1):
+            if _pc in self._seeds:
+                _cur = self._seeds[_pc]
+            chain_map[_pc] = _cur
+            _opv = self.prog[_pc][0] if self.prog[_pc] else 0
+            _cur = self._mix_chain(_cur, _opv if isinstance(_opv, int) else 0)
+        self._chain_map = chain_map
+        # ---- P2-5 结构密钥变量（值在 _dialect_consts 中已设置）----
+        seeds_var = gen.fresh()
+        chain_var = gen.fresh()
+        op_extra_var = gen.fresh()
+        seed_items = ",".join(f'[{L}]={s}' for L, s in self._seeds.items())
+        seeds_lua = "{" + seed_items + "}"
         bc_lua = self._encrypt_program(key, shift_period)
         ad_period = self.rng.randint(50, 150)
         # 反 trace 细化：高频时间检测阈值 + hook 检测
@@ -1421,6 +1457,7 @@ local function {fn_name}()
     local {jt_var} = {jt_lua}
     local {rk_var} = {rk_lua}  -- P2-2 寄存器虚拟化映射表
     local {sec_var} = {sec_lua}  -- P2-3 secure opcode 查找表
+    local {seeds_var} = {seeds_lua}  -- P2-2 滚动密钥链：基本块种子表
     {strs_lua}
     local {corrupt_var} = false  -- 反 trace 触发标志：true 时静默 corrupt 内部状态
     {crc_fn_lua}
@@ -1449,14 +1486,32 @@ local function {fn_name}()
         local {last_time_var} = os.clock()
         local {seg_chk_var} = 0
         local {watermark_var} = 0  -- P2-1 自擦除水位线（已擦除到的最高 PC）
+        -- P2-2 滚动密钥链：入口重置为该基本块种子（pc_start 恒为 leader）
+        local {chain_var} = {seeds_var}[{pc_var}] or {key_var}
+        -- P2-5 结构密钥：四个结构表长度异或。任一表被增删/hook 重排
+        -- （如伪造指令、塞假 handler）→ 长度变化 → 全部 opcode 解码错乱
+        -- → 静默跑飞。#strs 在此已构建完成（含 LOADKN 方言追加项）。
+        local {op_extra_var} = (#{bc_var} ~ #{jt_var} ~ #{consts_var} ~ #{strs_var}) & 0xFFFF
+        -- 反模拟执行探针：tostring/tonumber 往返一致性
+        -- 真实 Lua/Luau 恒成立；简陋模拟器（自实现 string 库）会失败
+        if tonumber(tostring(16789)) ~= 16789 then
+            {chain_var} = {chain_var} ~ 0x5A5A
+        end
         while {pc_var} <= {bc_len_var} do
             local {raw_var} = {bc_var}[{pc_var}]
             if not {raw_var} then break end
+            -- P2-2 滚动密钥链：到达基本块头（leader）时重置为该块种子
+            -- 跳转目标与 CLOSURE 入口全部是 leader，与编译期模型一致
+            if {seeds_var}[{pc_var}] then
+                {chain_var} = {seeds_var}[{pc_var}]
+            end
             local {inst_var} = {{}}
             for _i = 1, #{raw_var} do
                 local _e = {raw_var}[_i]
                 if type(_e) == "number" then
-                    local _v = _e ~ (({key_var} + {pc_var} + _i) & 0xFFFFFFFF)
+                    -- P2-2 滚动密钥链：元素密钥 = 当前链状态（执行历史绑定）
+                    -- 静态脱壳必须先还原块结构+种子+演化公式才能解密任一元素
+                    local _v = _e ~ {chain_var}
                     if _v >= 2147483648 then _v = _v - 4294967296 end
                     {inst_var}[_i] = _v
                 else
@@ -1472,6 +1527,8 @@ local function {fn_name}()
             -- axis_key = ((pc // axis_period) * axis_seed) & 0xFFFF
             -- 每轴指令段用不同密钥，反汇编器须模拟轴切换才能解码
             {op_var} = {op_var} ~ ((({pc_var} // {axis_period}) * {axis_seed}) & 0xFFFF)
+            -- P2-5 结构密钥参与 opcode 解码：表结构被动过则全部解码错乱
+            {op_var} = {op_var} ~ {op_extra_var}
             {ad_var} = {ad_var} + 1
             if {ad_var} % {ad_period} == 0 then
                 -- 反 trace 1: _G 表大小监测
@@ -1605,6 +1662,11 @@ local function {fn_name}()
             else
                 {main_chain}
             end
+            -- P2-2 滚动密钥链演化：本条指令的解密后 opcode 混入链状态，
+            -- 作为下一条（顺序流）指令的元素密钥。与编译期 _mix_chain 一致。
+            {chain_var} = ({chain_var} ~ ({inst_var}[1] * 0x9E3779B1)) & 0xFFFFFFFF
+            {chain_var} = ({chain_var} * 1664525 + 1013904223) & 0xFFFFFFFF
+            {chain_var} = {chain_var} ~ ({chain_var} >> 16)
             if not _jmp then {pc_var} = {pc_var} + 1 end
         end
     end
@@ -1619,14 +1681,17 @@ return {fn_name}()
         返回 (is_num, value)：
           is_num=True  → value 是加密后的 32-bit 整数（用于 CRC 校验）
           is_num=False → value 是 Lua 字符串字面量（寄存器名等，原样透传）
-        与 _encrypt_program 序列化、运行期 bc_var 表内容完全一致。"""
+        与 _encrypt_program 序列化、运行期 bc_var 表内容完全一致。
+        P2-2 滚动密钥链：元素密钥 = chain_map[pc]（执行历史绑定的链状态）。
+        P2-5 结构密钥：opcode（i==1）额外异或 op_extra（结构表长度派生）。"""
         if isinstance(p, str):
             return False, self._fmt_str(p)
         if isinstance(p, bool):
             return True, 1 if p else 0
         if isinstance(p, (int, float)):
             val = int(p) & 0xFFFFFFFF
-            enc = (val ^ ((key + pc + i) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            chain = self._chain_map[pc]
+            enc = (val ^ chain) & 0xFFFFFFFF
             if i == 1:
                 shift_key = (pc // shift_period) & 0xFFFF
                 enc = (enc ^ shift_key) & 0xFFFFFFFF
@@ -1635,10 +1700,63 @@ return {fn_name}()
                 # 编译期与运行期同步，确保解密后 opcode 正确
                 axis_key = ((pc // self._axis_period) * self._axis_seed) & 0xFFFF
                 enc = (enc ^ axis_key) & 0xFFFFFFFF
+                # P2-5 结构密钥（编译期镜像运行期 op_extra_var）
+                enc = (enc ^ self._op_extra) & 0xFFFFFFFF
             return True, enc
         if p is None:
             return True, 0
         return False, str(p)
+
+    def _mix_chain(self, chain: int, opv: int) -> int:
+        """P2-2 滚动密钥链演化函数（编译期/运行期共用同一公式）。
+        Lua 侧：h=(c ~ (op*0x9E3779B1))&0xFFFFFFFF; h=(h*1664525+1013904223)&0xFFFFFFFF; h=h~(h>>16)"""
+        h = (chain ^ ((opv * 0x9E3779B1) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        h = (h * 1664525 + 1013904223) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h & 0xFFFFFFFF
+
+    def _dialect_consts(self, ratio: float = 0.0):
+        """P2-4 常量池双表示方言：把部分数字 LOADK 就地改写为 LOADKN。
+
+        - ratio<=0 时按构建随机 30%-60%；每次构建比例不同（多方言）
+        - 就地改写（不插新指令），标签/跳转表/CLOSURE 地址全部不受影响
+        - 数字常量转为字符串进入 strs 池（四层加密+懒解密+校验），
+          运行期 tonumber 还原；静态 dump 常量池只见部分数字
+        - 必须在任何池序列化（consts/strs/seeds/op_extra/加密）之前调用
+        """
+        if getattr(self, '_dialect_done', False):
+            return
+        self._dialect_done = True
+        real_loadk = self.opcode["LOADK"]
+        variants_kn = self.opcode_variants["LOADKN"]
+        if ratio <= 0:
+            ratio = self.rng.uniform(0.3, 0.6)
+        for pc in range(1, len(self.prog)):
+            ins = self.prog[pc]
+            if not ins or len(ins) < 3:
+                continue
+            if self.variant_to_real.get(ins[0]) != real_loadk:
+                continue
+            ci = ins[2]
+            if not isinstance(ci, int) or ci < 0 or ci >= len(self.consts):
+                continue
+            cv = self.consts[ci]
+            if not isinstance(cv, (int, float)) or isinstance(cv, bool):
+                continue
+            if self.rng.random() >= ratio:
+                continue
+            # 数字 → 规范字符串（与 _fmt_const 的整数化规则一致）
+            if isinstance(cv, float) and cv.is_integer():
+                sv = str(int(cv))
+            else:
+                sv = repr(cv)
+            sidx = self._str_idx(sv)
+            ins[0] = self.rng.choice(variants_kn)
+            ins[2] = sidx
+        # 构建期结构密钥：与运行期 (#{bc} ~ #{jt} ~ #{consts} ~ #{strs}) & 0xFFFF 一致
+        bc_len = len(self.prog) - 1
+        jt_len = len(getattr(self, '_used_labels', []))
+        self._op_extra = (bc_len ^ jt_len ^ len(self.consts) ^ len(self.strs)) & 0xFFFF
 
     def _encrypt_program(self, key: int, shift_period: int) -> str:
         """序列化 prog 为 Lua 表，数字元素加密。
@@ -1842,6 +1960,44 @@ return {fn_name}()
                 parts.append(f'if c=={code} then {R}[{RK}[d]]=#{R}[{RK}[a]] end')
         return " ".join(parts)
 
+    # P2-1 handler 唯一化：handler 内部临时变量名集合（local 于单个 handler 块内，
+    # 重命名不影响主循环共享变量 _jmp/_dec_str/解释器变量）
+    _HANDLER_TEMPS = ["_j", "_k", "_v", "_fn", "_args", "_ai", "_rv", "_ri",
+                      "_obj", "_m", "_vi", "_pi", "_uvc", "_b",
+                      "_na", "_mr", "_mn", "_mi",
+                      "a", "b", "c", "d"]
+
+    def _mutate_handler(self, h: str) -> str:
+        """P2-1 handler 唯一化：对单个 handler 源码做随机变异，消灭模板痕迹。
+
+        1) 临时变量重命名：每个 handler 实例使用互不相同的内部变量名，
+           静态特征匹配（如按 ``local _args={}`` 定位 CALL handler）全部失效。
+        2) 垃圾语句/死分支内联：恒假分支（r>c1 恒假）+ 无操作真分支，
+           改变 handler 长度/结构与控制流形状。
+        含 return 的 handler（RET/RETVA/RETMR）只允许前缀变异——
+        Lua 语法要求 return 必须是块的最后一条语句。"""
+        import re as _re
+        for name in self._HANDLER_TEMPS:
+            if _re.search(rf'\b{_re.escape(name)}\b', h):
+                fresh = self.gen.fresh()
+                h = _re.sub(rf'\b{_re.escape(name)}\b', fresh, h)
+        has_return = 'return' in h
+        mode = self.rng.randint(0, 3)
+        if mode > 0:
+            r = self.gen.fresh()
+            c1 = self.rng.randint(0, 9999)
+            if mode == 1:
+                h = f'local {r}={c1} ' + h
+            elif mode == 2 and not has_return:
+                # 恒真分支内放无操作（r=c1<c2 恒成立）：改变控制流形状但不改语义
+                c2 = c1 + self.rng.randint(1, 500)
+                h = f'local {r}={c1} ' + h + f' if {r}<{c2} then {r}={r}+0 end'
+            else:
+                # 恒假死分支：r=c1 永不大于 c1，分支永不执行（return-handler 安全）
+                c3 = self.rng.randint(1, 99)
+                h = f'local {r}={c1} if {r}>{c1} then {r}={r}-{c3} end ' + h
+        return h
+
     def _gen_handler_chain(self, op_var, reg_var, consts_var, strs_var,
                            pc_var, inst_var, bin_dispatch, un_dispatch,
                            run_var, rets_var, va_var, uv_var, jt_var, rk_var,
@@ -1859,6 +2015,7 @@ return {fn_name}()
                 h = self._gen_handler(op_name, reg_var, consts_var,
                                       strs_var, pc_var, inst_var, bin_dispatch, un_dispatch,
                                       run_var, rets_var, va_var, uv_var, jt_var, rk_var)
+                h = self._mutate_handler(h)
                 handlers.append((variants, h))
             handlers.sort(key=lambda x: x[0][0])
             parts = []
@@ -1908,6 +2065,10 @@ return {fn_name}()
                 return f'local _j=function() end'
         if op_name == "LOADK":
             return f'{R}[{RK}[{I}[2]]]={C}[{I}[3]+1]'
+        elif op_name == "LOADKN":
+            # P2-4 常量池双表示方言：数字常量以字符串形态存 strs 池（四层加密），
+            # 运行期 tonumber 还原。静态 dump 常量池只见部分明文数字。
+            return f'{R}[{RK}[{I}[2]]]=tonumber(_dec_str({S}[{I}[3]+1]))'
         elif op_name == "LOADSTR":
             return f'{R}[{RK}[{I}[2]]]=_dec_str({S}[{I}[3]+1])'
         elif op_name == "LOADBOOL":
