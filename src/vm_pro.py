@@ -43,6 +43,7 @@ except Exception:
 _PRO_OPCODES = [
     "LOADK", "LOADSTR", "LOADBOOL", "LOADNIL", "MOVR",
     "BINOP", "UNOP",
+    "LOADKN",  # 常量池双表示方言：数字常量走字符串池四层加密（tonumber 还原）
     "JMP", "CJMP", "NJMP",
     "CALL", "CALLV", "RET", "CLOSURE", "PARAMS", "GETRET",
     "NEWTAB", "GETTAB", "SETTAB", "GETTABK", "SETTABK",
@@ -1226,6 +1227,10 @@ class ProVMCompiler:
         bc_len_var = gen.fresh()
         uv_var = gen.fresh()  # 闭包 upvalue 表变量名
 
+        # P2-4 常量池双表示方言：在任何池序列化之前改写字节码
+        # （LOADK→LOADKN 会向 strs 池追加加密条目）
+        self._dialect_consts()
+
         consts_lua = "{" + ",".join(self._fmt_const(c) for c in self.consts) + "}"
         strs_lua = self._gen_str_pool_lua(strs_var)
 
@@ -1277,6 +1282,39 @@ class ProVMCompiler:
         axis_seed = self.rng.randint(0x100, 0xFFFF)
         self._axis_period = axis_period
         self._axis_seed = axis_seed
+        # ---- P2-2 滚动密钥链：基本块种子 + 块内链式演化 ----
+        # leaders = {1} ∪ 跳转目标 ∪ CLOSURE 入口（run_var 的全部可能入口）
+        # 每个leader随机分配32位种子；块内每条指令执行后 chain 演化一步。
+        # 密钥与「执行历史」绑定：静态 dump 必须先还原块结构+种子+演化
+        # 公式才能解密任一指令，单条指令脱壳工具直接失效。
+        leaders = {1}
+        for _lk in getattr(self, '_used_labels', []):
+            leaders.add(self._labels.get(_lk, 1))
+        for _, _fid in getattr(self, '_closure_patches', []):
+            leaders.add(self._labels.get(_fid, 1))
+        self._seeds = {L: self.rng.randint(0x10000, 0xFFFFFFFF)
+                       for L in sorted(leaders)}
+        # 编译期模拟链演化：chain_map[pc] = 执行到 pc 时的链状态
+        chain_map = {}
+        _cur = self._seeds.get(1, key)
+        _bc_total = len(self.prog) - 1
+        for _pc in range(1, _bc_total + 1):
+            if _pc in self._seeds:
+                _cur = self._seeds[_pc]
+            chain_map[_pc] = _cur
+            _opv = self.prog[_pc][0] if self.prog[_pc] else 0
+            _cur = self._mix_chain(_cur, _opv if isinstance(_opv, int) else 0)
+        self._chain_map = chain_map
+        # ---- P2-5 解释器结构自校验：解密密钥绑定结构完整性 ----
+        # op_extra = f(#bc, #jt, #rk, #consts, #strs)：篡改/注入任一结构表
+        # （如 hook 后重排 bc、塞入伪造指令）→ 所有 opcode 解码错乱 →
+        # 静默跑飞（不报错），比显式校验更难定位。
+        # 注意 #rk 运行期恒为 0（字符串键表无 border），编译期镜像为 0。
+        seeds_var = gen.fresh()
+        chain_var = gen.fresh()
+        op_extra_var = gen.fresh()
+        seed_items = ",".join(f'[{L}]={s}' for L, s in self._seeds.items())
+        seeds_lua = "{" + seed_items + "}"
         bc_lua = self._encrypt_program(key, shift_period)
         ad_period = self.rng.randint(50, 150)
         # 反 trace 细化：高频时间检测阈值 + hook 检测
@@ -1859,6 +1897,10 @@ return {fn_name}()
                 h = self._gen_handler(op_name, reg_var, consts_var,
                                       strs_var, pc_var, inst_var, bin_dispatch, un_dispatch,
                                       run_var, rets_var, va_var, uv_var, jt_var, rk_var)
+                # P2-1 handler 唯一化：每个 handler 实例独立变异
+                # （临时变量重命名 + 随机垃圾语句 + 恒假死分支），
+                # 消灭「同模板生成」痕迹，跨样本模式匹配失效。
+                h = self._mutate_handler(h)
                 handlers.append((variants, h))
             handlers.sort(key=lambda x: x[0][0])
             parts = []
@@ -1881,6 +1923,46 @@ return {fn_name}()
                 for v in self.opcode_variants[op_name]:
                     secure_codes.add(v)
         return main_chain, secure_chain, secure_codes
+
+    # P2-1 handler 唯一化：handler 内部临时变量名集合（_dec_str/_jmp 属于
+    # dispatcher 层，绝不能重命名）
+    _HANDLER_TEMPS = ['_fn', '_args', '_ai', '_obj', '_m', '_b', '_mr', '_mn',
+                      '_mi', '_na', '_rv', '_ri', '_vi', '_j', '_k', '_uvc',
+                      '_pi', '_v', '_vi2']
+
+    def _mutate_handler(self, h: str) -> str:
+        """P2-1 handler 唯一化：对单个 handler 源码做三重随机变异。
+
+        1) 临时变量重命名：handler 内部 _fn/_args 等统一前缀改为
+           每实例独立的随机名 —— 同一 opcode 在不同构建、不同分片中
+           代码完全不同，消灭模板痕迹。
+        2) 随机垃圾语句：前插/后插 local 赋值（常量随机）。
+        3) 恒假死分支：`if r>c2 then`（r 恒 <= c2），永不执行但增加
+           静态分析的状态空间。
+        全部变异均为语义保持（只影响局部死值），不影响 handler 行为。"""
+        import re as _re
+        # 1) 临时变量重命名（词边界匹配，避免 _m 误伤 _mn）
+        for name in self._HANDLER_TEMPS:
+            if _re.search(rf'\b{ _re.escape(name) }\b', h):
+                fresh = self.gen.fresh()
+                h = _re.sub(rf'\b{ _re.escape(name) }\b', fresh, h)
+        # 2)+3) 垃圾语句 + 死分支
+        mode = self.rng.randint(0, 3)
+        if mode > 0:
+            r = self.gen.fresh()
+            c1 = self.rng.randint(0, 9999)
+            junk_pre = f'local {r}={c1} '
+            if mode == 1:
+                h = junk_pre + h
+            elif mode == 2:
+                # 恒假死分支（c2 > c1 保证 r<c2 恒真 → 不进分支）
+                c2 = c1 + self.rng.randint(1, 500)
+                h = h + f' if {r}<{c2} then {r}={r}+0 end'
+                h = junk_pre + h
+            else:
+                c3 = self.rng.randint(1, 99)
+                h = f'local {r}={c1} if {r}>{c1} then {r}={r}-{c3} end ' + h
+        return h
 
     def _gen_handler(self, op_name, R, C, S, pc_var, I, bin_d, un_d,
                      RUN, RETS, VA, UV, JT, RK) -> str:
@@ -1908,6 +1990,11 @@ return {fn_name}()
                 return f'local _j=function() end'
         if op_name == "LOADK":
             return f'{R}[{RK}[{I}[2]]]={C}[{I}[3]+1]'
+        elif op_name == "LOADKN":
+            # P2-4 常量池双表示方言：数字常量以字符串形式走 strs 池
+            # （四层加密 + 懒解密 + 字节和校验），运行期 tonumber 还原。
+            # 静态 dump 常量池只能得到部分数字，其余藏在字符串密文里。
+            return f'{R}[{RK}[{I}[2]]]=tonumber(_dec_str({S}[{I}[3]+1]))'
         elif op_name == "LOADSTR":
             return f'{R}[{RK}[{I}[2]]]=_dec_str({S}[{I}[3]+1])'
         elif op_name == "LOADBOOL":
