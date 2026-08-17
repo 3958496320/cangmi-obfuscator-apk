@@ -1,4 +1,4 @@
-<!-- build: 2026-08-08-v11-all-protection-max 12层全开+VM三开关全开+profile统一最强档 -->
+<!-- build: 2026-08-16-v12-worker-fix 修复大脚本闪退(Pyodide移入Worker)+vm_pro闭包/反调试修复 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -660,7 +660,7 @@ for (let i = 0; i < 15; i++) {
         </div>
         <div class="progress-bar"><div class="progress-fill" id="progress"></div></div>
         <div id="retry-area" class="hidden" style="text-align:center;margin-top:8px;">
-            <button class="btn btn-warning" onclick="initPyodide()">重试加载</button>
+            <button class="btn btn-warning" onclick="initWorker()">重试加载</button>
         </div>
     </div>
 
@@ -690,21 +690,15 @@ for (let i = 0; i < 15; i++) {
     </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"
-        onerror="this.remove(); var s=document.createElement('script'); s.src='https://unpkg.com/pyodide@0.26.2/full/pyodide.js'; document.head.appendChild(s);"></script>
 <script>
 // ===== 配置 =====
 const ACCESS_PASSWORD = "cangmi2024";
-const PYODIDE_VERSION = "0.26.2";
-const PYODIDE_CDNS = [
-    `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`,
-    `https://unpkg.com/pyodide@${PYODIDE_VERSION}/full/`,
-    `https://fastly.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`,
-];
-
-let pyodide = null;
-let do_obfuscate_py = null;
-let pyodideLoading = false;
+// Pyodide 引擎移入 Web Worker，避免大脚本混淆阻塞主线程导致页面闪退/重启。
+// Worker 文件位于同目录，与 obfuscator_all.py 同源。
+let worker = null;
+let workerReady = false;
+let workerLoading = false;
+let pendingReqId = 0;
 let loadedFileName = '';
 
 // ===== 密码 =====
@@ -714,7 +708,7 @@ function checkPwd() {
         sessionStorage.setItem('authed', '1');
         document.getElementById('pwd-screen').style.display = 'none';
         document.getElementById('app').style.display = 'block';
-        if (!pyodide && !pyodideLoading) initPyodide();
+        if (!worker && !workerLoading) initWorker();
     } else {
         document.getElementById('pwd-error').style.display = 'block';
         document.getElementById('pwd-input').value = '';
@@ -725,7 +719,7 @@ function checkPwd() {
 if (sessionStorage.getItem('authed') === '1') {
     document.getElementById('pwd-screen').style.display = 'none';
     document.getElementById('app').style.display = 'block';
-    if (!pyodide && !pyodideLoading) initPyodide();
+    if (!worker && !workerLoading) initWorker();
 }
 
 document.getElementById('pwd-input').addEventListener('keydown', e => {
@@ -750,12 +744,10 @@ function switchFileManager(chip) {
     }
     const modeName = chip.textContent.trim();
     uploadSub.textContent = `支持 .lua .luau .txt · 当前: ${modeName}`;
-    // 重置 input 以便下次点击触发选择器
     fileInput.value = '';
     setStatus(`已切换至「${modeName}」，点击上方按钮选择文件`, 'idle');
 }
 
-// 帮助弹窗
 function showFileManagerHelp() {
     document.getElementById('fm-help-popup').classList.remove('hidden');
 }
@@ -767,17 +759,13 @@ fileInput.addEventListener('change', e => {
     if (e.target.files[0]) handleFile(e.target.files[0]);
 });
 
-// 电脑端拖拽支持
-uploadBtn.addEventListener('dragover', e => {
-    e.preventDefault();
-});
+uploadBtn.addEventListener('dragover', e => { e.preventDefault(); });
 uploadBtn.addEventListener('drop', e => {
     e.preventDefault();
     if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
 });
 
 function handleFile(file) {
-    // 后缀校验（accept=*/* 时用户可能选到非文本文件）
     const name = file.name.toLowerCase();
     const valid = name.endsWith('.lua') || name.endsWith('.luau') ||
                   name.endsWith('.txt') || name.endsWith('.text') ||
@@ -799,9 +787,7 @@ function handleFile(file) {
         setStatus(`已加载 ${file.name}`, 'success');
         setTimeout(() => setStatus('准备就绪', 'idle'), 2000);
     };
-    reader.onerror = () => {
-        setStatus('文件读取失败，请重试', 'error');
-    };
+    reader.onerror = () => { setStatus('文件读取失败，请重试', 'error'); };
     reader.readAsText(file);
 }
 
@@ -848,102 +834,65 @@ function setProgress(pct) {
     document.getElementById('progress').style.width = pct + '%';
 }
 
-// ===== Pyodide 初始化 =====
-function loadScript(url) {
-    return new Promise((resolve, reject) => {
-        const existing = document.querySelector(`script[src="${url}"]`);
-        if (existing) { resolve(); return; }
-        const script = document.createElement('script');
-        script.src = url;
-        script.onload = () => resolve();
-        script.onerror = () => reject(new Error('CDN 脚本加载失败'));
-        document.head.appendChild(script);
-    });
-}
-
-async function initPyodide() {
-    if (pyodideLoading) return;
-    pyodideLoading = true;
-
+// ===== Worker 初始化（Pyodide 运行在独立线程）=====
+function initWorker() {
+    if (workerLoading) return;
+    workerLoading = true;
     const btn = document.getElementById('btn-run');
     document.getElementById('retry-area').classList.add('hidden');
-
     btn.disabled = true;
     setProgress(5);
     setStatus('正在下载 Python 运行环境 (约10MB)...', 'loading');
 
-    for (let i = 0; i < PYODIDE_CDNS.length; i++) {
-        const cdn = PYODIDE_CDNS[i];
-        try {
-            setStatus(`[${i+1}/${PYODIDE_CDNS.length}] 下载 Python 引擎中...`, 'loading');
-            setProgress(10 + i * 10);
-
-            await loadScript(cdn + 'pyodide.js');
-            setProgress(40);
-
-            setStatus(`[${i+1}/${PYODIDE_CDNS.length}] 初始化 Python 引擎...`, 'loading');
-            pyodide = await loadPyodide({ indexURL: cdn });
-            setProgress(60);
-
-            setStatus('正在加载混淆引擎...', 'loading');
-            const response = await fetch('obfuscator_all.py');
-            if (!response.ok) throw new Error('引擎文件下载失败: HTTP ' + response.status);
-            const pyCode = await response.text();
-            setProgress(75);
-
-            pyodide.runPython(pyCode);
-            setProgress(90);
-
-            do_obfuscate_py = pyodide.runPython(`
-from pyodide.ffi import create_proxy
-
-def _do_obfuscate(code, ninja_mode=False):
-    try:
-        result = obfuscate_code(code, ninja_mode=ninja_mode)
-        return result
-    except Exception as e:
-        import traceback
-        return "ERROR: " + str(e) + "\\n" + traceback.format_exc()
-
-create_proxy(_do_obfuscate)
-`);
-            setProgress(100);
-
-            btn.disabled = false;
-            setStatus('引擎就绪，可以开始混淆', 'success');
-            setTimeout(() => {
-                setStatus('准备就绪', 'idle');
-                setProgress(0);
-            }, 2000);
-
-            pyodideLoading = false;
-            return;
-
-        } catch (err) {
-            console.error(`CDN ${i+1} 失败:`, err);
-            setStatus(`CDN ${i+1} 失败: ${err.message}`, 'error');
-            if (typeof loadPyodide !== 'undefined' && (err.message.includes('引擎') || err.message.includes('初始化'))) {
-                break;
-            }
-        }
+    try {
+        worker = new Worker('obfuscator-worker.js');
+    } catch (err) {
+        workerLoading = false;
+        setStatus('Worker 创建失败: ' + err.message, 'error');
+        document.getElementById('retry-area').classList.remove('hidden');
+        return;
     }
 
-    setStatus('加载失败，请检查网络后重试。建议开启 VPN 或更换网络环境。', 'error');
-    document.getElementById('retry-area').classList.remove('hidden');
-    pyodideLoading = false;
+    worker.onmessage = (e) => {
+        const msg = e.data;
+        if (msg.type === 'progress') {
+            if (msg.pct > 0) setProgress(msg.pct);
+            if (msg.msg) setStatus(msg.msg, 'loading');
+        } else if (msg.type === 'ready') {
+            workerReady = true;
+            workerLoading = false;
+            btn.disabled = false;
+            setStatus('引擎就绪，可以开始混淆', 'success');
+            setProgress(100);
+            setTimeout(() => { setStatus('准备就绪', 'idle'); setProgress(0); }, 2000);
+        } else if (msg.type === 'init_failed') {
+            workerLoading = false;
+            setStatus('加载失败: ' + msg.msg + '。建议开启 VPN 或更换网络。', 'error');
+            document.getElementById('retry-area').classList.remove('hidden');
+        } else if (msg.type === 'heartbeat') {
+            // 大脚本混淆中的心跳：保持进度条动画 + 状态文字，避免页面被判定无响应
+            const elapsed = msg.beats * 0.8;
+            setStatus(`混淆进行中... ${elapsed.toFixed(0)}s（大脚本需较长时间，请勿离开页面）`, 'loading');
+            setProgress(30 + (msg.beats % 7));
+        } else if (msg.type === 'result') {
+            handleResult(msg);
+        }
+    };
+
+    worker.onerror = (err) => {
+        workerLoading = false;
+        setStatus('引擎错误: ' + (err.message || 'unknown'), 'error');
+        document.getElementById('retry-area').classList.remove('hidden');
+    };
+
+    worker.postMessage({ type: 'init' });
 }
 
 // ===== 混淆 =====
 async function doObfuscate() {
     const code = document.getElementById('input-code').value.trim();
-    if (!code) {
-        setStatus('请先输入或上传代码', 'error');
-        return;
-    }
-    if (!do_obfuscate_py) {
-        setStatus('引擎还在加载中，请稍等...', 'loading');
-        return;
-    }
+    if (!code) { setStatus('请先输入或上传代码', 'error'); return; }
+    if (!workerReady) { setStatus('引擎还在加载中，请稍等...', 'loading'); return; }
 
     const btn = document.getElementById('btn-run');
     btn.disabled = true;
@@ -951,40 +900,36 @@ async function doObfuscate() {
     setStatus('正在混淆，请稍候...', 'loading');
     setProgress(30);
 
-    try {
-        await new Promise(r => setTimeout(r, 50));
-        setProgress(60);
-        const result = do_obfuscate_py(code);
-        setProgress(90);
+    pendingReqId++;
+    worker.postMessage({ type: 'obfuscate', payload: { code, ninja: true, id: pendingReqId } });
+}
 
-        document.getElementById('output-code').value = result;
-        updateOutputStats();
-
-        if (result.startsWith('ERROR:')) {
-            setStatus('混淆出错，请检查代码语法', 'error');
-            setProgress(0);
-        } else {
-            setStatus('混淆完成', 'success');
-            setProgress(100);
-            setTimeout(() => { setProgress(0); setStatus('完成', 'idle'); }, 2000);
-        }
-    } catch (e) {
-        setStatus('错误: ' + e.message, 'error');
+function handleResult(msg) {
+    const btn = document.getElementById('btn-run');
+    btn.disabled = false;
+    btn.innerHTML = '<span>开始混淆</span>';
+    if (!msg.ok) {
+        setStatus('错误: ' + (msg.error || '未知'), 'error');
         setProgress(0);
-        console.error(e);
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = '<span>开始混淆</span>';
+        return;
+    }
+    const result = msg.result;
+    document.getElementById('output-code').value = result;
+    updateOutputStats();
+    if (typeof result === 'string' && result.startsWith('ERROR:')) {
+        setStatus('混淆出错，请检查代码语法', 'error');
+        setProgress(0);
+    } else {
+        setStatus('混淆完成', 'success');
+        setProgress(100);
+        setTimeout(() => { setProgress(0); setStatus('完成', 'idle'); }, 2000);
     }
 }
 
 // ===== 复制 =====
 function copyResult() {
     const output = document.getElementById('output-code');
-    if (!output.value) {
-        setStatus('没有可复制的内容', 'error');
-        return;
-    }
+    if (!output.value) { setStatus('没有可复制的内容', 'error'); return; }
     output.select();
     output.setSelectionRange(0, 99999);
     try {
@@ -999,14 +944,10 @@ function copyResult() {
 // ===== 下载 =====
 function downloadResult() {
     const output = document.getElementById('output-code');
-    if (!output.value) {
-        setStatus('没有可下载的内容', 'error');
-        return;
-    }
+    if (!output.value) { setStatus('没有可下载的内容', 'error'); return; }
     let name = loadedFileName ?
         loadedFileName.replace(/\.(lua|luau|txt)$/, '_obfuscated.lua') :
         'obfuscated.lua';
-
     const blob = new Blob([output.value], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1016,7 +957,6 @@ function downloadResult() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-
     setStatus(`已下载: ${name}`, 'success');
     setTimeout(() => setStatus('准备就绪', 'idle'), 2000);
 }
