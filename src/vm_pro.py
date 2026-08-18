@@ -71,7 +71,7 @@ _PRO_FAKE_OPCODES = [
 _PRO_BINOPS = ["+", "-", "*", "/", "%", "^", "..",
                "==", "~=", "<", ">", "<=", ">=", "and", "or",
                "&", "|", "~", "<<", ">>", "//"]
-_PRO_UNOPS = ["-", "not", "#"]
+_PRO_UNOPS = ["-", "not", "#", "~"]
 
 
 # P1-3 字节码防篡改校验：CRC32 (IEEE 802.3) 查表
@@ -476,13 +476,21 @@ class ProVMCompiler:
         t = node.type
         if t == "Number":
             try:
-                v = str(node.get("value"))
-                if "." in v or "e" in v.lower():
+                v = str(node.get("value")).strip()
+                # 【修复】支持十六进制(0x)/二进制(0b)整数字面量：
+                # int(v, 0) 按前缀自动识别进制；旧实现 int(v) 对 "0xF0"
+                # 抛 ValueError → 静默置 0（位运算测试全错的根因）
+                if v.lower().startswith(("0x", "0b")):
+                    val = int(v, 0)
+                elif "." in v or "e" in v.lower():
                     val = float(v)
                 else:
                     val = int(v)
             except Exception:
-                val = 0
+                try:
+                    val = float(v)
+                except Exception:
+                    val = 0
             self._emit("LOADK", dest_reg, self._const_idx(val))
         elif t == "String":
             self._emit("LOADSTR", dest_reg, self._str_idx(node.get("value")))
@@ -1005,7 +1013,11 @@ class ProVMCompiler:
             step_reg = self._new_reg()
             self._emit("LOADK", step_reg, self._const_idx(1))
         # 先声明再取寄存器：声明时若遮蔽外层同名变量会分配全新寄存器，
-        # 之后的 _reg_of(var) 才与循环体引用一致
+        # 之后的 _reg_of(var) 才与循环体引用一致。
+        # 【作用域修复】循环变量作用域仅限循环本身（Lua 语义）：包一层独立
+        # scope，循环结束 pop 恢复外层同名绑定（旧实现声明进外层作用域，
+        # 循环后外层变量仍指向循环内部控制寄存器，读到 limit+step 残留值）。
+        self._push_scope()
         self._declare_local(var)
         loop_var_reg = self._reg_of(var)
         # 专用寄存器保存 limit 和 step（跨迭代不变）
@@ -1043,6 +1055,7 @@ class ProVMCompiler:
         self._jmp_ph("FORLOOP", loop_var_reg, limit_store, step_store,
                       0, label_key=loop_start_label, field=4)
         self._label(end_label)
+        self._pop_scope()  # 恢复被循环变量遮蔽的外层绑定
 
     def _compile_generic_for(self, node):
         """编译 generic for: for v1, v2, ... in explist do body end
@@ -1080,6 +1093,9 @@ class ProVMCompiler:
             if len(regs) >= 3:
                 self._emit("MOVR", var_reg, regs[2])
 
+        # 【作用域修复】for-in 循环变量作用域仅限循环本身：包独立 scope，
+        # 循环结束 pop 恢复外层同名绑定（与 numeric for 同一问题的修复）
+        self._push_scope()
         for v in vars_:
             self._declare_local(v)
 
@@ -1124,6 +1140,7 @@ class ProVMCompiler:
         # 跳回循环开始
         self._jmp_ph("JMP", 0, label_key=start_label, field=1)
         self._label(end_label)
+        self._pop_scope()  # 恢复被循环变量遮蔽的外层绑定
 
     def _compile_return(self, node):
         exprs = node.get("exprs") or []
@@ -1664,7 +1681,10 @@ local function {fn_name}()
             end
             -- P2-2 滚动密钥链演化：本条指令的解密后 opcode 混入链状态，
             -- 作为下一条（顺序流）指令的元素密钥。与编译期 _mix_chain 一致。
-            {chain_var} = ({chain_var} ~ ({inst_var}[1] * 0x9E3779B1)) & 0xFFFFFFFF
+            -- 【关键】必须用完全解码后的 {op_var}（明文变体码），
+            -- 不能用 {inst_var}[1]（还叠着 shift/axis/op_extra 三层异或，
+            -- 会导致编译期/运行期链状态从第 2 条指令起分歧，全部解密错乱）。
+            {chain_var} = ({chain_var} ~ ({op_var} * 0x9E3779B1)) & 0xFFFFFFFF
             {chain_var} = ({chain_var} * 1664525 + 1013904223) & 0xFFFFFFFF
             {chain_var} = {chain_var} ~ ({chain_var} >> 16)
             if not _jmp then {pc_var} = {pc_var} + 1 end
@@ -1958,6 +1978,8 @@ return {fn_name}()
                 parts.append(f'if c=={code} then {R}[{RK}[d]]=not {R}[{RK}[a]] end')
             elif op == "#":
                 parts.append(f'if c=={code} then {R}[{RK}[d]]=#{R}[{RK}[a]] end')
+            elif op == "~":
+                parts.append(f'if c=={code} then {R}[{RK}[d]]=~{R}[{RK}[a]] end')
         return " ".join(parts)
 
     # P2-1 handler 唯一化：handler 内部临时变量名集合（local 于单个 handler 块内，
@@ -2291,9 +2313,24 @@ def _wrap_nested_vm(inner_code: str, rng: random.Random, gen) -> str:
         enc.append(b ^ key_byte)
 
     # 生成 Lua 字节数组字面量（\ddd 转义）
-    payload_str = '"' + ''.join(f'\\{b:03d}' for b in enc) + '"'
+    # 【ninja 兼容】按 24 字节分块存入表 + table.concat 拼接：
+    #   - 每行 ≈ 24*4+3 ≈ 100 字符 < 120（忍者注入器行长上限），
+    #     避免 165KB+ 的巨型单行字符串（字符串字面量内部无法安全折行）
+    #   - 不能用 `"a" .. "b" .. "c"` 链：Lua 的 `..` 右结合，
+    #     上千个操作数会让 load() 解析器 C 栈溢出；
+    #     表构造器项间解析是迭代的，任意数量都安全
+    _CHUNK = 24
+    chunk_lits = []
+    for off in range(0, len(enc), _CHUNK):
+        piece = enc[off:off + _CHUNK]
+        chunk_lits.append('"' + ''.join(f'\\{b:03d}' for b in piece) + '",')
+    if chunk_lits:
+        payload_tbl = "{\n" + "\n".join(chunk_lits) + "\n}"
+    else:
+        payload_tbl = "{}"
 
     # 变量名
+    payload_tbl_var = gen.fresh()
     payload_var = gen.fresh()
     key1_var = gen.fresh()
     key2_var = gen.fresh()
@@ -2327,7 +2364,8 @@ def _wrap_nested_vm(inner_code: str, rng: random.Random, gen) -> str:
     d4 = (a4 + b4) * c4 - salt
 
     outer = f'''-- [AI-DETECT] VM嵌套VM外层解密加载器（Dual-VM）
-local {payload_var} = {payload_str}
+local {payload_tbl_var} = {payload_tbl}
+local {payload_var} = table.concat({payload_tbl_var})
 local {key1_var} = ({a1} + {b1}) - {c1}
 local {key2_var} = ({a2} * {b2}) + {r2}
 local {key3_var} = ({a3} - {b3}) + {c3}
